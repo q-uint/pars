@@ -2,8 +2,12 @@ const std = @import("std");
 const Value = @import("value.zig").Value;
 
 pub const OpCode = enum(u8) {
-    op_constant,
-    op_return,
+    op_constant, // 2 bytes: opcode + 1-byte index
+    // 4 bytes: opcode + 3-byte (24-bit) index. Trades dispatch
+    // complexity (two code paths everywhere constants are handled)
+    // for compact encoding in the common case.
+    op_constant_wide,
+    op_return, // 1 byte
 };
 
 // Run-length encoded line number entry. Each entry covers `count`
@@ -57,6 +61,22 @@ pub const Chunk = struct {
     pub fn addConstant(self: *Chunk, val: Value) !usize {
         try self.constants.append(self.allocator, val);
         return self.constants.items.len - 1;
+    }
+
+    // Adds a constant and emits the appropriate load instruction.
+    // Uses op_constant (2 bytes) when the index fits in a u8,
+    // otherwise op_constant_wide (4 bytes) with a 24-bit index.
+    pub fn writeConstant(self: *Chunk, val: Value, line: usize) !void {
+        const index = try self.addConstant(val);
+        if (index <= std.math.maxInt(u8)) {
+            try self.write(@intFromEnum(OpCode.op_constant), line);
+            try self.write(@intCast(index), line);
+        } else {
+            try self.write(@intFromEnum(OpCode.op_constant_wide), line);
+            try self.write(@intCast(index & 0xff), line);
+            try self.write(@intCast((index >> 8) & 0xff), line);
+            try self.write(@intCast((index >> 16) & 0xff), line);
+        }
     }
 
     pub fn deinit(self: *Chunk) void {

@@ -33,6 +33,7 @@ pub fn disassembleInstruction(c: *Chunk, offset: usize) usize {
 
     return switch (op) {
         .op_constant => constantInstruction("OP_CONSTANT", c, offset),
+        .op_constant_wide => constantWideInstruction("OP_CONSTANT_WIDE", c, offset),
         .op_return => simpleInstruction("OP_RETURN", offset),
     };
 }
@@ -43,6 +44,16 @@ fn constantInstruction(name: []const u8, c: *Chunk, offset: usize) usize {
     printValue(c.constants.items[constant]);
     std.debug.print("'\n", .{});
     return offset + 2;
+}
+
+fn constantWideInstruction(name: []const u8, c: *Chunk, offset: usize) usize {
+    const constant: usize = @as(usize, c.code.items[offset + 1]) |
+        (@as(usize, c.code.items[offset + 2]) << 8) |
+        (@as(usize, c.code.items[offset + 3]) << 16);
+    std.debug.print("{s:<16} {d:>4} '", .{ name, constant });
+    printValue(c.constants.items[constant]);
+    std.debug.print("'\n", .{});
+    return offset + 4;
 }
 
 fn simpleInstruction(name: []const u8, offset: usize) usize {

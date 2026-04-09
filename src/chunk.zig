@@ -10,8 +10,8 @@ pub const OpCode = enum(u8) {
     op_return, // 1 byte
 };
 
-// Run-length encoded line number entry. Each entry covers `count`
-// consecutive bytecode bytes, all from the same source `line`.
+// Run-length encoded (RLE) line number entry. Each entry covers
+// `count` consecutive bytecode bytes, all from the same source `line`.
 pub const LineRun = struct {
     line: usize,
     count: usize,
@@ -85,3 +85,51 @@ pub const Chunk = struct {
         self.constants.deinit(self.allocator);
     }
 };
+
+test "getLine resolves offsets across multiple runs" {
+    var c = Chunk.init(std.testing.allocator);
+    defer c.deinit();
+
+    // 3 bytes on line 1, 2 bytes on line 2, 1 byte on line 3
+    try c.write(0, 1);
+    try c.write(0, 1);
+    try c.write(0, 1);
+    try c.write(0, 2);
+    try c.write(0, 2);
+    try c.write(0, 3);
+
+    try std.testing.expectEqual(1, c.getLine(0));
+    try std.testing.expectEqual(1, c.getLine(2));
+    try std.testing.expectEqual(2, c.getLine(3));
+    try std.testing.expectEqual(2, c.getLine(4));
+    try std.testing.expectEqual(3, c.getLine(5));
+
+    // Only 3 runs stored, not 6 entries.
+    try std.testing.expectEqual(3, c.lines.items.len);
+}
+
+test "writeConstant emits op_constant_wide after 256 constants" {
+    var c = Chunk.init(std.testing.allocator);
+    defer c.deinit();
+
+    // Fill up the first 256 constant slots.
+    for (0..256) |_| {
+        try c.writeConstant("x", 1);
+    }
+
+    // The 257th should use op_constant_wide.
+    const code_len_before = c.code.items.len;
+    try c.writeConstant("wide", 2);
+
+    // op_constant_wide is 4 bytes: opcode + 3-byte index.
+    try std.testing.expectEqual(code_len_before + 4, c.code.items.len);
+    try std.testing.expectEqual(
+        @intFromEnum(OpCode.op_constant_wide),
+        c.code.items[code_len_before],
+    );
+
+    // Index 256 = 0x100: low byte 0x00, middle byte 0x01, high byte 0x00.
+    try std.testing.expectEqual(0x00, c.code.items[code_len_before + 1]);
+    try std.testing.expectEqual(0x01, c.code.items[code_len_before + 2]);
+    try std.testing.expectEqual(0x00, c.code.items[code_len_before + 3]);
+}

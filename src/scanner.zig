@@ -21,6 +21,12 @@ pub const TokenType = enum {
     equal,
     /// '-' - charset range separator, e.g. the minus in ['a'-'z'].
     minus,
+    /// '.' - any-byte wildcard.
+    dot,
+    /// '%' - separator-list sugar: 'A % B' desugars to 'A (B A)*'.
+    percent,
+    /// '^' - cut marker; with a following string, attaches a failure label.
+    caret,
 
     /// '/' - ordered choice: try the left alternative, then the right on failure.
     slash,
@@ -42,8 +48,12 @@ pub const TokenType = enum {
 
     /// An identifier: a rule name, a let-binding name, or a field key.
     identifier,
-    /// A string literal in double quotes, e.g. "HTTP/".
+    /// A string literal in double quotes, e.g. "HTTP/". The triple-quoted
+    /// form """...""" allows embedded newlines and skips escape processing.
     string,
+    /// A case-insensitive string literal with an 'i' prefix, e.g. i"HTTP/".
+    /// Matches the literal regardless of ASCII letter case.
+    string_i,
     /// A character literal in single quotes, e.g. 'a'.
     char,
 
@@ -93,6 +103,14 @@ pub fn scanToken() Token {
     if (isAtEnd()) return makeToken(.eof);
 
     const c = advance();
+
+    if (c == 'i' and peek() == '"') {
+        _ = advance();
+        const tok = string();
+        if (tok.type == .err) return tok;
+        return makeToken(.string_i);
+    }
+
     if (isAlpha(c)) return identifier();
 
     switch (c) {
@@ -104,6 +122,9 @@ pub fn scanToken() Token {
         '}' => return makeToken(.right_brace),
         ',' => return makeToken(.comma),
         ':' => return makeToken(.colon),
+        '.' => return makeToken(.dot),
+        '%' => return makeToken(.percent),
+        '^' => return makeToken(.caret),
         '-' => return makeToken(.minus),
         '/' => return makeToken(.slash),
         '|' => return makeToken(.pipe),
@@ -182,6 +203,12 @@ fn checkKeyword(start: usize, rest: []const u8, token_type: TokenType) TokenType
 }
 
 fn string() Token {
+    if (peek() == '"' and peekNext() == '"') {
+        _ = advance();
+        _ = advance();
+        return tripleString();
+    }
+
     while (peek() != '"' and !isAtEnd()) {
         if (peek() == '\n') scanner.line += 1;
         _ = advance();
@@ -191,6 +218,23 @@ fn string() Token {
 
     _ = advance();
     return makeToken(.string);
+}
+
+fn tripleString() Token {
+    while (!isAtEnd()) {
+        if (peek() == '"' and peekNext() == '"' and
+            scanner.current + 2 < scanner.source.len and
+            scanner.source[scanner.current + 2] == '"')
+        {
+            _ = advance();
+            _ = advance();
+            _ = advance();
+            return makeToken(.string);
+        }
+        if (peek() == '\n') scanner.line += 1;
+        _ = advance();
+    }
+    return errorToken("Unterminated triple-quoted string.");
 }
 
 fn charLiteral() Token {
@@ -241,4 +285,193 @@ fn errorToken(message: []const u8) Token {
         .lexeme = message,
         .line = scanner.line,
     };
+}
+
+const Expected = struct { type: TokenType, lexeme: []const u8 };
+
+fn expectTokens(source: []const u8, expected: []const Expected) !void {
+    init(source);
+    for (expected) |e| {
+        const tok = scanToken();
+        try std.testing.expectEqual(e.type, tok.type);
+        try std.testing.expectEqualStrings(e.lexeme, tok.lexeme);
+    }
+    const tail = scanToken();
+    try std.testing.expectEqual(TokenType.eof, tail.type);
+}
+
+test "empty source yields eof" {
+    try expectTokens("", &.{});
+}
+
+test "whitespace only yields eof" {
+    try expectTokens("   \t\r\n  ", &.{});
+}
+
+test "line comment is skipped" {
+    try expectTokens("-- nothing here\nrule", &.{
+        .{ .type = .kw_rule, .lexeme = "rule" },
+    });
+}
+
+test "single-character punctuation" {
+    try expectTokens("()[]{},:.%^/|*+?!&", &.{
+        .{ .type = .left_paren, .lexeme = "(" },
+        .{ .type = .right_paren, .lexeme = ")" },
+        .{ .type = .left_bracket, .lexeme = "[" },
+        .{ .type = .right_bracket, .lexeme = "]" },
+        .{ .type = .left_brace, .lexeme = "{" },
+        .{ .type = .right_brace, .lexeme = "}" },
+        .{ .type = .comma, .lexeme = "," },
+        .{ .type = .colon, .lexeme = ":" },
+        .{ .type = .dot, .lexeme = "." },
+        .{ .type = .percent, .lexeme = "%" },
+        .{ .type = .caret, .lexeme = "^" },
+        .{ .type = .slash, .lexeme = "/" },
+        .{ .type = .pipe, .lexeme = "|" },
+        .{ .type = .star, .lexeme = "*" },
+        .{ .type = .plus, .lexeme = "+" },
+        .{ .type = .question, .lexeme = "?" },
+        .{ .type = .bang, .lexeme = "!" },
+        .{ .type = .amp, .lexeme = "&" },
+    });
+}
+
+test "equal vs arrow" {
+    try expectTokens("= =>", &.{
+        .{ .type = .equal, .lexeme = "=" },
+        .{ .type = .arrow, .lexeme = "=>" },
+    });
+}
+
+test "keywords" {
+    try expectTokens("rule let grammar extends super", &.{
+        .{ .type = .kw_rule, .lexeme = "rule" },
+        .{ .type = .kw_let, .lexeme = "let" },
+        .{ .type = .kw_grammar, .lexeme = "grammar" },
+        .{ .type = .kw_extends, .lexeme = "extends" },
+        .{ .type = .kw_super, .lexeme = "super" },
+    });
+}
+
+test "near-miss keywords are identifiers" {
+    try expectTokens("ruler letter grammars extend supers", &.{
+        .{ .type = .identifier, .lexeme = "ruler" },
+        .{ .type = .identifier, .lexeme = "letter" },
+        .{ .type = .identifier, .lexeme = "grammars" },
+        .{ .type = .identifier, .lexeme = "extend" },
+        .{ .type = .identifier, .lexeme = "supers" },
+    });
+}
+
+test "plain string literal" {
+    try expectTokens("\"HTTP/\"", &.{
+        .{ .type = .string, .lexeme = "\"HTTP/\"" },
+    });
+}
+
+test "triple-quoted string allows newlines" {
+    try expectTokens("\"\"\"a\nb\"\"\"", &.{
+        .{ .type = .string, .lexeme = "\"\"\"a\nb\"\"\"" },
+    });
+    try std.testing.expectEqual(@as(usize, 2), scanner.line);
+}
+
+test "case-insensitive string literal" {
+    try expectTokens("i\"HTTP/\"", &.{
+        .{ .type = .string_i, .lexeme = "i\"HTTP/\"" },
+    });
+}
+
+test "unterminated string produces error" {
+    init("\"oops");
+    const tok = scanToken();
+    try std.testing.expectEqual(TokenType.err, tok.type);
+    try std.testing.expectEqualStrings("Unterminated string.", tok.lexeme);
+}
+
+test "unterminated triple-quoted string" {
+    init("\"\"\"oops");
+    const tok = scanToken();
+    try std.testing.expectEqual(TokenType.err, tok.type);
+    try std.testing.expectEqualStrings("Unterminated triple-quoted string.", tok.lexeme);
+}
+
+test "character literal" {
+    try expectTokens("'a'", &.{
+        .{ .type = .char, .lexeme = "'a'" },
+    });
+}
+
+test "unterminated character literal at eof" {
+    init("'a");
+    const tok = scanToken();
+    try std.testing.expectEqual(TokenType.err, tok.type);
+    try std.testing.expectEqualStrings("Unterminated character literal.", tok.lexeme);
+}
+
+test "character literal rejects newline" {
+    init("'\n'");
+    const tok = scanToken();
+    try std.testing.expectEqual(TokenType.err, tok.type);
+}
+
+test "minus preserved outside of comment" {
+    try expectTokens("'0'-'9'", &.{
+        .{ .type = .char, .lexeme = "'0'" },
+        .{ .type = .minus, .lexeme = "-" },
+        .{ .type = .char, .lexeme = "'9'" },
+    });
+}
+
+test "identifier starting with i is not a case-insensitive string" {
+    try expectTokens("i ix", &.{
+        .{ .type = .identifier, .lexeme = "i" },
+        .{ .type = .identifier, .lexeme = "ix" },
+    });
+}
+
+test "newline bumps line counter" {
+    init("a\nb");
+    const first = scanToken();
+    try std.testing.expectEqual(@as(usize, 1), first.line);
+    const second = scanToken();
+    try std.testing.expectEqual(@as(usize, 2), second.line);
+}
+
+test "cut with label is two tokens" {
+    try expectTokens("^\"expected rparen\"", &.{
+        .{ .type = .caret, .lexeme = "^" },
+        .{ .type = .string, .lexeme = "\"expected rparen\"" },
+    });
+}
+
+test "full rule body tokenizes" {
+    try expectTokens(
+        "rule kv = let k = ident \"=\" let v = ident => { key: k, value: v }",
+        &.{
+            .{ .type = .kw_rule, .lexeme = "rule" },
+            .{ .type = .identifier, .lexeme = "kv" },
+            .{ .type = .equal, .lexeme = "=" },
+            .{ .type = .kw_let, .lexeme = "let" },
+            .{ .type = .identifier, .lexeme = "k" },
+            .{ .type = .equal, .lexeme = "=" },
+            .{ .type = .identifier, .lexeme = "ident" },
+            .{ .type = .string, .lexeme = "\"=\"" },
+            .{ .type = .kw_let, .lexeme = "let" },
+            .{ .type = .identifier, .lexeme = "v" },
+            .{ .type = .equal, .lexeme = "=" },
+            .{ .type = .identifier, .lexeme = "ident" },
+            .{ .type = .arrow, .lexeme = "=>" },
+            .{ .type = .left_brace, .lexeme = "{" },
+            .{ .type = .identifier, .lexeme = "key" },
+            .{ .type = .colon, .lexeme = ":" },
+            .{ .type = .identifier, .lexeme = "k" },
+            .{ .type = .comma, .lexeme = "," },
+            .{ .type = .identifier, .lexeme = "value" },
+            .{ .type = .colon, .lexeme = ":" },
+            .{ .type = .identifier, .lexeme = "v" },
+            .{ .type = .right_brace, .lexeme = "}" },
+        },
+    );
 }

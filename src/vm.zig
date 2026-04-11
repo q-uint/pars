@@ -7,7 +7,10 @@ const printValue = @import("value.zig").printValue;
 const debug = @import("debug.zig");
 const compiler = @import("compiler.zig");
 
-const trace_execution = !@import("builtin").is_test;
+// Comptime toggle: per-instruction disassembly during run(). Off by
+// default so the REPL and scripts produce clean output; flip to true
+// when debugging the dispatch loop.
+const trace_execution = false;
 
 pub const InterpretResult = enum {
     ok,

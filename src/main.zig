@@ -1,6 +1,7 @@
 const std = @import("std");
 const pars = @import("pars");
 const VM = pars.vm.Vm(null);
+const InterpretResult = pars.vm.InterpretResult;
 
 pub fn main() !void {
     const alloc = std.heap.page_allocator;
@@ -12,7 +13,7 @@ pub fn main() !void {
     defer std.process.argsFree(alloc, args);
 
     if (args.len == 1) {
-        try repl(&vm);
+        try repl(&vm, alloc);
     } else if (args.len == 2) {
         try runFile(&vm, args[1]);
     } else {
@@ -21,14 +22,32 @@ pub fn main() !void {
     }
 }
 
-fn repl(vm: *VM) !void {
-    var stdin_buf: [1024]u8 = undefined;
+fn repl(vm: *VM, alloc: std.mem.Allocator) !void {
+    var stdin_buf: [4096]u8 = undefined;
     var stdin_reader = std.fs.File.stdin().reader(&stdin_buf);
-    const stdin = &stdin_reader.interface;
 
-    var stdout_buf: [64]u8 = undefined;
+    var stdout_buf: [256]u8 = undefined;
     var stdout_writer = std.fs.File.stdout().writer(&stdout_buf);
-    const stdout = &stdout_writer.interface;
+
+    try runRepl(vm, alloc, &stdin_reader.interface, &stdout_writer.interface);
+}
+
+// The REPL keeps a *sticky input buffer*: a single byte slice that
+// persists across iterations. Meta commands (lines starting with `:`)
+// manipulate the buffer; every other line is compiled as a pars
+// expression and matched against whatever the buffer currently holds.
+// Extracted from `repl()` so tests can drive it with in-memory reader
+// and writer.
+fn runRepl(
+    vm: *VM,
+    alloc: std.mem.Allocator,
+    stdin: *std.Io.Reader,
+    stdout: *std.Io.Writer,
+) !void {
+    var sticky: std.ArrayList(u8) = .empty;
+    defer sticky.deinit(alloc);
+
+    try stdout.writeAll("pars REPL. type :help for commands.\n");
 
     while (true) {
         try stdout.writeAll("> ");
@@ -40,7 +59,73 @@ fn repl(vm: *VM) !void {
             return;
         };
 
-        _ = vm.interpret(line);
+        const trimmed = std.mem.trim(u8, line, " \t\r\n");
+        if (trimmed.len == 0) continue;
+
+        if (trimmed[0] == ':') {
+            const exit = try handleMeta(trimmed, &sticky, alloc, stdout);
+            try stdout.flush();
+            if (exit) return;
+            continue;
+        }
+
+        const result = vm.match(trimmed, sticky.items);
+        try reportResult(stdout, result, vm);
+        try stdout.flush();
+    }
+}
+
+fn handleMeta(
+    line: []const u8,
+    sticky: *std.ArrayList(u8),
+    alloc: std.mem.Allocator,
+    stdout: anytype,
+) !bool {
+    // Split on the first space: everything before is the command,
+    // everything after (left-trimmed) is the argument.
+    const space = std.mem.indexOfScalar(u8, line, ' ');
+    const cmd = if (space) |s| line[0..s] else line;
+    const arg = if (space) |s| std.mem.trimLeft(u8, line[s + 1 ..], " \t") else "";
+
+    if (std.mem.eql(u8, cmd, ":input")) {
+        if (arg.len == 0) {
+            try stdout.print("input ({d} bytes): \"{s}\"\n", .{ sticky.items.len, sticky.items });
+        } else {
+            sticky.clearRetainingCapacity();
+            try sticky.appendSlice(alloc, arg);
+            try stdout.print("input set ({d} bytes)\n", .{arg.len});
+        }
+    } else if (std.mem.eql(u8, cmd, ":clear")) {
+        sticky.clearRetainingCapacity();
+        try stdout.writeAll("input cleared\n");
+    } else if (std.mem.eql(u8, cmd, ":help")) {
+        try stdout.writeAll(
+            \\commands:
+            \\  :input <text>  set the sticky input buffer
+            \\  :input         show the current input
+            \\  :clear         clear the sticky input
+            \\  :exit / :quit  exit the REPL
+            \\  :help          this message
+            \\
+            \\any other line is compiled as a pars expression and
+            \\matched against the sticky input.
+            \\
+        );
+    } else if (std.mem.eql(u8, cmd, ":exit") or std.mem.eql(u8, cmd, ":quit")) {
+        return true;
+    } else {
+        try stdout.print("unknown command: {s}\n", .{cmd});
+    }
+    return false;
+}
+
+fn reportResult(stdout: anytype, result: InterpretResult, vm: *VM) !void {
+    switch (result) {
+        .ok => try stdout.print("ok: matched {d}/{d} bytes\n", .{ vm.pos, vm.input.len }),
+        .no_match => try stdout.print("no match at byte {d}/{d}\n", .{ vm.pos, vm.input.len }),
+        // Compile errors are already reported by the compiler via stderr.
+        .compile_error => {},
+        .runtime_error => try stdout.writeAll("runtime error\n"),
     }
 }
 
@@ -72,4 +157,86 @@ fn runFile(vm: *VM, path: []const u8) !void {
         .compile_error => std.process.exit(65),
         .runtime_error => std.process.exit(70),
     }
+}
+
+test "repl session: set input, match, inspect, clear, exit" {
+    const alloc = std.testing.allocator;
+
+    var vm = VM.init(alloc);
+    defer vm.deinit();
+
+    const script =
+        ":input GET /foo HTTP/1.1\n" ++
+        "\"GET\"\n" ++
+        "\"GET\" \" \" \"/\"\n" ++
+        "\"POST\"\n" ++
+        ":input\n" ++
+        ":clear\n" ++
+        ":input\n" ++
+        ":exit\n";
+
+    var reader = std.Io.Reader.fixed(script);
+
+    var aw = std.Io.Writer.Allocating.init(alloc);
+    defer aw.deinit();
+
+    try runRepl(&vm, alloc, &reader, &aw.writer);
+
+    const expected =
+        "pars REPL. type :help for commands.\n" ++
+        "> input set (17 bytes)\n" ++
+        "> ok: matched 3/17 bytes\n" ++
+        "> ok: matched 5/17 bytes\n" ++
+        "> no match at byte 0/17\n" ++
+        "> input (17 bytes): \"GET /foo HTTP/1.1\"\n" ++
+        "> input cleared\n" ++
+        "> input (0 bytes): \"\"\n" ++
+        "> ";
+
+    try std.testing.expectEqualStrings(expected, aw.writer.buffered());
+}
+
+test "repl: unknown meta command and eof exit" {
+    const alloc = std.testing.allocator;
+
+    var vm = VM.init(alloc);
+    defer vm.deinit();
+
+    const script = ":bogus\n";
+
+    var reader = std.Io.Reader.fixed(script);
+
+    var aw = std.Io.Writer.Allocating.init(alloc);
+    defer aw.deinit();
+
+    try runRepl(&vm, alloc, &reader, &aw.writer);
+
+    const expected =
+        "pars REPL. type :help for commands.\n" ++
+        "> unknown command: :bogus\n" ++
+        "> \n";
+
+    try std.testing.expectEqualStrings(expected, aw.writer.buffered());
+}
+
+test "repl: help command lists all meta commands" {
+    const alloc = std.testing.allocator;
+
+    var vm = VM.init(alloc);
+    defer vm.deinit();
+
+    const script = ":help\n:exit\n";
+
+    var reader = std.Io.Reader.fixed(script);
+
+    var aw = std.Io.Writer.Allocating.init(alloc);
+    defer aw.deinit();
+
+    try runRepl(&vm, alloc, &reader, &aw.writer);
+
+    const out = aw.writer.buffered();
+    try std.testing.expect(std.mem.indexOf(u8, out, ":input <text>") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, ":clear") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, ":exit / :quit") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, ":help") != null);
 }

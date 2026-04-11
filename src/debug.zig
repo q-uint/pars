@@ -34,7 +34,7 @@ pub fn disassembleInstruction(c: *Chunk, offset: usize) usize {
     return switch (op) {
         .op_constant => constantInstruction("OP_CONSTANT", c, offset),
         .op_constant_wide => constantWideInstruction("OP_CONSTANT_WIDE", c, offset),
-        .op_return => simpleInstruction("OP_RETURN", offset),
+        .op_halt => simpleInstruction("OP_HALT", offset),
     };
 }
 

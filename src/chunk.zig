@@ -7,7 +7,7 @@ pub const OpCode = enum(u8) {
     // complexity (two code paths everywhere constants are handled)
     // for compact encoding in the common case.
     op_constant_wide,
-    op_return, // 1 byte
+    op_halt, // 1 byte
 };
 
 // Run-length encoded (RLE) line number entry. Each entry covers

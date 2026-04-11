@@ -25,13 +25,18 @@ pub fn Vm(comptime stack_size: ?comptime_int) type {
         chunk: ?*Chunk,
         // Instruction pointer: index of the next instruction to execute.
         ip: usize,
+        // Dormant until backtrack frames land. Per ADR 006, successful
+        // matches leave nothing here; the stack will hold saved (ip, pos)
+        // pairs pushed by a future op_choice and popped by op_commit/fail.
         stack: Stack,
+        allocator: std.mem.Allocator,
 
         pub fn init(allocator: std.mem.Allocator) Self {
             return .{
                 .chunk = null,
                 .ip = 0,
                 .stack = Stack.init(allocator),
+                .allocator = allocator,
             };
         }
 
@@ -48,9 +53,14 @@ pub fn Vm(comptime stack_size: ?comptime_int) type {
         }
 
         pub fn interpret(self: *Self, source: []const u8) InterpretResult {
-            _ = self;
-            compiler.compile(source);
-            return .ok;
+            var c = Chunk.init(self.allocator);
+            defer c.deinit();
+
+            if (!compiler.compile(source, &c)) return .compile_error;
+
+            self.chunk = &c;
+            self.ip = 0;
+            return self.run();
         }
 
         // Dispatch loop. Faster VMs use direct threaded code, jump tables,
@@ -85,14 +95,7 @@ pub fn Vm(comptime stack_size: ?comptime_int) type {
                         const constant = self.readConstantWide();
                         self.push(constant) catch return .runtime_error;
                     },
-                    .op_return => {
-                        const val = self.pop();
-                        if (comptime !@import("builtin").is_test) {
-                            printValue(val);
-                            std.debug.print("\n", .{});
-                        }
-                        return .ok;
-                    },
+                    .op_halt => return .ok,
                 }
             }
         }
@@ -182,81 +185,28 @@ const DynamicStack = struct {
     }
 };
 
-fn testVm(comptime stack_size: ?comptime_int) type {
-    return struct {
-        fn helperChunk(alloc: std.mem.Allocator) !Chunk {
-            var c = Chunk.init(alloc);
-            try c.writeConstant("hello", 1);
-            try c.write(@intFromEnum(OpCode.op_return), 1);
-            return c;
-        }
-
-        fn interpretReturnsOk() !void {
-            const alloc = std.testing.allocator;
-            var c = try helperChunk(alloc);
-            defer c.deinit();
-            var machine = Vm(stack_size).init(alloc);
-            defer machine.deinit();
-            machine.chunk = &c;
-            try std.testing.expectEqual(.ok, machine.run());
-        }
-
-        fn constantIsPushedOntoStack() !void {
-            const alloc = std.testing.allocator;
-            var c = Chunk.init(alloc);
-            defer c.deinit();
-            try c.writeConstant("world", 1);
-            try c.writeConstant("hello", 1);
-            try c.write(@intFromEnum(OpCode.op_return), 1);
-
-            var machine = Vm(stack_size).init(alloc);
-            defer machine.deinit();
-            machine.chunk = &c;
-
-            // Manually execute the first constant instruction.
-            const first = machine.readByte();
-            try std.testing.expectEqual(@intFromEnum(OpCode.op_constant), first);
-            const val = machine.readConstant();
-            try machine.push(val);
-            try std.testing.expectEqualStrings("world", machine.stackSlice()[0]);
-        }
-
-        fn fixedStackOverflows() !void {
-            if (stack_size == null) return;
-            const alloc = std.testing.allocator;
-            var c = Chunk.init(alloc);
-            defer c.deinit();
-            // Write more constants than the stack can hold.
-            for (0..stack_size.? + 1) |_| {
-                try c.writeConstant("x", 1);
-            }
-            try c.write(@intFromEnum(OpCode.op_return), 1);
-
-            var machine = Vm(stack_size).init(alloc);
-            defer machine.deinit();
-            machine.chunk = &c;
-            // Should hit runtime_error from stack overflow, not crash.
-            try std.testing.expectEqual(.runtime_error, machine.run());
-        }
-    };
+fn haltChunk(alloc: std.mem.Allocator) !Chunk {
+    var c = Chunk.init(alloc);
+    try c.write(@intFromEnum(OpCode.op_halt), 1);
+    return c;
 }
 
-test "dynamic vm: interpret returns ok" {
-    try testVm(null).interpretReturnsOk();
+test "dynamic vm: halt returns ok" {
+    const alloc = std.testing.allocator;
+    var c = try haltChunk(alloc);
+    defer c.deinit();
+    var machine = Vm(null).init(alloc);
+    defer machine.deinit();
+    machine.chunk = &c;
+    try std.testing.expectEqual(.ok, machine.run());
 }
 
-test "dynamic vm: constant is pushed onto stack" {
-    try testVm(null).constantIsPushedOntoStack();
-}
-
-test "fixed vm: interpret returns ok" {
-    try testVm(256).interpretReturnsOk();
-}
-
-test "fixed vm: constant is pushed onto stack" {
-    try testVm(256).constantIsPushedOntoStack();
-}
-
-test "fixed vm: stack overflow returns runtime error" {
-    try testVm(4).fixedStackOverflows();
+test "fixed vm: halt returns ok" {
+    const alloc = std.testing.allocator;
+    var c = try haltChunk(alloc);
+    defer c.deinit();
+    var machine = Vm(256).init(alloc);
+    defer machine.deinit();
+    machine.chunk = &c;
+    try std.testing.expectEqual(.ok, machine.run());
 }

@@ -86,8 +86,11 @@ pub fn Vm(comptime stack_size: ?comptime_int) type {
                         self.push(constant) catch return .runtime_error;
                     },
                     .op_return => {
-                        printValue(self.pop());
-                        std.debug.print("\n", .{});
+                        const val = self.pop();
+                        if (comptime !@import("builtin").is_test) {
+                            printValue(val);
+                            std.debug.print("\n", .{});
+                        }
                         return .ok;
                     },
                 }

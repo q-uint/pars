@@ -5,6 +5,7 @@ const OpCode = chunk_mod.OpCode;
 const Value = @import("value.zig").Value;
 const printValue = @import("value.zig").printValue;
 const debug = @import("debug.zig");
+const compiler = @import("compiler.zig");
 
 const trace_execution = !@import("builtin").is_test;
 
@@ -21,14 +22,14 @@ pub fn Vm(comptime stack_size: ?comptime_int) type {
     return struct {
         const Self = @This();
 
-        chunk: *Chunk,
+        chunk: ?*Chunk,
         // Instruction pointer: index of the next instruction to execute.
         ip: usize,
         stack: Stack,
 
-        pub fn init(allocator: std.mem.Allocator, c: *Chunk) Self {
+        pub fn init(allocator: std.mem.Allocator) Self {
             return .{
-                .chunk = c,
+                .chunk = null,
                 .ip = 0,
                 .stack = Stack.init(allocator),
             };
@@ -46,15 +47,17 @@ pub fn Vm(comptime stack_size: ?comptime_int) type {
             return self.stack.slice();
         }
 
-        pub fn interpret(self: *Self) InterpretResult {
-            return self.run();
+        pub fn interpret(self: *Self, source: []const u8) InterpretResult {
+            _ = self;
+            compiler.compile(source);
+            return .ok;
         }
 
         // Dispatch loop. Faster VMs use direct threaded code, jump tables,
         // or computed goto to avoid the switch overhead. Zig has no goto,
         // but the compiler can lower a dense enum switch to a jump table
         // automatically, so a plain switch is both idiomatic and efficient.
-        fn run(self: *Self) InterpretResult {
+        pub fn run(self: *Self) InterpretResult {
             while (true) {
                 if (comptime trace_execution) {
                     const s = self.stackSlice();
@@ -67,7 +70,7 @@ pub fn Vm(comptime stack_size: ?comptime_int) type {
                         }
                         std.debug.print("\n", .{});
                     }
-                    _ = debug.disassembleInstruction(self.chunk, self.ip);
+                    _ = debug.disassembleInstruction(self.chunk.?, self.ip);
                 }
 
                 const instruction = self.readByte();
@@ -92,20 +95,20 @@ pub fn Vm(comptime stack_size: ?comptime_int) type {
         }
 
         fn readByte(self: *Self) u8 {
-            const byte = self.chunk.code.items[self.ip];
+            const byte = self.chunk.?.code.items[self.ip];
             self.ip += 1;
             return byte;
         }
 
         fn readConstant(self: *Self) []const u8 {
-            return self.chunk.constants.items[self.readByte()];
+            return self.chunk.?.constants.items[self.readByte()];
         }
 
         fn readConstantWide(self: *Self) []const u8 {
             const index: usize = @as(usize, self.readByte()) |
                 (@as(usize, self.readByte()) << 8) |
                 (@as(usize, self.readByte()) << 16);
-            return self.chunk.constants.items[index];
+            return self.chunk.?.constants.items[index];
         }
 
         pub fn deinit(self: *Self) void {
@@ -189,9 +192,10 @@ fn testVm(comptime stack_size: ?comptime_int) type {
             const alloc = std.testing.allocator;
             var c = try helperChunk(alloc);
             defer c.deinit();
-            var machine = Vm(stack_size).init(alloc, &c);
+            var machine = Vm(stack_size).init(alloc);
             defer machine.deinit();
-            try std.testing.expectEqual(.ok, machine.interpret());
+            machine.chunk = &c;
+            try std.testing.expectEqual(.ok, machine.run());
         }
 
         fn constantIsPushedOntoStack() !void {
@@ -202,8 +206,9 @@ fn testVm(comptime stack_size: ?comptime_int) type {
             try c.writeConstant("hello", 1);
             try c.write(@intFromEnum(OpCode.op_return), 1);
 
-            var machine = Vm(stack_size).init(alloc, &c);
+            var machine = Vm(stack_size).init(alloc);
             defer machine.deinit();
+            machine.chunk = &c;
 
             // Manually execute the first constant instruction.
             const first = machine.readByte();
@@ -224,10 +229,11 @@ fn testVm(comptime stack_size: ?comptime_int) type {
             }
             try c.write(@intFromEnum(OpCode.op_return), 1);
 
-            var machine = Vm(stack_size).init(alloc, &c);
+            var machine = Vm(stack_size).init(alloc);
             defer machine.deinit();
+            machine.chunk = &c;
             // Should hit runtime_error from stack overflow, not crash.
-            try std.testing.expectEqual(.runtime_error, machine.interpret());
+            try std.testing.expectEqual(.runtime_error, machine.run());
         }
     };
 }

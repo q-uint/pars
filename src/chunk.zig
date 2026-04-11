@@ -2,11 +2,20 @@ const std = @import("std");
 const Value = @import("value.zig").Value;
 
 pub const OpCode = enum(u8) {
-    op_constant, // 2 bytes: opcode + 1-byte index
-    // 4 bytes: opcode + 3-byte (24-bit) index. Trades dispatch
-    // complexity (two code paths everywhere constants are handled)
-    // for compact encoding in the common case.
-    op_constant_wide,
+    // Match a single byte from the input against an inline byte operand.
+    // 2 bytes: opcode + byte.
+    op_match_char,
+    // Match any single byte. 1 byte.
+    op_match_any,
+    // Match a literal byte sequence held in the constant pool.
+    // Narrow form: 2 bytes (opcode + 1-byte index).
+    // Wide form:   4 bytes (opcode + 3-byte (24-bit) index).
+    op_match_string,
+    op_match_string_wide,
+    // Case-insensitive variant of op_match_string. Compares ASCII letters
+    // without regard to case; other bytes compare exactly.
+    op_match_string_i,
+    op_match_string_i_wide,
     op_halt, // 1 byte
 };
 
@@ -63,16 +72,22 @@ pub const Chunk = struct {
         return self.constants.items.len - 1;
     }
 
-    // Adds a constant and emits the appropriate load instruction.
-    // Uses op_constant (2 bytes) when the index fits in a u8,
-    // otherwise op_constant_wide (4 bytes) with a 24-bit index.
-    pub fn writeConstant(self: *Chunk, val: Value, line: usize) !void {
+    // Emits a constant-pool load for the given op pair. Uses the narrow
+    // form (1-byte index) when the index fits in a u8, otherwise the
+    // wide form (24-bit index). Both forms share a single constant pool.
+    pub fn emitOpConstant(
+        self: *Chunk,
+        op_narrow: OpCode,
+        op_wide: OpCode,
+        val: Value,
+        line: usize,
+    ) !void {
         const index = try self.addConstant(val);
         if (index <= std.math.maxInt(u8)) {
-            try self.write(@intFromEnum(OpCode.op_constant), line);
+            try self.write(@intFromEnum(op_narrow), line);
             try self.write(@intCast(index), line);
         } else {
-            try self.write(@intFromEnum(OpCode.op_constant_wide), line);
+            try self.write(@intFromEnum(op_wide), line);
             try self.write(@intCast(index & 0xff), line);
             try self.write(@intCast((index >> 8) & 0xff), line);
             try self.write(@intCast((index >> 16) & 0xff), line);
@@ -108,23 +123,23 @@ test "getLine resolves offsets across multiple runs" {
     try std.testing.expectEqual(3, c.lines.items.len);
 }
 
-test "writeConstant emits op_constant_wide after 256 constants" {
+test "emitOpConstant switches to wide form after 256 constants" {
     var c = Chunk.init(std.testing.allocator);
     defer c.deinit();
 
     // Fill up the first 256 constant slots.
     for (0..256) |_| {
-        try c.writeConstant("x", 1);
+        try c.emitOpConstant(.op_match_string, .op_match_string_wide, "x", 1);
     }
 
-    // The 257th should use op_constant_wide.
+    // The 257th should use the wide form.
     const code_len_before = c.code.items.len;
-    try c.writeConstant("wide", 2);
+    try c.emitOpConstant(.op_match_string, .op_match_string_wide, "wide", 2);
 
-    // op_constant_wide is 4 bytes: opcode + 3-byte index.
+    // Wide form is 4 bytes: opcode + 3-byte index.
     try std.testing.expectEqual(code_len_before + 4, c.code.items.len);
     try std.testing.expectEqual(
-        @intFromEnum(OpCode.op_constant_wide),
+        @intFromEnum(OpCode.op_match_string_wide),
         c.code.items[code_len_before],
     );
 

@@ -11,6 +11,7 @@ const trace_execution = !@import("builtin").is_test;
 
 pub const InterpretResult = enum {
     ok,
+    no_match,
     compile_error,
     runtime_error,
 };
@@ -25,6 +26,11 @@ pub fn Vm(comptime stack_size: ?comptime_int) type {
         chunk: ?*Chunk,
         // Instruction pointer: index of the next instruction to execute.
         ip: usize,
+        // Input being matched and the current cursor into it. A successful
+        // primary advances `pos`; a failure leaves `pos` unchanged and (in
+        // the future) unwinds to a saved backtrack frame on `stack`.
+        input: []const u8,
+        pos: usize,
         // Dormant until backtrack frames land. Per ADR 006, successful
         // matches leave nothing here; the stack will hold saved (ip, pos)
         // pairs pushed by a future op_choice and popped by op_commit/fail.
@@ -35,6 +41,8 @@ pub fn Vm(comptime stack_size: ?comptime_int) type {
             return .{
                 .chunk = null,
                 .ip = 0,
+                .input = "",
+                .pos = 0,
                 .stack = Stack.init(allocator),
                 .allocator = allocator,
             };
@@ -53,6 +61,14 @@ pub fn Vm(comptime stack_size: ?comptime_int) type {
         }
 
         pub fn interpret(self: *Self, source: []const u8) InterpretResult {
+            return self.match(source, "");
+        }
+
+        pub fn match(
+            self: *Self,
+            source: []const u8,
+            input: []const u8,
+        ) InterpretResult {
             var c = Chunk.init(self.allocator);
             defer c.deinit();
 
@@ -60,6 +76,8 @@ pub fn Vm(comptime stack_size: ?comptime_int) type {
 
             self.chunk = &c;
             self.ip = 0;
+            self.input = input;
+            self.pos = 0;
             return self.run();
         }
 
@@ -87,17 +105,54 @@ pub fn Vm(comptime stack_size: ?comptime_int) type {
                 const op = std.meta.intToEnum(OpCode, instruction) catch
                     return .runtime_error;
                 switch (op) {
-                    .op_constant => {
-                        const constant = self.readConstant();
-                        self.push(constant) catch return .runtime_error;
+                    .op_match_char => {
+                        const byte = self.readByte();
+                        if (self.pos >= self.input.len) return .no_match;
+                        if (self.input[self.pos] != byte) return .no_match;
+                        self.pos += 1;
                     },
-                    .op_constant_wide => {
-                        const constant = self.readConstantWide();
-                        self.push(constant) catch return .runtime_error;
+                    .op_match_any => {
+                        if (self.pos >= self.input.len) return .no_match;
+                        self.pos += 1;
+                    },
+                    .op_match_string => {
+                        const literal = self.readConstant();
+                        if (!self.consumePrefix(literal)) return .no_match;
+                    },
+                    .op_match_string_wide => {
+                        const literal = self.readConstantWide();
+                        if (!self.consumePrefix(literal)) return .no_match;
+                    },
+                    .op_match_string_i => {
+                        const literal = self.readConstant();
+                        if (!self.consumePrefixIgnoreCase(literal)) return .no_match;
+                    },
+                    .op_match_string_i_wide => {
+                        const literal = self.readConstantWide();
+                        if (!self.consumePrefixIgnoreCase(literal)) return .no_match;
                     },
                     .op_halt => return .ok,
                 }
             }
+        }
+
+        fn consumePrefix(self: *Self, literal: []const u8) bool {
+            if (self.input.len - self.pos < literal.len) return false;
+            if (!std.mem.eql(u8, self.input[self.pos..][0..literal.len], literal)) {
+                return false;
+            }
+            self.pos += literal.len;
+            return true;
+        }
+
+        fn consumePrefixIgnoreCase(self: *Self, literal: []const u8) bool {
+            if (self.input.len - self.pos < literal.len) return false;
+            const slice = self.input[self.pos..][0..literal.len];
+            for (literal, slice) |l, r| {
+                if (asciiToLower(l) != asciiToLower(r)) return false;
+            }
+            self.pos += literal.len;
+            return true;
         }
 
         fn readByte(self: *Self) u8 {
@@ -121,6 +176,10 @@ pub fn Vm(comptime stack_size: ?comptime_int) type {
             self.stack.deinit();
         }
     };
+}
+
+fn asciiToLower(c: u8) u8 {
+    return if (c >= 'A' and c <= 'Z') c + ('a' - 'A') else c;
 }
 
 // Fixed-size stack backed by an array. Fast and cache-friendly, but
@@ -209,4 +268,63 @@ test "fixed vm: halt returns ok" {
     defer machine.deinit();
     machine.chunk = &c;
     try std.testing.expectEqual(.ok, machine.run());
+}
+
+const VmTest = Vm(null);
+
+fn expectMatch(source: []const u8, input: []const u8, expected: InterpretResult) !void {
+    var machine = VmTest.init(std.testing.allocator);
+    defer machine.deinit();
+    try std.testing.expectEqual(expected, machine.match(source, input));
+}
+
+test "string literal matches input prefix" {
+    try expectMatch("\"GET\"", "GET /", .ok);
+}
+
+test "string literal rejects non-matching input" {
+    try expectMatch("\"GET\"", "POST /", .no_match);
+}
+
+test "string literal rejects input shorter than literal" {
+    try expectMatch("\"GET\"", "GE", .no_match);
+}
+
+test "sequence of literals matches concatenation" {
+    try expectMatch("\"GET\" \" \" \"/\"", "GET /", .ok);
+}
+
+test "sequence fails if any primary fails" {
+    try expectMatch("\"GET\" \" \" \"/\"", "GET:/", .no_match);
+}
+
+test "character literal matches single byte" {
+    try expectMatch("'a'", "abc", .ok);
+}
+
+test "character literal rejects wrong byte" {
+    try expectMatch("'a'", "xbc", .no_match);
+}
+
+test "dot matches any single byte" {
+    try expectMatch(".", "x", .ok);
+}
+
+test "dot fails on empty input" {
+    try expectMatch(".", "", .no_match);
+}
+
+test "case-insensitive string matches regardless of case" {
+    try expectMatch("i\"http\"", "HTTP/1.1", .ok);
+    try expectMatch("i\"http\"", "http/1.1", .ok);
+    try expectMatch("i\"http\"", "HtTp/1.1", .ok);
+}
+
+test "case-insensitive string rejects non-letters that differ" {
+    try expectMatch("i\"a-b\"", "a_b", .no_match);
+}
+
+test "grouping compiles to the same code as the inner expression" {
+    try expectMatch("(\"GET\")", "GET", .ok);
+    try expectMatch("(\"GET\" \" \") \"/\"", "GET /", .ok);
 }

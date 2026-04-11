@@ -68,6 +68,7 @@ fn runFile(vm: *VM, path: []const u8) !void {
     const result = vm.interpret(source);
     switch (result) {
         .ok => {},
+        .no_match => std.process.exit(1),
         .compile_error => std.process.exit(65),
         .runtime_error => std.process.exit(70),
     }

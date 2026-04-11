@@ -32,15 +32,25 @@ pub fn disassembleInstruction(c: *Chunk, offset: usize) usize {
     };
 
     return switch (op) {
-        .op_constant => constantInstruction("OP_CONSTANT", c, offset),
-        .op_constant_wide => constantWideInstruction("OP_CONSTANT_WIDE", c, offset),
+        .op_match_char => byteInstruction("OP_MATCH_CHAR", c, offset),
+        .op_match_any => simpleInstruction("OP_MATCH_ANY", offset),
+        .op_match_string => constantInstruction("OP_MATCH_STRING", c, offset),
+        .op_match_string_wide => constantWideInstruction("OP_MATCH_STRING_WIDE", c, offset),
+        .op_match_string_i => constantInstruction("OP_MATCH_STRING_I", c, offset),
+        .op_match_string_i_wide => constantWideInstruction("OP_MATCH_STRING_I_WIDE", c, offset),
         .op_halt => simpleInstruction("OP_HALT", offset),
     };
 }
 
+fn byteInstruction(name: []const u8, c: *Chunk, offset: usize) usize {
+    const byte = c.code.items[offset + 1];
+    std.debug.print("{s:<22} '{c}'\n", .{ name, byte });
+    return offset + 2;
+}
+
 fn constantInstruction(name: []const u8, c: *Chunk, offset: usize) usize {
     const constant = c.code.items[offset + 1];
-    std.debug.print("{s:<16} {d:>4} '", .{ name, constant });
+    std.debug.print("{s:<22} {d:>4} '", .{ name, constant });
     printValue(c.constants.items[constant]);
     std.debug.print("'\n", .{});
     return offset + 2;
@@ -50,7 +60,7 @@ fn constantWideInstruction(name: []const u8, c: *Chunk, offset: usize) usize {
     const constant: usize = @as(usize, c.code.items[offset + 1]) |
         (@as(usize, c.code.items[offset + 2]) << 8) |
         (@as(usize, c.code.items[offset + 3]) << 16);
-    std.debug.print("{s:<16} {d:>4} '", .{ name, constant });
+    std.debug.print("{s:<22} {d:>4} '", .{ name, constant });
     printValue(c.constants.items[constant]);
     std.debug.print("'\n", .{});
     return offset + 4;

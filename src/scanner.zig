@@ -76,14 +76,33 @@ pub const TokenType = enum {
 
 pub const Token = struct {
     type: TokenType,
+    /// For normal tokens, a slice of the source covering the lexeme.
+    /// For `.err` tokens, a static diagnostic message string.
     lexeme: []const u8,
     line: usize,
+    /// 1-based column of the first byte of the token on its line.
+    column: usize,
+    /// Byte offset of the first byte of the token into the source.
+    start: usize,
+    /// Length in bytes of the source span the token covers. For `.err`
+    /// tokens this is still the source span that triggered the error,
+    /// not the length of the `lexeme` message.
+    len: usize,
 };
 
 const Scanner = struct {
     start: usize,
     current: usize,
     line: usize,
+    /// Byte offset of the first byte of the current line, used to
+    /// derive columns for diagnostics.
+    line_start: usize,
+    /// Snapshot of `line` taken when a token starts scanning. Multi-
+    /// line tokens (e.g. triple-quoted strings) would otherwise report
+    /// the line they end on, not the line they begin on.
+    token_line: usize,
+    /// Snapshot of the token's starting column, taken at the same time.
+    token_col: usize,
     source: []const u8,
 };
 
@@ -94,11 +113,20 @@ pub fn init(source: []const u8) void {
     scanner.start = 0;
     scanner.current = 0;
     scanner.line = 1;
+    scanner.line_start = 0;
+    scanner.token_line = 1;
+    scanner.token_col = 1;
+}
+
+pub fn getSource() []const u8 {
+    return scanner.source;
 }
 
 pub fn scanToken() Token {
     skipWhitespace();
     scanner.start = scanner.current;
+    scanner.token_line = scanner.line;
+    scanner.token_col = scanner.start - scanner.line_start + 1;
 
     if (isAtEnd()) return makeToken(.eof);
 
@@ -210,7 +238,10 @@ fn string() Token {
     }
 
     while (peek() != '"' and !isAtEnd()) {
-        if (peek() == '\n') scanner.line += 1;
+        if (peek() == '\n') {
+            scanner.line += 1;
+            scanner.line_start = scanner.current + 1;
+        }
         _ = advance();
     }
 
@@ -231,7 +262,10 @@ fn tripleString() Token {
             _ = advance();
             return makeToken(.string);
         }
-        if (peek() == '\n') scanner.line += 1;
+        if (peek() == '\n') {
+            scanner.line += 1;
+            scanner.line_start = scanner.current + 1;
+        }
         _ = advance();
     }
     return errorToken("Unterminated triple-quoted string.");
@@ -258,6 +292,7 @@ fn skipWhitespace() void {
             '\n' => {
                 scanner.line += 1;
                 _ = advance();
+                scanner.line_start = scanner.current;
             },
             '-' => {
                 if (peekNext() == '-') {
@@ -275,7 +310,10 @@ fn makeToken(token_type: TokenType) Token {
     return .{
         .type = token_type,
         .lexeme = scanner.source[scanner.start..scanner.current],
-        .line = scanner.line,
+        .line = scanner.token_line,
+        .column = scanner.token_col,
+        .start = scanner.start,
+        .len = scanner.current - scanner.start,
     };
 }
 
@@ -283,7 +321,10 @@ fn errorToken(message: []const u8) Token {
     return .{
         .type = .err,
         .lexeme = message,
-        .line = scanner.line,
+        .line = scanner.token_line,
+        .column = scanner.token_col,
+        .start = scanner.start,
+        .len = scanner.current - scanner.start,
     };
 }
 

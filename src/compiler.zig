@@ -1,10 +1,28 @@
 const std = @import("std");
 const scanner = @import("scanner.zig");
 const chunk_mod = @import("chunk.zig");
+const debug = @import("debug.zig");
 const Chunk = chunk_mod.Chunk;
 const OpCode = chunk_mod.OpCode;
 const Token = scanner.Token;
 const TokenType = scanner.TokenType;
+
+// Comptime toggle: disassemble the chunk after a successful compile.
+// Off by default so the REPL and scripts produce clean output; flip to
+// true when debugging codegen.
+const print_code = false;
+
+/// A structured compile-time diagnostic. Messages are static strings;
+/// the location is a source-byte span plus 1-based line and column so
+/// the renderer can show a snippet with a caret without re-scanning.
+pub const CompileError = struct {
+    line: usize,
+    column: usize,
+    start: usize,
+    len: usize,
+    message: []const u8,
+    at_eof: bool,
+};
 
 const Parser = struct {
     current: Token,
@@ -41,14 +59,27 @@ const ParseRule = struct {
 
 var parser: Parser = undefined;
 var compiling_chunk: *Chunk = undefined;
+var errors: std.ArrayList(CompileError) = .empty;
+var errors_alloc: std.mem.Allocator = undefined;
+var compiling_source: []const u8 = &.{};
 
 fn currentChunk() *Chunk {
     return compiling_chunk;
 }
 
-pub fn compile(source: []const u8, chunk: *Chunk) bool {
+/// Diagnostics produced by the most recent `compile` call. The slice is
+/// invalidated the next time `compile` is called.
+pub fn getErrors() []const CompileError {
+    return errors.items;
+}
+
+pub fn compile(alloc: std.mem.Allocator, source: []const u8, chunk: *Chunk) bool {
     scanner.init(source);
     compiling_chunk = chunk;
+    compiling_source = source;
+
+    errors.clearRetainingCapacity();
+    errors_alloc = alloc;
 
     parser.had_error = false;
     parser.panic_mode = false;
@@ -59,6 +90,13 @@ pub fn compile(source: []const u8, chunk: *Chunk) bool {
     endCompiler();
 
     return !parser.had_error;
+}
+
+/// Free any memory retained by the module-global error list. Safe to
+/// call repeatedly; the next `compile` re-initializes the list.
+pub fn deinit(alloc: std.mem.Allocator) void {
+    errors.deinit(alloc);
+    errors = .empty;
 }
 
 fn advance() void {
@@ -92,7 +130,7 @@ fn expression() void {
 fn parsePrecedence(precedence: Precedence) void {
     advance();
     const prefix_rule = getRule(parser.previous.type).prefix orelse {
-        errorAtPrevious("Expect expression.");
+        errorAtPrevious("Expected an expression: a string, a character literal, '.', or '('.");
         return;
     };
     prefix_rule();
@@ -214,6 +252,11 @@ fn emitMatchString(narrow: OpCode, wide: OpCode, bytes: []const u8) void {
 
 fn endCompiler() void {
     emitHalt();
+    if (comptime print_code) {
+        if (!parser.had_error) {
+            debug.disassembleChunk(currentChunk(), "code");
+        }
+    }
 }
 
 fn errorAtCurrent(message: []const u8) void {
@@ -227,15 +270,151 @@ fn errorAtPrevious(message: []const u8) void {
 fn errorAt(token: *const Token, message: []const u8) void {
     if (parser.panic_mode) return;
     parser.panic_mode = true;
-
-    std.debug.print("[line {d}] Error", .{token.line});
-
-    switch (token.type) {
-        .eof => std.debug.print(" at end", .{}),
-        .err => {},
-        else => std.debug.print(" at '{s}'", .{token.lexeme}),
-    }
-
-    std.debug.print(": {s}\n", .{message});
     parser.had_error = true;
+
+    // Scanner errors put the diagnostic text in the lexeme field;
+    // surface that to the caller in place of the parser's message.
+    const msg = if (token.type == .err) token.lexeme else message;
+
+    errors.append(errors_alloc, .{
+        .line = token.line,
+        .column = token.column,
+        .start = token.start,
+        .len = token.len,
+        .message = msg,
+        .at_eof = token.type == .eof,
+    }) catch {
+        // If we cannot even record the error, fall back to a direct
+        // write so the failure is not silently swallowed.
+        std.debug.print("[line {d}] Error: {s}\n", .{ token.line, msg });
+    };
+}
+
+/// Renders all diagnostics from the most recent `compile` call to the
+/// given writer, one per error, with a source snippet and caret:
+///
+///     error: Expect expression.
+///      --> line 1, column 5
+///       |
+///     1 | "a" )
+///       |     ^ Expect expression.
+///
+/// `source` must be the same buffer passed to `compile`.
+pub fn renderErrors(source: []const u8, writer: *std.Io.Writer) !void {
+    for (errors.items) |e| {
+        try renderOne(source, writer, e);
+    }
+}
+
+fn renderOne(source: []const u8, writer: *std.Io.Writer, e: CompileError) !void {
+    try writer.print("error: {s}\n", .{e.message});
+    try writer.print(" --> line {d}, column {d}\n", .{ e.line, e.column });
+
+    const line_range = findLine(source, e.line);
+    const line_text = source[line_range.start..line_range.end];
+
+    // Clamp the caret column into the rendered line so a reported
+    // column past end-of-line (e.g. EOF on an empty file) still
+    // produces a readable pointer rather than running off the edge.
+    const caret_col = if (e.column == 0) 1 else e.column;
+    const caret_pad = caret_col - 1;
+    const caret_len: usize = if (e.at_eof) 1 else @max(e.len, 1);
+
+    try writer.print("{d: >4} | {s}\n", .{ e.line, line_text });
+    try writer.writeAll("     | ");
+    var i: usize = 0;
+    while (i < caret_pad) : (i += 1) try writer.writeByte(' ');
+    i = 0;
+    while (i < caret_len) : (i += 1) try writer.writeByte('^');
+    try writer.print(" {s}\n", .{e.message});
+}
+
+const LineRange = struct { start: usize, end: usize };
+
+fn findLine(source: []const u8, line: usize) LineRange {
+    var current_line: usize = 1;
+    var start: usize = 0;
+    var i: usize = 0;
+    while (i < source.len) : (i += 1) {
+        if (current_line == line and source[i] == '\n') {
+            return .{ .start = start, .end = i };
+        }
+        if (source[i] == '\n') {
+            current_line += 1;
+            start = i + 1;
+        }
+    }
+    if (current_line == line) {
+        return .{ .start = start, .end = source.len };
+    }
+    return .{ .start = source.len, .end = source.len };
+}
+
+fn compileForTest(alloc: std.mem.Allocator, source: []const u8) !struct {
+    chunk: Chunk,
+    ok: bool,
+} {
+    var c = Chunk.init(alloc);
+    const ok = compile(alloc, source, &c);
+    return .{ .chunk = c, .ok = ok };
+}
+
+test "stray token at start flags Expected-an-expression diagnostic" {
+    const alloc = std.testing.allocator;
+    var result = try compileForTest(alloc, ")");
+    defer result.chunk.deinit();
+    defer deinit(alloc);
+
+    try std.testing.expect(!result.ok);
+    const errs = getErrors();
+    try std.testing.expectEqual(@as(usize, 1), errs.len);
+    try std.testing.expectEqual(@as(usize, 1), errs[0].line);
+    try std.testing.expectEqual(@as(usize, 1), errs[0].column);
+    try std.testing.expect(!errs[0].at_eof);
+}
+
+test "empty source flags Expected-an-expression at eof" {
+    const alloc = std.testing.allocator;
+    var result = try compileForTest(alloc, "");
+    defer result.chunk.deinit();
+    defer deinit(alloc);
+
+    try std.testing.expect(!result.ok);
+    const errs = getErrors();
+    try std.testing.expectEqual(@as(usize, 1), errs.len);
+    try std.testing.expect(errs[0].at_eof);
+}
+
+test "renderErrors produces snippet with caret pointing at token" {
+    const alloc = std.testing.allocator;
+    const src = "   )";
+    var result = try compileForTest(alloc, src);
+    defer result.chunk.deinit();
+    defer deinit(alloc);
+
+    try std.testing.expect(!result.ok);
+
+    var aw = std.Io.Writer.Allocating.init(alloc);
+    defer aw.deinit();
+    try renderErrors(src, &aw.writer);
+
+    const expected =
+        "error: Expected an expression: a string, a character literal, '.', or '('.\n" ++
+        " --> line 1, column 4\n" ++
+        "   1 |    )\n" ++
+        "     |    ^ Expected an expression: a string, a character literal, '.', or '('.\n";
+    try std.testing.expectEqualStrings(expected, aw.writer.buffered());
+}
+
+test "scanner error surfaces through compile with correct location" {
+    const alloc = std.testing.allocator;
+    var result = try compileForTest(alloc, "\"unterminated");
+    defer result.chunk.deinit();
+    defer deinit(alloc);
+
+    try std.testing.expect(!result.ok);
+    const errs = getErrors();
+    try std.testing.expectEqual(@as(usize, 1), errs.len);
+    try std.testing.expectEqualStrings("Unterminated string.", errs[0].message);
+    try std.testing.expectEqual(@as(usize, 1), errs[0].column);
 }

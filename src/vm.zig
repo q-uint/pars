@@ -75,7 +75,10 @@ pub fn Vm(comptime stack_size: ?comptime_int) type {
             var c = Chunk.init(self.allocator);
             defer c.deinit();
 
-            if (!compiler.compile(source, &c)) return .compile_error;
+            if (!compiler.compile(self.allocator, source, &c)) {
+                renderCompileErrorsToStderr(source);
+                return .compile_error;
+            }
 
             self.chunk = &c;
             self.ip = 0;
@@ -177,6 +180,7 @@ pub fn Vm(comptime stack_size: ?comptime_int) type {
 
         pub fn deinit(self: *Self) void {
             self.stack.deinit();
+            compiler.deinit(self.allocator);
         }
     };
 }
@@ -246,6 +250,13 @@ const DynamicStack = struct {
         self.items.deinit(self.allocator);
     }
 };
+
+fn renderCompileErrorsToStderr(source: []const u8) void {
+    var buf: [1024]u8 = undefined;
+    var stderr_writer = std.fs.File.stderr().writer(&buf);
+    compiler.renderErrors(source, &stderr_writer.interface) catch return;
+    stderr_writer.interface.flush() catch return;
+}
 
 fn haltChunk(alloc: std.mem.Allocator) !Chunk {
     var c = Chunk.init(alloc);

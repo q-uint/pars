@@ -1,4 +1,6 @@
 const std = @import("std");
+const value_mod = @import("value.zig");
+const Value = value_mod.Value;
 
 pub const OpCode = enum(u8) {
     // Match a single byte from the input against an inline byte operand.
@@ -15,6 +17,11 @@ pub const OpCode = enum(u8) {
     // without regard to case; other bytes compare exactly.
     op_match_string_i,
     op_match_string_i_wide,
+    // Match a single byte against a charset (256-bit bitvector) in the
+    // constant pool. Succeeds and advances by one byte when the byte at
+    // the current position is a member of the set.
+    op_match_charset,
+    op_match_charset_wide,
     op_halt, // 1 byte
 };
 
@@ -32,7 +39,7 @@ pub const Chunk = struct {
     // LineRun. getLine() walks the runs to resolve a bytecode offset
     // to a source line -- acceptable because it only runs on errors.
     lines: std.ArrayList(LineRun),
-    constants: std.ArrayList([]const u8),
+    constants: std.ArrayList(Value),
     allocator: std.mem.Allocator,
 
     pub fn init(allocator: std.mem.Allocator) Chunk {
@@ -66,7 +73,7 @@ pub const Chunk = struct {
         unreachable;
     }
 
-    pub fn addConstant(self: *Chunk, val: []const u8) !usize {
+    pub fn addConstant(self: *Chunk, val: Value) !usize {
         try self.constants.append(self.allocator, val);
         return self.constants.items.len - 1;
     }
@@ -78,7 +85,7 @@ pub const Chunk = struct {
         self: *Chunk,
         op_narrow: OpCode,
         op_wide: OpCode,
-        val: []const u8,
+        val: Value,
         line: usize,
     ) !void {
         const index = try self.addConstant(val);
@@ -123,17 +130,24 @@ test "getLine resolves offsets across multiple runs" {
 }
 
 test "emitOpConstant switches to wide form after 256 constants" {
-    var c = Chunk.init(std.testing.allocator);
+    const object = @import("object.zig");
+    const alloc = std.testing.allocator;
+    object.init(alloc);
+    defer object.freeObjects();
+
+    var c = Chunk.init(alloc);
     defer c.deinit();
 
     // Fill up the first 256 constant slots.
     for (0..256) |_| {
-        try c.emitOpConstant(.op_match_string, .op_match_string_wide, "x", 1);
+        const lit = try object.copyLiteral("x");
+        try c.emitOpConstant(.op_match_string, .op_match_string_wide, .{ .obj = lit.asObj() }, 1);
     }
 
     // The 257th should use the wide form.
     const code_len_before = c.code.items.len;
-    try c.emitOpConstant(.op_match_string, .op_match_string_wide, "wide", 2);
+    const lit = try object.copyLiteral("wide");
+    try c.emitOpConstant(.op_match_string, .op_match_string_wide, .{ .obj = lit.asObj() }, 2);
 
     // Wide form is 4 bytes: opcode + 3-byte index.
     try std.testing.expectEqual(code_len_before + 4, c.code.items.len);

@@ -148,3 +148,41 @@ popping a value.
 If semantic-action values grow complex enough to justify a second stack, we
 revisit and move toward the side-channel model. Until then, one stack for
 backtrack frames is enough.
+
+## 007 -- Strings are raw byte sequences, not Unicode-aware
+
+_Decision._
+
+The VM operates on bytes, not characters or code points. `ObjLiteral`
+stores a raw byte sequence and matches byte-for-byte against the input.
+`ObjCharset` is a 256-bit bitvector indexed by byte value. `Span`
+records byte offsets into the input. None of these types encode or
+decode Unicode.
+
+Three approaches were considered:
+
+- _Byte-level._ The VM treats input as a flat byte stream. Grammar
+  authors who want to parse UTF-8 write rules that match the byte
+  patterns (a `utf8_char` rule matching 1-4 byte sequences, for
+  example).
+- _Code-point-aware._ The VM decodes UTF-8 internally, charsets
+  operate on code points, and spans are code-point-indexed. Correct
+  for Unicode text but imposes an encoding assumption on all inputs,
+  including binary protocols.
+- _Maximal._ Support multiple encodings, expose both code-point and
+  grapheme-cluster APIs. Comprehensive but far too complex for an
+  embedded parsing VM.
+
+I choose byte-level. pars is a tool for describing the structure of
+input, and input is not always text. Binary protocols, wire formats,
+and mixed-encoding streams are legitimate targets. Assuming UTF-8
+would make these harder to express while adding decode overhead to
+every match operation. Grammar authors who parse UTF-8 text can
+express the encoding rules in the grammar itself, keeping the VM
+simple and the charset bitvector a single array lookup.
+
+The cost is that the language provides no built-in Unicode character
+classes or code-point-level operations. Users who want `\p{Letter}`
+style classes must build them from byte-level rules or a future
+standard library. If enough grammars need Unicode support, a standard
+`utf8` grammar module is the right place for it, not the VM.

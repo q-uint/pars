@@ -2,8 +2,11 @@ const std = @import("std");
 const scanner = @import("scanner.zig");
 const chunk_mod = @import("chunk.zig");
 const debug = @import("debug.zig");
+const object = @import("object.zig");
+const value_mod = @import("value.zig");
 const Chunk = chunk_mod.Chunk;
 const OpCode = chunk_mod.OpCode;
+const Value = value_mod.Value;
 const Token = scanner.Token;
 const TokenType = scanner.TokenType;
 
@@ -130,7 +133,7 @@ fn expression() void {
 fn parsePrecedence(precedence: Precedence) void {
     advance();
     const prefix_rule = getRule(parser.previous.type).prefix orelse {
-        errorAtPrevious("Expected an expression: a string, a character literal, '.', or '('.");
+        errorAtPrevious("Expected an expression: a string, a character literal, '.', '[', or '('.");
         return;
     };
     prefix_rule();
@@ -172,6 +175,7 @@ const rules: [token_count]ParseRule = blk: {
     var t: [token_count]ParseRule = @splat(empty);
 
     t[@intFromEnum(TokenType.left_paren)] = .{ .prefix = grouping, .infix = null, .precedence = .none };
+    t[@intFromEnum(TokenType.left_bracket)] = .{ .prefix = charset, .infix = null, .precedence = .none };
     t[@intFromEnum(TokenType.string)] = .{ .prefix = stringLiteral, .infix = null, .precedence = .none };
     t[@intFromEnum(TokenType.string_i)] = .{ .prefix = stringLiteralIgnoreCase, .infix = null, .precedence = .none };
     t[@intFromEnum(TokenType.char)] = .{ .prefix = charLiteral, .infix = null, .precedence = .none };
@@ -197,7 +201,7 @@ fn charLiteral() void {
     const lexeme = parser.previous.lexeme;
     // Lexeme includes the surrounding single quotes: 'a' -> length 3.
     // Only single-byte character literals are supported at this stage;
-    // escapes and multi-byte forms will land with the charset work.
+    // escapes and multi-byte forms will land with extended charset work.
     if (lexeme.len != 3) {
         errorAtPrevious("Character literal must be a single byte.");
         return;
@@ -214,6 +218,77 @@ fn stringLiteralIgnoreCase() void {
     // The 'i' prefix counts as one extra leading byte before the quotes.
     const bytes = stripStringDelimiters(parser.previous.lexeme, 1);
     emitMatchString(.op_match_string_i, .op_match_string_i_wide, bytes);
+}
+
+/// Compile a charset expression: `[` has already been consumed.
+/// The body is a sequence of single characters ('a') and ranges ('a'-'z').
+/// Each element sets bits in a 256-bit membership vector. The result is
+/// emitted as an op_match_charset referencing an ObjCharset constant.
+fn charset() void {
+    var bits: [32]u8 = .{0} ** 32;
+
+    if (parser.current.type == .right_bracket) {
+        errorAtCurrent("Empty charset.");
+        advance();
+        return;
+    }
+
+    while (parser.current.type != .right_bracket and parser.current.type != .eof) {
+        if (parser.current.type != .char) {
+            errorAtCurrent("Expected a character literal inside charset.");
+            return;
+        }
+        advance();
+        const lo = extractCharByte(parser.previous.lexeme) orelse return;
+
+        if (parser.current.type == .minus) {
+            // Range: 'a'-'z'
+            advance(); // consume '-'
+            if (parser.current.type != .char) {
+                errorAtCurrent("Expected a character literal after '-' in charset range.");
+                return;
+            }
+            advance();
+            const hi = extractCharByte(parser.previous.lexeme) orelse return;
+
+            if (lo > hi) {
+                errorAtPrevious("Charset range start must not exceed range end.");
+                return;
+            }
+
+            var byte: usize = lo;
+            while (byte <= hi) : (byte += 1) {
+                bits[byte >> 3] |= @as(u8, 1) << @intCast(byte & 0x07);
+            }
+        } else {
+            // Single character.
+            bits[lo >> 3] |= @as(u8, 1) << @intCast(lo & 0x07);
+        }
+    }
+
+    consume(.right_bracket, "Expect ']' after charset.");
+
+    const cs = object.createCharset(bits) catch {
+        errorAtPrevious("Out of memory.");
+        return;
+    };
+
+    currentChunk().emitOpConstant(
+        .op_match_charset,
+        .op_match_charset_wide,
+        .{ .obj = cs.asObj() },
+        parser.previous.line,
+    ) catch {
+        errorAtPrevious("Out of memory.");
+    };
+}
+
+fn extractCharByte(lexeme: []const u8) ?u8 {
+    if (lexeme.len != 3) {
+        errorAtPrevious("Character literal must be a single byte.");
+        return null;
+    }
+    return lexeme[1];
 }
 
 // Strips the surrounding quote delimiters, accounting for an optional
@@ -245,7 +320,11 @@ fn emitHalt() void {
 }
 
 fn emitMatchString(narrow: OpCode, wide: OpCode, bytes: []const u8) void {
-    currentChunk().emitOpConstant(narrow, wide, bytes, parser.previous.line) catch {
+    const lit = object.copyLiteral(bytes) catch {
+        errorAtPrevious("Out of memory.");
+        return;
+    };
+    currentChunk().emitOpConstant(narrow, wide, .{ .obj = lit.asObj() }, parser.previous.line) catch {
         errorAtPrevious("Out of memory.");
     };
 }
@@ -361,6 +440,8 @@ fn compileForTest(alloc: std.mem.Allocator, source: []const u8) !struct {
 
 test "stray token at start flags Expected-an-expression diagnostic" {
     const alloc = std.testing.allocator;
+    object.init(alloc);
+    defer object.freeObjects();
     var result = try compileForTest(alloc, ")");
     defer result.chunk.deinit();
     defer deinit(alloc);
@@ -375,6 +456,8 @@ test "stray token at start flags Expected-an-expression diagnostic" {
 
 test "empty source flags Expected-an-expression at eof" {
     const alloc = std.testing.allocator;
+    object.init(alloc);
+    defer object.freeObjects();
     var result = try compileForTest(alloc, "");
     defer result.chunk.deinit();
     defer deinit(alloc);
@@ -387,6 +470,8 @@ test "empty source flags Expected-an-expression at eof" {
 
 test "renderErrors produces snippet with caret pointing at token" {
     const alloc = std.testing.allocator;
+    object.init(alloc);
+    defer object.freeObjects();
     const src = "   )";
     var result = try compileForTest(alloc, src);
     defer result.chunk.deinit();
@@ -399,15 +484,17 @@ test "renderErrors produces snippet with caret pointing at token" {
     try renderErrors(src, &aw.writer);
 
     const expected =
-        "error: Expected an expression: a string, a character literal, '.', or '('.\n" ++
+        "error: Expected an expression: a string, a character literal, '.', '[', or '('.\n" ++
         " --> line 1, column 4\n" ++
         "   1 |    )\n" ++
-        "     |    ^ Expected an expression: a string, a character literal, '.', or '('.\n";
+        "     |    ^ Expected an expression: a string, a character literal, '.', '[', or '('.\n";
     try std.testing.expectEqualStrings(expected, aw.writer.buffered());
 }
 
 test "scanner error surfaces through compile with correct location" {
     const alloc = std.testing.allocator;
+    object.init(alloc);
+    defer object.freeObjects();
     var result = try compileForTest(alloc, "\"unterminated");
     defer result.chunk.deinit();
     defer deinit(alloc);

@@ -7,6 +7,7 @@ const Value = value_mod.Value;
 const printValue = value_mod.printValue;
 const debug = @import("debug.zig");
 const compiler = @import("compiler.zig");
+const object = @import("object.zig");
 
 // Comptime toggle: per-instruction disassembly during run(). Off by
 // default so the REPL and scripts produce clean output; flip to true
@@ -42,6 +43,7 @@ pub fn Vm(comptime stack_size: ?comptime_int) type {
         allocator: std.mem.Allocator,
 
         pub fn init(allocator: std.mem.Allocator) Self {
+            object.init(allocator);
             return .{
                 .chunk = null,
                 .ip = 0,
@@ -125,20 +127,28 @@ pub fn Vm(comptime stack_size: ?comptime_int) type {
                         self.pos += 1;
                     },
                     .op_match_string => {
-                        const literal = self.readConstant();
+                        const literal = self.readConstantLiteral();
                         if (!self.consumePrefix(literal)) return .no_match;
                     },
                     .op_match_string_wide => {
-                        const literal = self.readConstantWide();
+                        const literal = self.readConstantWideLiteral();
                         if (!self.consumePrefix(literal)) return .no_match;
                     },
                     .op_match_string_i => {
-                        const literal = self.readConstant();
+                        const literal = self.readConstantLiteral();
                         if (!self.consumePrefixIgnoreCase(literal)) return .no_match;
                     },
                     .op_match_string_i_wide => {
-                        const literal = self.readConstantWide();
+                        const literal = self.readConstantWideLiteral();
                         if (!self.consumePrefixIgnoreCase(literal)) return .no_match;
+                    },
+                    .op_match_charset => {
+                        const cs = self.readConstantCharset();
+                        if (!self.consumeCharset(cs)) return .no_match;
+                    },
+                    .op_match_charset_wide => {
+                        const cs = self.readConstantWideCharset();
+                        if (!self.consumeCharset(cs)) return .no_match;
                     },
                     .op_halt => return .ok,
                 }
@@ -164,21 +174,44 @@ pub fn Vm(comptime stack_size: ?comptime_int) type {
             return true;
         }
 
+        fn consumeCharset(self: *Self, cs: *const object.ObjCharset) bool {
+            if (self.pos >= self.input.len) return false;
+            if (!cs.contains(self.input[self.pos])) return false;
+            self.pos += 1;
+            return true;
+        }
+
         fn readByte(self: *Self) u8 {
             const byte = self.chunk.?.code.items[self.ip];
             self.ip += 1;
             return byte;
         }
 
-        fn readConstant(self: *Self) []const u8 {
+        fn readConstant(self: *Self) Value {
             return self.chunk.?.constants.items[self.readByte()];
         }
 
-        fn readConstantWide(self: *Self) []const u8 {
+        fn readConstantWide(self: *Self) Value {
             const index: usize = @as(usize, self.readByte()) |
                 (@as(usize, self.readByte()) << 8) |
                 (@as(usize, self.readByte()) << 16);
             return self.chunk.?.constants.items[index];
+        }
+
+        fn readConstantLiteral(self: *Self) []const u8 {
+            return self.readConstant().asObj().asLiteral().chars();
+        }
+
+        fn readConstantWideLiteral(self: *Self) []const u8 {
+            return self.readConstantWide().asObj().asLiteral().chars();
+        }
+
+        fn readConstantCharset(self: *Self) *const object.ObjCharset {
+            return self.readConstant().asObj().asCharset();
+        }
+
+        fn readConstantWideCharset(self: *Self) *const object.ObjCharset {
+            return self.readConstantWide().asObj().asCharset();
         }
 
         fn runtimeError(self: *Self, comptime fmt: []const u8, args: anytype) void {
@@ -196,6 +229,7 @@ pub fn Vm(comptime stack_size: ?comptime_int) type {
         pub fn deinit(self: *Self) void {
             self.stack.deinit();
             compiler.deinit(self.allocator);
+            object.freeObjects();
         }
     };
 }
@@ -356,4 +390,44 @@ test "case-insensitive string rejects non-letters that differ" {
 test "grouping compiles to the same code as the inner expression" {
     try expectMatch("(\"GET\")", "GET", .ok);
     try expectMatch("(\"GET\" \" \") \"/\"", "GET /", .ok);
+}
+
+test "charset matches a single character in range" {
+    try expectMatch("['a'-'z']", "m", .ok);
+}
+
+test "charset rejects character outside range" {
+    try expectMatch("['a'-'z']", "M", .no_match);
+}
+
+test "charset matches boundary characters" {
+    try expectMatch("['a'-'z']", "a", .ok);
+    try expectMatch("['a'-'z']", "z", .ok);
+}
+
+test "charset with multiple ranges" {
+    try expectMatch("['a'-'z' '0'-'9']", "m", .ok);
+    try expectMatch("['a'-'z' '0'-'9']", "5", .ok);
+    try expectMatch("['a'-'z' '0'-'9']", "!", .no_match);
+}
+
+test "charset with single characters" {
+    try expectMatch("['_']", "_", .ok);
+    try expectMatch("['_']", "a", .no_match);
+}
+
+test "charset mixed ranges and singles" {
+    try expectMatch("['a'-'z' '_' '0'-'9']", "_", .ok);
+    try expectMatch("['a'-'z' '_' '0'-'9']", "x", .ok);
+    try expectMatch("['a'-'z' '_' '0'-'9']", "7", .ok);
+    try expectMatch("['a'-'z' '_' '0'-'9']", "!", .no_match);
+}
+
+test "charset fails on empty input" {
+    try expectMatch("['a'-'z']", "", .no_match);
+}
+
+test "charset in sequence" {
+    try expectMatch("['a'-'z'] ['0'-'9']", "a1", .ok);
+    try expectMatch("['a'-'z'] ['0'-'9']", "1a", .no_match);
 }

@@ -41,8 +41,8 @@ pub fn disassembleInstruction(c: *Chunk, offset: usize) usize {
         .op_match_string_i_wide => constantWideInstruction("OP_MATCH_STRING_I_WIDE", c, offset),
         .op_match_charset => constantInstruction("OP_MATCH_CHARSET", c, offset),
         .op_match_charset_wide => constantWideInstruction("OP_MATCH_CHARSET_WIDE", c, offset),
-        .op_call => constantInstruction("OP_CALL", c, offset),
-        .op_call_wide => constantWideInstruction("OP_CALL_WIDE", c, offset),
+        .op_call => indexInstruction("OP_CALL", c, offset),
+        .op_call_wide => indexWideInstruction("OP_CALL_WIDE", c, offset),
         .op_return => simpleInstruction("OP_RETURN", offset),
         .op_choice => jumpInstruction("OP_CHOICE", c, offset),
         .op_commit => jumpInstruction("OP_COMMIT", c, offset),
@@ -72,6 +72,20 @@ fn constantWideInstruction(name: []const u8, c: *Chunk, offset: usize) usize {
     std.debug.print("{s:<22} {d:>4} '", .{ name, constant });
     printValue(c.constants.items[constant]);
     std.debug.print("'\n", .{});
+    return offset + 4;
+}
+
+fn indexInstruction(name: []const u8, c: *Chunk, offset: usize) usize {
+    const index = c.code.items[offset + 1];
+    std.debug.print("{s:<22} {d}\n", .{ name, index });
+    return offset + 2;
+}
+
+fn indexWideInstruction(name: []const u8, c: *Chunk, offset: usize) usize {
+    const index: u32 = @as(u32, c.code.items[offset + 1]) |
+        (@as(u32, c.code.items[offset + 2]) << 8) |
+        (@as(u32, c.code.items[offset + 3]) << 16);
+    std.debug.print("{s:<22} {d}\n", .{ name, index });
     return offset + 4;
 }
 

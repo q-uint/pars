@@ -205,10 +205,10 @@ pub fn Vm(comptime stack_size: ?comptime_int) type {
                         }
                     },
                     .op_call => {
-                        if (!self.callRule(self.readConstant())) return .runtime_error;
+                        if (!self.callRule(self.readByte())) return .runtime_error;
                     },
                     .op_call_wide => {
-                        if (!self.callRule(self.readConstantWide())) return .runtime_error;
+                        if (!self.callRule(self.readWideIndex())) return .runtime_error;
                     },
                     .op_return => {
                         if (self.frame_count == 0) {
@@ -272,9 +272,12 @@ pub fn Vm(comptime stack_size: ?comptime_int) type {
             return @bitCast(@as(u16, lo) | (@as(u16, hi) << 8));
         }
 
-        fn callRule(self: *Self, name_val: Value) bool {
-            const name = name_val.asObj().asLiteral().chars();
-            const rule_chunk = self.rules.getPtr(name) orelse {
+        fn callRule(self: *Self, index: u32) bool {
+            const rule_chunk = self.rules.getChunkPtr(index) orelse {
+                const name = if (index < self.rules.names.items.len)
+                    self.rules.names.items[index]
+                else
+                    "(unknown)";
                 self.runtimeError("Undefined rule '{s}'.", .{name});
                 return false;
             };
@@ -290,6 +293,13 @@ pub fn Vm(comptime stack_size: ?comptime_int) type {
             self.chunk = rule_chunk;
             self.ip = 0;
             return true;
+        }
+
+        fn readWideIndex(self: *Self) u32 {
+            const lo = self.readByte();
+            const mid = self.readByte();
+            const hi = self.readByte();
+            return @as(u32, lo) | (@as(u32, mid) << 8) | (@as(u32, hi) << 16);
         }
 
         fn consumePrefix(self: *Self, literal: []const u8) bool {
@@ -365,10 +375,6 @@ pub fn Vm(comptime stack_size: ?comptime_int) type {
 
         pub fn deinit(self: *Self) void {
             self.stack.deinit();
-            var it = self.rules.iterator();
-            while (it.next()) |entry| {
-                entry.value_ptr.deinit();
-            }
             self.rules.deinit(self.allocator);
             compiler.deinit(self.allocator);
             object.freeObjects();

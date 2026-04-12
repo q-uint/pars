@@ -10,7 +10,56 @@ const Value = value_mod.Value;
 const Token = scanner.Token;
 const TokenType = scanner.TokenType;
 
-pub const RuleTable = std.StringHashMapUnmanaged(Chunk);
+/// Maps rule names to numeric indices and stores compiled chunks in a
+/// flat array for direct-index dispatch. The name map is used at
+/// compile time; at runtime op_call uses the index to jump straight
+/// to the chunk without a hash lookup.
+pub const RuleTable = struct {
+    by_name: std.StringHashMapUnmanaged(u32) = .{},
+    chunks: std.ArrayListUnmanaged(?Chunk) = .{},
+    names: std.ArrayListUnmanaged([]const u8) = .{},
+
+    /// Return the index for `name`, allocating a new slot if this is
+    /// the first reference. Forward references get a null chunk that
+    /// ruleDeclaration fills in later.
+    pub fn getOrCreateIndex(self: *RuleTable, alloc: std.mem.Allocator, name: []const u8) !u32 {
+        const gop = try self.by_name.getOrPut(alloc, name);
+        if (!gop.found_existing) {
+            const idx: u32 = @intCast(self.chunks.items.len);
+            gop.value_ptr.* = idx;
+            try self.chunks.append(alloc, null);
+            try self.names.append(alloc, name);
+        }
+        return gop.value_ptr.*;
+    }
+
+    pub fn setChunk(self: *RuleTable, index: u32, c: Chunk) void {
+        if (self.chunks.items[index]) |*old| old.deinit();
+        self.chunks.items[index] = c;
+    }
+
+    pub fn getChunkPtr(self: *RuleTable, index: u32) ?*Chunk {
+        if (self.chunks.items[index]) |*c| return c;
+        return null;
+    }
+
+    pub fn count(self: *const RuleTable) usize {
+        return self.by_name.count();
+    }
+
+    pub fn get(self: *const RuleTable, name: []const u8) ?u32 {
+        return self.by_name.get(name);
+    }
+
+    pub fn deinit(self: *RuleTable, alloc: std.mem.Allocator) void {
+        for (self.chunks.items) |*slot| {
+            if (slot.*) |*c| c.deinit();
+        }
+        self.chunks.deinit(alloc);
+        self.names.deinit(alloc);
+        self.by_name.deinit(alloc);
+    }
+};
 
 // Comptime toggle: disassemble the chunk after a successful compile.
 // Off by default so the REPL and scripts produce clean output; flip to
@@ -175,8 +224,7 @@ fn ruleDeclaration() void {
     const name_token = parser.previous;
     consume(.equal, "Expect '=' after rule name.");
 
-    // Intern the rule name for the rule table key.
-    const name_obj = object.copyLiteral(name_token.lexeme) catch {
+    const index = compiling_rules.?.getOrCreateIndex(errors_alloc, name_token.lexeme) catch {
         errorAtPrevious("Out of memory.");
         return;
     };
@@ -197,17 +245,7 @@ fn ruleDeclaration() void {
 
     compiling_chunk = saved_chunk;
 
-    // Store the compiled chunk in the rule table, freeing any
-    // previous definition of the same name.
-    const gop = compiling_rules.?.getOrPut(errors_alloc, name_obj.chars()) catch {
-        errorAtPrevious("Out of memory.");
-        rule_chunk.deinit();
-        return;
-    };
-    if (gop.found_existing) {
-        gop.value_ptr.deinit();
-    }
-    gop.value_ptr.* = rule_chunk;
+    compiling_rules.?.setChunk(index, rule_chunk);
     last_rule_name = name_token;
 }
 
@@ -222,18 +260,11 @@ fn synchronize() void {
 
 fn namedRule() void {
     const name = parser.previous;
-    const lit = object.copyLiteral(name.lexeme) catch {
+    const index = compiling_rules.?.getOrCreateIndex(errors_alloc, name.lexeme) catch {
         errorAtPrevious("Out of memory.");
         return;
     };
-    currentChunk().emitOpConstant(
-        .op_call,
-        .op_call_wide,
-        .{ .obj = lit.asObj() },
-        parser.previous.line,
-    ) catch {
-        errorAtPrevious("Out of memory.");
-    };
+    emitRuleCall(index);
 }
 
 // Pratt loop. Sequence is the only operator without a token of its own:
@@ -427,6 +458,17 @@ fn stripStringDelimiters(lexeme: []const u8, prefix_len: usize) []const u8 {
     return body[delim .. body.len - delim];
 }
 
+fn emitRuleCall(index: u32) void {
+    if (index <= std.math.maxInt(u8)) {
+        emitBytes(@intFromEnum(OpCode.op_call), @intCast(index));
+    } else {
+        emitByte(@intFromEnum(OpCode.op_call_wide));
+        emitByte(@intCast(index & 0xff));
+        emitByte(@intCast((index >> 8) & 0xff));
+        emitByte(@intCast((index >> 16) & 0xff));
+    }
+}
+
 fn emitByte(byte: u8) void {
     currentChunk().write(byte, parser.previous.line) catch {
         errorAtPrevious("Out of memory.");
@@ -565,19 +607,12 @@ fn endCompiler() void {
     // auto-emit a call to the last rule as the entry point.
     if (!had_expression) {
         if (last_rule_name) |name| {
-            const lit = object.copyLiteral(name.lexeme) catch {
+            const index = compiling_rules.?.getOrCreateIndex(errors_alloc, name.lexeme) catch {
                 errorAtPrevious("Out of memory.");
                 emitHalt();
                 return;
             };
-            currentChunk().emitOpConstant(
-                .op_call,
-                .op_call_wide,
-                .{ .obj = lit.asObj() },
-                name.line,
-            ) catch {
-                errorAtPrevious("Out of memory.");
-            };
+            emitRuleCall(index);
         }
     }
     emitHalt();
@@ -687,10 +722,6 @@ const TestCompileResult = struct {
 
     fn deinit(self: *TestCompileResult) void {
         self.chunk.deinit();
-        var it = self.rules.iterator();
-        while (it.next()) |entry| {
-            entry.value_ptr.deinit();
-        }
         self.rules.deinit(self.alloc);
     }
 };
@@ -822,20 +853,31 @@ test "error recovery skips to next rule" {
     try std.testing.expect(result.rules.get("digit") != null);
 }
 
-test "repeated rule calls share a single constant pool entry" {
+test "repeated rule calls emit the same index operand" {
     const alloc = std.testing.allocator;
     object.init(alloc);
     defer object.freeObjects();
-    // Three calls to "digit" in the rule body should produce one constant,
-    // not three.
-    var result = try compileForTest(alloc, "rule digit = ['0'-'9']\ndigit digit digit");
+    // The rule body contains three calls to "digit" via sequence.
+    var result = try compileForTest(
+        alloc,
+        "rule digit = ['0'-'9']\nrule triple = digit digit digit",
+    );
     defer result.deinit();
     defer deinit(alloc);
 
     try std.testing.expect(result.ok);
-    // Main chunk constants: one entry for "digit" (reused by all three
-    // op_call instructions).
-    try std.testing.expectEqual(@as(usize, 1), result.chunk.constants.items.len);
+    // The "triple" rule chunk: three op_call + op_return = 7 bytes.
+    const triple = result.rules.getChunkPtr(result.rules.get("triple").?) orelse
+        return error.TestUnexpectedResult;
+    const code = triple.code.items;
+    try std.testing.expectEqual(@as(usize, 7), code.len);
+    const call_op = @intFromEnum(OpCode.op_call);
+    try std.testing.expectEqual(call_op, code[0]);
+    try std.testing.expectEqual(call_op, code[2]);
+    try std.testing.expectEqual(call_op, code[4]);
+    // All three share the same rule index.
+    try std.testing.expectEqual(code[1], code[3]);
+    try std.testing.expectEqual(code[1], code[5]);
 }
 
 test "scanner error surfaces through compile with correct location" {

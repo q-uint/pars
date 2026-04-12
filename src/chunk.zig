@@ -97,6 +97,11 @@ pub const Chunk = struct {
     }
 
     pub fn addConstant(self: *Chunk, val: Value) !usize {
+        // Deduplicate: reuse an existing slot when the value is already
+        // present. Linear scan is fine for typical constant pool sizes.
+        for (self.constants.items, 0..) |existing, i| {
+            if (existing.eql(val)) return i;
+        }
         try self.constants.append(self.allocator, val);
         return self.constants.items.len - 1;
     }
@@ -190,10 +195,11 @@ test "emitOpConstant switches to wide form after 256 constants" {
     var c = Chunk.init(alloc);
     defer c.deinit();
 
-    // Fill up the first 256 constant slots.
-    for (0..256) |_| {
-        const lit = try object.copyLiteral("x");
-        try c.emitOpConstant(.op_match_string, .op_match_string_wide, .{ .obj = lit.asObj() }, 1);
+    // Fill up the first 256 constant slots with distinct values.
+    // Use span values with unique start positions so deduplication
+    // does not collapse them.
+    for (0..256) |i| {
+        try c.emitOpConstant(.op_match_string, .op_match_string_wide, .{ .span = .{ .start = i, .len = 0 } }, 1);
     }
 
     // The 257th should use the wide form.
@@ -212,4 +218,23 @@ test "emitOpConstant switches to wide form after 256 constants" {
     try std.testing.expectEqual(0x00, c.code.items[code_len_before + 1]);
     try std.testing.expectEqual(0x01, c.code.items[code_len_before + 2]);
     try std.testing.expectEqual(0x00, c.code.items[code_len_before + 3]);
+}
+
+test "addConstant deduplicates identical values" {
+    const object = @import("object.zig");
+    const alloc = std.testing.allocator;
+    object.init(alloc);
+    defer object.freeObjects();
+
+    var c = Chunk.init(alloc);
+    defer c.deinit();
+
+    const lit = try object.copyLiteral("digit");
+    const idx0 = try c.addConstant(.{ .obj = lit.asObj() });
+    const idx1 = try c.addConstant(.{ .obj = lit.asObj() });
+    const idx2 = try c.addConstant(.{ .obj = lit.asObj() });
+
+    try std.testing.expectEqual(idx0, idx1);
+    try std.testing.expectEqual(idx0, idx2);
+    try std.testing.expectEqual(@as(usize, 1), c.constants.items.len);
 }

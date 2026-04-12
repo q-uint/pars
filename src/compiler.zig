@@ -822,6 +822,22 @@ test "error recovery skips to next rule" {
     try std.testing.expect(result.rules.get("digit") != null);
 }
 
+test "repeated rule calls share a single constant pool entry" {
+    const alloc = std.testing.allocator;
+    object.init(alloc);
+    defer object.freeObjects();
+    // Three calls to "digit" in the rule body should produce one constant,
+    // not three.
+    var result = try compileForTest(alloc, "rule digit = ['0'-'9']\ndigit digit digit");
+    defer result.deinit();
+    defer deinit(alloc);
+
+    try std.testing.expect(result.ok);
+    // Main chunk constants: one entry for "digit" (reused by all three
+    // op_call instructions).
+    try std.testing.expectEqual(@as(usize, 1), result.chunk.constants.items.len);
+}
+
 test "scanner error surfaces through compile with correct location" {
     const alloc = std.testing.allocator;
     object.init(alloc);

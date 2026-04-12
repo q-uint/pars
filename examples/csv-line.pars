@@ -1,0 +1,9 @@
+-- Match a single CSV line: comma-separated fields, each field
+-- being a run of non-comma, non-newline bytes.
+--
+-- Usage:
+--   echo -n "alice,30,new york" | pars examples/csv-line.pars
+
+rule field_char = ['a'-'z' 'A'-'Z' '0'-'9' ' ' '-' '_' '.']
+rule field      = field_char+
+rule csv_line   = field (',' field)*

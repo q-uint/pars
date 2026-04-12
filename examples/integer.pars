@@ -1,0 +1,9 @@
+-- Match a signed or unsigned integer.
+--
+-- Usage:
+--   echo -n "-42" | pars examples/integer.pars
+--   echo -n "100" | pars examples/integer.pars
+
+rule digit   = ['0'-'9']
+rule sign    = '+' / '-'
+rule integer = sign? digit+

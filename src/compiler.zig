@@ -10,6 +10,8 @@ const Value = value_mod.Value;
 const Token = scanner.Token;
 const TokenType = scanner.TokenType;
 
+pub const RuleTable = std.StringHashMapUnmanaged(Chunk);
+
 // Comptime toggle: disassemble the chunk after a successful compile.
 // Off by default so the REPL and scripts produce clean output; flip to
 // true when debugging codegen.
@@ -65,6 +67,14 @@ var compiling_chunk: *Chunk = undefined;
 var errors: std.ArrayList(CompileError) = .empty;
 var errors_alloc: std.mem.Allocator = undefined;
 var compiling_source: []const u8 = &.{};
+var compiling_rules: ?*RuleTable = null;
+var last_rule_name: ?Token = null;
+var had_expression: bool = false;
+// Bytecode offset where the current expression started, used by
+// choice and quantifier operators to retroactively wrap compiled
+// code with backtracking instructions. Saved and restored across
+// recursive parsePrecedence calls.
+var last_expr_start: usize = 0;
 
 fn currentChunk() *Chunk {
     return compiling_chunk;
@@ -76,10 +86,13 @@ pub fn getErrors() []const CompileError {
     return errors.items;
 }
 
-pub fn compile(alloc: std.mem.Allocator, source: []const u8, chunk: *Chunk) bool {
+pub fn compile(alloc: std.mem.Allocator, source: []const u8, chunk: *Chunk, rule_table: *RuleTable) bool {
     scanner.init(source);
     compiling_chunk = chunk;
     compiling_source = source;
+    compiling_rules = rule_table;
+    last_rule_name = null;
+    had_expression = false;
 
     errors.clearRetainingCapacity();
     errors_alloc = alloc;
@@ -88,9 +101,13 @@ pub fn compile(alloc: std.mem.Allocator, source: []const u8, chunk: *Chunk) bool
     parser.panic_mode = false;
 
     advance();
-    expression();
-    consume(.eof, "Expect end of expression.");
+
+    while (!check(.eof)) {
+        declaration();
+    }
+
     endCompiler();
+    compiling_rules = null;
 
     return !parser.had_error;
 }
@@ -121,8 +138,102 @@ fn consume(token_type: TokenType, message: []const u8) void {
     errorAtCurrent(message);
 }
 
+fn check(token_type: TokenType) bool {
+    return parser.current.type == token_type;
+}
+
+fn match(token_type: TokenType) bool {
+    if (!check(token_type)) return false;
+    advance();
+    return true;
+}
+
 fn expression() void {
     parsePrecedence(.choice);
+}
+
+fn declaration() void {
+    if (match(.kw_rule)) {
+        ruleDeclaration();
+    } else {
+        statement();
+    }
+    if (parser.panic_mode) synchronize();
+}
+
+fn statement() void {
+    expressionStatement();
+}
+
+fn expressionStatement() void {
+    expression();
+    had_expression = true;
+}
+
+fn ruleDeclaration() void {
+    consume(.identifier, "Expect rule name.");
+    const name_token = parser.previous;
+    consume(.equal, "Expect '=' after rule name.");
+
+    // Intern the rule name for the rule table key.
+    const name_obj = object.copyLiteral(name_token.lexeme) catch {
+        errorAtPrevious("Out of memory.");
+        return;
+    };
+
+    // Compile the rule body into its own chunk.
+    const saved_chunk = compiling_chunk;
+    var rule_chunk = Chunk.init(errors_alloc);
+    compiling_chunk = &rule_chunk;
+
+    expression();
+    emitByte(@intFromEnum(OpCode.op_return));
+
+    if (comptime print_code) {
+        if (!parser.had_error) {
+            debug.disassembleChunk(currentChunk(), name_token.lexeme);
+        }
+    }
+
+    compiling_chunk = saved_chunk;
+
+    // Store the compiled chunk in the rule table, freeing any
+    // previous definition of the same name.
+    const gop = compiling_rules.?.getOrPut(errors_alloc, name_obj.chars()) catch {
+        errorAtPrevious("Out of memory.");
+        rule_chunk.deinit();
+        return;
+    };
+    if (gop.found_existing) {
+        gop.value_ptr.deinit();
+    }
+    gop.value_ptr.* = rule_chunk;
+    last_rule_name = name_token;
+}
+
+fn synchronize() void {
+    parser.panic_mode = false;
+
+    while (parser.current.type != .eof) {
+        if (parser.current.type == .kw_rule) return;
+        advance();
+    }
+}
+
+fn namedRule() void {
+    const name = parser.previous;
+    const lit = object.copyLiteral(name.lexeme) catch {
+        errorAtPrevious("Out of memory.");
+        return;
+    };
+    currentChunk().emitOpConstant(
+        .op_call,
+        .op_call_wide,
+        .{ .obj = lit.asObj() },
+        parser.previous.line,
+    ) catch {
+        errorAtPrevious("Out of memory.");
+    };
 }
 
 // Pratt loop. Sequence is the only operator without a token of its own:
@@ -131,9 +242,12 @@ fn expression() void {
 // if the next token can start a primary, recurse one precedence level
 // tighter so that sequence stays left-associative.
 fn parsePrecedence(precedence: Precedence) void {
+    const saved_expr_start = last_expr_start;
+    last_expr_start = currentChunk().code.items.len;
+
     advance();
     const prefix_rule = getRule(parser.previous.type).prefix orelse {
-        errorAtPrevious("Expected an expression: a string, a character literal, '.', '[', or '('.");
+        errorAtPrevious("Expected an expression: a string, a character literal, '.', '[', '(', or a rule name.");
         return;
     };
     prefix_rule();
@@ -162,6 +276,8 @@ fn parsePrecedence(precedence: Precedence) void {
 
         break;
     }
+
+    last_expr_start = saved_expr_start;
 }
 
 // Pratt rule table, one row per TokenType. Unassigned rows default to
@@ -180,6 +296,13 @@ const rules: [token_count]ParseRule = blk: {
     t[@intFromEnum(TokenType.string_i)] = .{ .prefix = stringLiteralIgnoreCase, .infix = null, .precedence = .none };
     t[@intFromEnum(TokenType.char)] = .{ .prefix = charLiteral, .infix = null, .precedence = .none };
     t[@intFromEnum(TokenType.dot)] = .{ .prefix = anyChar, .infix = null, .precedence = .none };
+    t[@intFromEnum(TokenType.identifier)] = .{ .prefix = namedRule, .infix = null, .precedence = .none };
+
+    t[@intFromEnum(TokenType.slash)] = .{ .prefix = null, .infix = choiceOp, .precedence = .choice };
+    t[@intFromEnum(TokenType.pipe)] = .{ .prefix = null, .infix = choiceOp, .precedence = .choice };
+    t[@intFromEnum(TokenType.star)] = .{ .prefix = null, .infix = starOp, .precedence = .quantifier };
+    t[@intFromEnum(TokenType.plus)] = .{ .prefix = null, .infix = plusOp, .precedence = .quantifier };
+    t[@intFromEnum(TokenType.question)] = .{ .prefix = null, .infix = questionOp, .precedence = .quantifier };
 
     break :blk t;
 };
@@ -319,6 +442,114 @@ fn emitHalt() void {
     emitByte(@intFromEnum(OpCode.op_halt));
 }
 
+// Emit a jump instruction with a 2-byte placeholder offset. Returns
+// the bytecode offset of the instruction (for later backpatching).
+fn emitJump(op: OpCode) usize {
+    const offset = currentChunk().code.items.len;
+    emitByte(@intFromEnum(op));
+    emitByte(0);
+    emitByte(0);
+    return offset;
+}
+
+// Backpatch a forward jump: write the offset from the instruction at
+// `offset` to the current end of the chunk.
+fn patchJump(offset: usize) void {
+    const target = currentChunk().code.items.len;
+    const ip_after = offset + 3;
+    const jump = @as(i32, @intCast(target)) - @as(i32, @intCast(ip_after));
+    if (jump < 0 or jump > std.math.maxInt(i16)) {
+        errorAtPrevious("Too much code to jump over.");
+        return;
+    }
+    const j: u16 = @intCast(jump);
+    currentChunk().code.items[offset + 1] = @intCast(j & 0xff);
+    currentChunk().code.items[offset + 2] = @intCast(j >> 8);
+}
+
+// Emit an op_commit that jumps backward to `loop_start`.
+fn emitLoop(loop_start: usize) void {
+    emitByte(@intFromEnum(OpCode.op_commit));
+    const ip_after = currentChunk().code.items.len + 2;
+    const offset = @as(i32, @intCast(loop_start)) - @as(i32, @intCast(ip_after));
+    if (offset < std.math.minInt(i16) or offset > std.math.maxInt(i16)) {
+        errorAtPrevious("Loop body too large.");
+        return;
+    }
+    const off16: u16 = @bitCast(@as(i16, @intCast(offset)));
+    emitByte(@intCast(off16 & 0xff));
+    emitByte(@intCast(off16 >> 8));
+}
+
+// Insert an OP_CHOICE placeholder (3 zero bytes) at `offset` in the
+// chunk, shifting existing code to the right.
+fn insertChoicePlaceholder(offset: usize) void {
+    currentChunk().insertBytesAt(offset, 3) catch {
+        errorAtPrevious("Out of memory.");
+        return;
+    };
+    currentChunk().code.items[offset] = @intFromEnum(OpCode.op_choice);
+}
+
+// Ordered choice infix: A / B. When called, A is already compiled
+// starting at last_expr_start. We retroactively insert OP_CHOICE
+// before A, emit OP_COMMIT after A, then compile B.
+fn choiceOp() void {
+    const left_start = last_expr_start;
+    insertChoicePlaceholder(left_start);
+    const commit_offset = emitJump(.op_commit);
+    // Patch OP_CHOICE: on failure, jump to start of alternative.
+    patchJump(left_start);
+    // Compile right operand (right-associative: same precedence).
+    parsePrecedence(.choice);
+    // Patch OP_COMMIT: on success, jump past alternative.
+    patchJump(commit_offset);
+}
+
+// A* : zero or more.
+fn starOp() void {
+    const operand_start = last_expr_start;
+    insertChoicePlaceholder(operand_start);
+    // OP_COMMIT loops back to the OP_CHOICE.
+    emitLoop(operand_start);
+    // Patch OP_CHOICE: on failure, exit loop.
+    patchJump(operand_start);
+}
+
+// A+ : one or more. Compiled as: A (choice-loop of A).
+// The first A must match; subsequent iterations use choice/commit.
+fn plusOp() void {
+    const operand_start = last_expr_start;
+    const operand_len = currentChunk().code.items.len - operand_start;
+    if (operand_len > 256) {
+        errorAtPrevious("Pattern too large for '+' quantifier.");
+        return;
+    }
+    // Copy the operand bytecode (before emitting anything that could
+    // trigger a reallocation and invalidate a slice into the code).
+    var buf: [256]u8 = undefined;
+    @memcpy(buf[0..operand_len], currentChunk().code.items[operand_start..][0..operand_len]);
+
+    // Emit: OP_CHOICE <exit> [duplicated A] OP_COMMIT <back>
+    const choice_offset = emitJump(.op_choice);
+    for (buf[0..operand_len]) |byte| {
+        emitByte(byte);
+    }
+    emitLoop(choice_offset);
+    patchJump(choice_offset);
+}
+
+// A? : optional.
+fn questionOp() void {
+    const operand_start = last_expr_start;
+    insertChoicePlaceholder(operand_start);
+    const commit_offset = emitJump(.op_commit);
+    // Patch OP_CHOICE: on failure, skip past OP_COMMIT.
+    patchJump(operand_start);
+    // Patch OP_COMMIT: continue (offset 0 since target is next byte).
+    patchJump(commit_offset);
+}
+
 fn emitMatchString(narrow: OpCode, wide: OpCode, bytes: []const u8) void {
     const lit = object.copyLiteral(bytes) catch {
         errorAtPrevious("Out of memory.");
@@ -330,6 +561,25 @@ fn emitMatchString(narrow: OpCode, wide: OpCode, bytes: []const u8) void {
 }
 
 fn endCompiler() void {
+    // If no bare expression was compiled but rules were defined,
+    // auto-emit a call to the last rule as the entry point.
+    if (!had_expression) {
+        if (last_rule_name) |name| {
+            const lit = object.copyLiteral(name.lexeme) catch {
+                errorAtPrevious("Out of memory.");
+                emitHalt();
+                return;
+            };
+            currentChunk().emitOpConstant(
+                .op_call,
+                .op_call_wide,
+                .{ .obj = lit.asObj() },
+                name.line,
+            ) catch {
+                errorAtPrevious("Out of memory.");
+            };
+        }
+    }
     emitHalt();
     if (comptime print_code) {
         if (!parser.had_error) {
@@ -429,13 +679,27 @@ fn findLine(source: []const u8, line: usize) LineRange {
     return .{ .start = source.len, .end = source.len };
 }
 
-fn compileForTest(alloc: std.mem.Allocator, source: []const u8) !struct {
+const TestCompileResult = struct {
     chunk: Chunk,
+    rules: RuleTable,
     ok: bool,
-} {
+    alloc: std.mem.Allocator,
+
+    fn deinit(self: *TestCompileResult) void {
+        self.chunk.deinit();
+        var it = self.rules.iterator();
+        while (it.next()) |entry| {
+            entry.value_ptr.deinit();
+        }
+        self.rules.deinit(self.alloc);
+    }
+};
+
+fn compileForTest(alloc: std.mem.Allocator, source: []const u8) !TestCompileResult {
     var c = Chunk.init(alloc);
-    const ok = compile(alloc, source, &c);
-    return .{ .chunk = c, .ok = ok };
+    var rt: RuleTable = .{};
+    const ok = compile(alloc, source, &c, &rt);
+    return .{ .chunk = c, .rules = rt, .ok = ok, .alloc = alloc };
 }
 
 test "stray token at start flags Expected-an-expression diagnostic" {
@@ -443,7 +707,7 @@ test "stray token at start flags Expected-an-expression diagnostic" {
     object.init(alloc);
     defer object.freeObjects();
     var result = try compileForTest(alloc, ")");
-    defer result.chunk.deinit();
+    defer result.deinit();
     defer deinit(alloc);
 
     try std.testing.expect(!result.ok);
@@ -454,18 +718,21 @@ test "stray token at start flags Expected-an-expression diagnostic" {
     try std.testing.expect(!errs[0].at_eof);
 }
 
-test "empty source flags Expected-an-expression at eof" {
+test "empty source compiles to just halt" {
     const alloc = std.testing.allocator;
     object.init(alloc);
     defer object.freeObjects();
     var result = try compileForTest(alloc, "");
-    defer result.chunk.deinit();
+    defer result.deinit();
     defer deinit(alloc);
 
-    try std.testing.expect(!result.ok);
-    const errs = getErrors();
-    try std.testing.expectEqual(@as(usize, 1), errs.len);
-    try std.testing.expect(errs[0].at_eof);
+    // An empty program is valid: no declarations, main chunk is just OP_HALT.
+    try std.testing.expect(result.ok);
+    try std.testing.expectEqual(@as(usize, 1), result.chunk.code.items.len);
+    try std.testing.expectEqual(
+        @intFromEnum(OpCode.op_halt),
+        result.chunk.code.items[0],
+    );
 }
 
 test "renderErrors produces snippet with caret pointing at token" {
@@ -474,7 +741,7 @@ test "renderErrors produces snippet with caret pointing at token" {
     defer object.freeObjects();
     const src = "   )";
     var result = try compileForTest(alloc, src);
-    defer result.chunk.deinit();
+    defer result.deinit();
     defer deinit(alloc);
 
     try std.testing.expect(!result.ok);
@@ -484,11 +751,75 @@ test "renderErrors produces snippet with caret pointing at token" {
     try renderErrors(src, &aw.writer);
 
     const expected =
-        "error: Expected an expression: a string, a character literal, '.', '[', or '('.\n" ++
+        "error: Expected an expression: a string, a character literal, '.', '[', '(', or a rule name.\n" ++
         " --> line 1, column 4\n" ++
         "   1 |    )\n" ++
-        "     |    ^ Expected an expression: a string, a character literal, '.', '[', or '('.\n";
+        "     |    ^ Expected an expression: a string, a character literal, '.', '[', '(', or a rule name.\n";
     try std.testing.expectEqualStrings(expected, aw.writer.buffered());
+}
+
+test "rule declaration populates rule table" {
+    const alloc = std.testing.allocator;
+    object.init(alloc);
+    defer object.freeObjects();
+    var result = try compileForTest(alloc, "rule digit = ['0'-'9']");
+    defer result.deinit();
+    defer deinit(alloc);
+
+    try std.testing.expect(result.ok);
+    try std.testing.expectEqual(@as(usize, 1), result.rules.count());
+    try std.testing.expect(result.rules.get("digit") != null);
+}
+
+test "multiple rule declarations populate rule table" {
+    const alloc = std.testing.allocator;
+    object.init(alloc);
+    defer object.freeObjects();
+    var result = try compileForTest(
+        alloc,
+        "rule digit = ['0'-'9']\nrule alpha = ['a'-'z']",
+    );
+    defer result.deinit();
+    defer deinit(alloc);
+
+    try std.testing.expect(result.ok);
+    try std.testing.expectEqual(@as(usize, 2), result.rules.count());
+    try std.testing.expect(result.rules.get("digit") != null);
+    try std.testing.expect(result.rules.get("alpha") != null);
+}
+
+test "auto-call emits op_call for last rule in main chunk" {
+    const alloc = std.testing.allocator;
+    object.init(alloc);
+    defer object.freeObjects();
+    var result = try compileForTest(alloc, "rule digit = ['0'-'9']");
+    defer result.deinit();
+    defer deinit(alloc);
+
+    try std.testing.expect(result.ok);
+    // Main chunk should have: OP_CALL <index> OP_HALT
+    try std.testing.expect(result.chunk.code.items.len >= 3);
+    try std.testing.expectEqual(
+        @intFromEnum(OpCode.op_call),
+        result.chunk.code.items[0],
+    );
+}
+
+test "error recovery skips to next rule" {
+    const alloc = std.testing.allocator;
+    object.init(alloc);
+    defer object.freeObjects();
+    // First rule has a bad body; second rule is valid.
+    var result = try compileForTest(
+        alloc,
+        "rule bad = )\nrule digit = ['0'-'9']",
+    );
+    defer result.deinit();
+    defer deinit(alloc);
+
+    try std.testing.expect(!result.ok);
+    // Despite the error, the second rule should still be in the table.
+    try std.testing.expect(result.rules.get("digit") != null);
 }
 
 test "scanner error surfaces through compile with correct location" {
@@ -496,7 +827,7 @@ test "scanner error surfaces through compile with correct location" {
     object.init(alloc);
     defer object.freeObjects();
     var result = try compileForTest(alloc, "\"unterminated");
-    defer result.chunk.deinit();
+    defer result.deinit();
     defer deinit(alloc);
 
     try std.testing.expect(!result.ok);

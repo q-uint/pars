@@ -8,11 +8,28 @@ const printValue = value_mod.printValue;
 const debug = @import("debug.zig");
 const compiler = @import("compiler.zig");
 const object = @import("object.zig");
+const RuleTable = compiler.RuleTable;
 
 // Comptime toggle: per-instruction disassembly during run(). Off by
 // default so the REPL and scripts produce clean output; flip to true
 // when debugging the dispatch loop.
 const trace_execution = false;
+
+const CallFrame = struct {
+    chunk: *Chunk,
+    ip: usize,
+};
+
+const max_frames = 64;
+
+const BacktrackFrame = struct {
+    ip: usize,
+    pos: usize,
+    chunk: *Chunk,
+    frame_count: usize,
+};
+
+const max_bt = 256;
 
 pub const InterpretResult = enum {
     ok,
@@ -40,6 +57,19 @@ pub fn Vm(comptime stack_size: ?comptime_int) type {
         // matches leave nothing here; the stack will hold saved (ip, pos)
         // pairs pushed by a future op_choice and popped by op_commit/fail.
         stack: Stack,
+        // Rule table: maps rule names to their compiled chunks. Populated
+        // by the compiler during rule declarations and persists across
+        // REPL iterations so rules defined on one line can be called later.
+        rules: RuleTable,
+        // Call stack for rule-to-rule invocation. Each frame saves the
+        // caller's chunk and ip so op_return can restore them.
+        frames: [max_frames]CallFrame,
+        frame_count: usize,
+        // Backtrack stack for ordered choice and quantifiers. Each
+        // frame saves enough state to restore the VM to the point
+        // before a speculative match attempt.
+        bt_stack: [max_bt]BacktrackFrame,
+        bt_top: usize,
         allocator: std.mem.Allocator,
 
         pub fn init(allocator: std.mem.Allocator) Self {
@@ -50,6 +80,11 @@ pub fn Vm(comptime stack_size: ?comptime_int) type {
                 .input = "",
                 .pos = 0,
                 .stack = Stack.init(allocator),
+                .rules = .{},
+                .frames = undefined,
+                .frame_count = 0,
+                .bt_stack = undefined,
+                .bt_top = 0,
                 .allocator = allocator,
             };
         }
@@ -78,7 +113,7 @@ pub fn Vm(comptime stack_size: ?comptime_int) type {
             var c = Chunk.init(self.allocator);
             defer c.deinit();
 
-            if (!compiler.compile(self.allocator, source, &c)) {
+            if (!compiler.compile(self.allocator, source, &c, &self.rules)) {
                 renderCompileErrorsToStderr(source);
                 return .compile_error;
             }
@@ -87,6 +122,8 @@ pub fn Vm(comptime stack_size: ?comptime_int) type {
             self.ip = 0;
             self.input = input;
             self.pos = 0;
+            self.frame_count = 0;
+            self.bt_top = 0;
             return self.run();
         }
 
@@ -118,41 +155,141 @@ pub fn Vm(comptime stack_size: ?comptime_int) type {
                 switch (op) {
                     .op_match_char => {
                         const byte = self.readByte();
-                        if (self.pos >= self.input.len) return .no_match;
-                        if (self.input[self.pos] != byte) return .no_match;
-                        self.pos += 1;
+                        if (self.pos >= self.input.len or self.input[self.pos] != byte) {
+                            if (self.fail() == .no_match) return .no_match;
+                        } else {
+                            self.pos += 1;
+                        }
                     },
                     .op_match_any => {
-                        if (self.pos >= self.input.len) return .no_match;
-                        self.pos += 1;
+                        if (self.pos >= self.input.len) {
+                            if (self.fail() == .no_match) return .no_match;
+                        } else {
+                            self.pos += 1;
+                        }
                     },
                     .op_match_string => {
                         const literal = self.readConstantLiteral();
-                        if (!self.consumePrefix(literal)) return .no_match;
+                        if (!self.consumePrefix(literal)) {
+                            if (self.fail() == .no_match) return .no_match;
+                        }
                     },
                     .op_match_string_wide => {
                         const literal = self.readConstantWideLiteral();
-                        if (!self.consumePrefix(literal)) return .no_match;
+                        if (!self.consumePrefix(literal)) {
+                            if (self.fail() == .no_match) return .no_match;
+                        }
                     },
                     .op_match_string_i => {
                         const literal = self.readConstantLiteral();
-                        if (!self.consumePrefixIgnoreCase(literal)) return .no_match;
+                        if (!self.consumePrefixIgnoreCase(literal)) {
+                            if (self.fail() == .no_match) return .no_match;
+                        }
                     },
                     .op_match_string_i_wide => {
                         const literal = self.readConstantWideLiteral();
-                        if (!self.consumePrefixIgnoreCase(literal)) return .no_match;
+                        if (!self.consumePrefixIgnoreCase(literal)) {
+                            if (self.fail() == .no_match) return .no_match;
+                        }
                     },
                     .op_match_charset => {
                         const cs = self.readConstantCharset();
-                        if (!self.consumeCharset(cs)) return .no_match;
+                        if (!self.consumeCharset(cs)) {
+                            if (self.fail() == .no_match) return .no_match;
+                        }
                     },
                     .op_match_charset_wide => {
                         const cs = self.readConstantWideCharset();
-                        if (!self.consumeCharset(cs)) return .no_match;
+                        if (!self.consumeCharset(cs)) {
+                            if (self.fail() == .no_match) return .no_match;
+                        }
+                    },
+                    .op_call => {
+                        if (!self.callRule(self.readConstant())) return .runtime_error;
+                    },
+                    .op_call_wide => {
+                        if (!self.callRule(self.readConstantWide())) return .runtime_error;
+                    },
+                    .op_return => {
+                        if (self.frame_count == 0) {
+                            self.runtimeError("op_return with empty call stack", .{});
+                            return .runtime_error;
+                        }
+                        self.frame_count -= 1;
+                        const frame = self.frames[self.frame_count];
+                        self.chunk = frame.chunk;
+                        self.ip = frame.ip;
+                    },
+                    .op_choice => {
+                        const offset = self.readJumpOffset();
+                        if (self.bt_top >= max_bt) {
+                            self.runtimeError("Backtrack stack overflow.", .{});
+                            return .runtime_error;
+                        }
+                        self.bt_stack[self.bt_top] = .{
+                            .ip = @intCast(@as(isize, @intCast(self.ip)) + offset),
+                            .pos = self.pos,
+                            .chunk = self.chunk.?,
+                            .frame_count = self.frame_count,
+                        };
+                        self.bt_top += 1;
+                    },
+                    .op_commit => {
+                        const offset = self.readJumpOffset();
+                        if (self.bt_top == 0) {
+                            self.runtimeError("op_commit with empty backtrack stack", .{});
+                            return .runtime_error;
+                        }
+                        self.bt_top -= 1;
+                        self.ip = @intCast(@as(isize, @intCast(self.ip)) + offset);
+                    },
+                    .op_fail => {
+                        if (self.fail() == .no_match) return .no_match;
                     },
                     .op_halt => return .ok,
                 }
             }
+        }
+
+        const FailResult = enum { backtracked, no_match };
+
+        fn fail(self: *Self) FailResult {
+            if (self.bt_top > 0) {
+                self.bt_top -= 1;
+                const frame = self.bt_stack[self.bt_top];
+                self.pos = frame.pos;
+                self.ip = frame.ip;
+                self.chunk = frame.chunk;
+                self.frame_count = frame.frame_count;
+                return .backtracked;
+            }
+            return .no_match;
+        }
+
+        fn readJumpOffset(self: *Self) i16 {
+            const lo = self.readByte();
+            const hi = self.readByte();
+            return @bitCast(@as(u16, lo) | (@as(u16, hi) << 8));
+        }
+
+        fn callRule(self: *Self, name_val: Value) bool {
+            const name = name_val.asObj().asLiteral().chars();
+            const rule_chunk = self.rules.getPtr(name) orelse {
+                self.runtimeError("Undefined rule '{s}'.", .{name});
+                return false;
+            };
+            if (self.frame_count >= max_frames) {
+                self.runtimeError("Call stack overflow.", .{});
+                return false;
+            }
+            self.frames[self.frame_count] = .{
+                .chunk = self.chunk.?,
+                .ip = self.ip,
+            };
+            self.frame_count += 1;
+            self.chunk = rule_chunk;
+            self.ip = 0;
+            return true;
         }
 
         fn consumePrefix(self: *Self, literal: []const u8) bool {
@@ -228,6 +365,11 @@ pub fn Vm(comptime stack_size: ?comptime_int) type {
 
         pub fn deinit(self: *Self) void {
             self.stack.deinit();
+            var it = self.rules.iterator();
+            while (it.next()) |entry| {
+                entry.value_ptr.deinit();
+            }
+            self.rules.deinit(self.allocator);
             compiler.deinit(self.allocator);
             object.freeObjects();
         }
@@ -430,4 +572,208 @@ test "charset fails on empty input" {
 test "charset in sequence" {
     try expectMatch("['a'-'z'] ['0'-'9']", "a1", .ok);
     try expectMatch("['a'-'z'] ['0'-'9']", "1a", .no_match);
+}
+
+test "single rule declaration matches via auto-call" {
+    try expectMatch(
+        "rule digit = ['0'-'9']",
+        "5",
+        .ok,
+    );
+}
+
+test "single rule declaration rejects non-matching input" {
+    try expectMatch(
+        "rule digit = ['0'-'9']",
+        "x",
+        .no_match,
+    );
+}
+
+test "rule calling another rule" {
+    try expectMatch(
+        "rule digit = ['0'-'9']\nrule two_digits = digit digit",
+        "42",
+        .ok,
+    );
+}
+
+test "rule calling another rule fails on short input" {
+    try expectMatch(
+        "rule digit = ['0'-'9']\nrule two_digits = digit digit",
+        "4",
+        .no_match,
+    );
+}
+
+test "forward rule reference" {
+    try expectMatch(
+        "rule pair = digit digit\nrule digit = ['0'-'9']",
+        "42",
+        .ok,
+    );
+}
+
+test "undefined rule produces runtime error" {
+    try expectMatch(
+        "bogus",
+        "x",
+        .runtime_error,
+    );
+}
+
+test "rule with sequence body" {
+    try expectMatch(
+        "rule http_ver = \"HTTP/\" ['0'-'9'] '.' ['0'-'9']",
+        "HTTP/1.1",
+        .ok,
+    );
+}
+
+test "empty program matches nothing" {
+    try expectMatch("", "", .ok);
+}
+
+// -- Choice tests --
+
+test "choice picks first matching alternative" {
+    try expectMatch("\"GET\" / \"POST\"", "GET /", .ok);
+}
+
+test "choice falls back to second alternative" {
+    try expectMatch("\"GET\" / \"POST\"", "POST /", .ok);
+}
+
+test "choice fails if no alternative matches" {
+    try expectMatch("\"GET\" / \"POST\"", "DELETE /", .no_match);
+}
+
+test "choice restores position on backtrack" {
+    // "GE" matches the first 2 bytes of "GET" but the full literal
+    // "GEX" fails, so the parser must backtrack to pos 0 for "GET".
+    try expectMatch("\"GEX\" / \"GET\"", "GET", .ok);
+}
+
+test "three-way choice" {
+    try expectMatch("\"a\" / \"b\" / \"c\"", "a", .ok);
+    try expectMatch("\"a\" / \"b\" / \"c\"", "b", .ok);
+    try expectMatch("\"a\" / \"b\" / \"c\"", "c", .ok);
+    try expectMatch("\"a\" / \"b\" / \"c\"", "d", .no_match);
+}
+
+test "choice with sequence: choice binds looser than sequence" {
+    // "ab" / "cd" means ("ab") / ("cd"), not "a" ("b" / "c") "d"
+    try expectMatch("'a' 'b' / 'c' 'd'", "ab", .ok);
+    try expectMatch("'a' 'b' / 'c' 'd'", "cd", .ok);
+    try expectMatch("'a' 'b' / 'c' 'd'", "ad", .no_match);
+}
+
+test "pipe is synonym for slash" {
+    try expectMatch("\"GET\" | \"POST\"", "POST", .ok);
+}
+
+test "choice in rules" {
+    try expectMatch(
+        "rule method = \"GET\" / \"POST\" / \"PUT\"\nrule req = method \" /\"",
+        "PUT /",
+        .ok,
+    );
+}
+
+// -- Quantifier tests --
+
+test "star matches zero occurrences" {
+    try expectMatch("'a'*", "", .ok);
+}
+
+test "star matches multiple occurrences" {
+    try expectMatch("'a'*", "aaaa", .ok);
+}
+
+test "star stops at non-matching byte" {
+    try expectMatch("'a'* 'b'", "aaab", .ok);
+}
+
+test "plus requires at least one match" {
+    try expectMatch("'a'+", "", .no_match);
+}
+
+test "plus matches one occurrence" {
+    try expectMatch("'a'+", "a", .ok);
+}
+
+test "plus matches many occurrences" {
+    try expectMatch("'a'+", "aaaa", .ok);
+}
+
+test "plus followed by literal" {
+    try expectMatch("['0'-'9']+ '.'", "123.", .ok);
+}
+
+test "question matches zero occurrences" {
+    try expectMatch("'a'? 'b'", "b", .ok);
+}
+
+test "question matches one occurrence" {
+    try expectMatch("'a'? 'b'", "ab", .ok);
+}
+
+test "quantifier with charset" {
+    try expectMatch("['a'-'z']+", "hello", .ok);
+    try expectMatch("['a'-'z']+", "HELLO", .no_match);
+}
+
+test "quantifier in rule" {
+    try expectMatch(
+        "rule digit = ['0'-'9']\nrule number = digit+",
+        "42",
+        .ok,
+    );
+}
+
+test "combined: choice and quantifiers" {
+    try expectMatch(
+        "rule alpha = ['a'-'z' 'A'-'Z']\n" ++
+            "rule digit = ['0'-'9']\n" ++
+            "rule ident = alpha (alpha / digit)*",
+        "foo123",
+        .ok,
+    );
+}
+
+test "combined: optional and sequence" {
+    try expectMatch(
+        "rule digit = ['0'-'9']\n" ++
+            "rule sign = '+' / '-'\n" ++
+            "rule integer = sign? digit+",
+        "-42",
+        .ok,
+    );
+}
+
+test "combined: optional sign with unsigned" {
+    try expectMatch(
+        "rule digit = ['0'-'9']\n" ++
+            "rule sign = '+' / '-'\n" ++
+            "rule integer = sign? digit+",
+        "42",
+        .ok,
+    );
+}
+
+test "rules persist across REPL iterations" {
+    var machine = VmTest.init(std.testing.allocator);
+    defer machine.deinit();
+
+    // First iteration: define a rule.
+    const r1 = machine.match("rule digit = ['0'-'9']", "5");
+    try std.testing.expectEqual(.ok, r1);
+
+    // Second iteration: call the rule by name.
+    const r2 = machine.match("digit", "7");
+    try std.testing.expectEqual(.ok, r2);
+
+    // Third iteration: rule still available.
+    const r3 = machine.match("digit digit", "42");
+    try std.testing.expectEqual(.ok, r3);
 }

@@ -1,0 +1,18 @@
+-- Match an HTTP/1.x request line: METHOD SP PATH SP VERSION
+--
+-- Usage:
+--   echo -n "GET /index.html HTTP/1.1" | pars examples/http-request-line.pars
+--   pars examples/http-request-line.pars examples/http-request-line.input
+
+rule upper  = ['A'-'Z']
+rule method = upper+
+
+rule path_char = ['a'-'z' 'A'-'Z' '0'-'9' '.' '/' '_']
+rule path      = path_char+
+
+rule digit   = ['0'-'9']
+rule version = "HTTP/" digit '.' digit
+
+rule sp = ' '
+
+rule request_line = method sp path sp version

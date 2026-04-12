@@ -14,10 +14,15 @@ pub fn main() !void {
 
     if (args.len == 1) {
         try repl(&vm, alloc);
-    } else if (args.len == 2) {
-        try runFile(&vm, args[1]);
+    } else if (args.len == 2 or args.len == 3) {
+        const input = if (args.len == 3)
+            readInput(alloc, args[2])
+        else
+            readStdin(alloc);
+        defer alloc.free(input);
+        try runFile(&vm, args[1], input);
     } else {
-        std.debug.print("Usage: pars [path]\n", .{});
+        std.debug.print("Usage: pars <grammar> [input]\n", .{});
         std.process.exit(64);
     }
 }
@@ -129,7 +134,33 @@ fn reportResult(stdout: anytype, result: InterpretResult, vm: *VM) !void {
     }
 }
 
-fn runFile(vm: *VM, path: []const u8) !void {
+fn readInput(alloc: std.mem.Allocator, path: []const u8) []const u8 {
+    return std.fs.cwd().readFileAlloc(alloc, path, std.math.maxInt(usize)) catch |err| switch (err) {
+        error.FileNotFound, error.AccessDenied => {
+            std.debug.print("Could not open input file \"{s}\".\n", .{path});
+            std.process.exit(74);
+        },
+        error.OutOfMemory => {
+            std.debug.print("Not enough memory to read \"{s}\".\n", .{path});
+            std.process.exit(74);
+        },
+        else => {
+            std.debug.print("Could not read input file \"{s}\".\n", .{path});
+            std.process.exit(74);
+        },
+    };
+}
+
+fn readStdin(alloc: std.mem.Allocator) []const u8 {
+    var buf: [4096]u8 = undefined;
+    var reader = std.fs.File.stdin().reader(&buf);
+    return reader.interface.allocRemaining(alloc, .unlimited) catch {
+        std.debug.print("Could not read stdin.\n", .{});
+        std.process.exit(74);
+    };
+}
+
+fn runFile(vm: *VM, path: []const u8, input: []const u8) !void {
     const source = std.fs.cwd().readFileAlloc(
         std.heap.page_allocator,
         path,
@@ -150,7 +181,7 @@ fn runFile(vm: *VM, path: []const u8) !void {
     };
     defer std.heap.page_allocator.free(source);
 
-    const result = vm.interpret(source);
+    const result = vm.match(source, input);
     switch (result) {
         .ok => {},
         .no_match => std.process.exit(1),

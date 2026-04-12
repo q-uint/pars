@@ -41,6 +41,12 @@ pub fn disassembleInstruction(c: *Chunk, offset: usize) usize {
         .op_match_string_i_wide => constantWideInstruction("OP_MATCH_STRING_I_WIDE", c, offset),
         .op_match_charset => constantInstruction("OP_MATCH_CHARSET", c, offset),
         .op_match_charset_wide => constantWideInstruction("OP_MATCH_CHARSET_WIDE", c, offset),
+        .op_call => constantInstruction("OP_CALL", c, offset),
+        .op_call_wide => constantWideInstruction("OP_CALL_WIDE", c, offset),
+        .op_return => simpleInstruction("OP_RETURN", offset),
+        .op_choice => jumpInstruction("OP_CHOICE", c, offset),
+        .op_commit => jumpInstruction("OP_COMMIT", c, offset),
+        .op_fail => simpleInstruction("OP_FAIL", offset),
         .op_halt => simpleInstruction("OP_HALT", offset),
     };
 }
@@ -67,6 +73,15 @@ fn constantWideInstruction(name: []const u8, c: *Chunk, offset: usize) usize {
     printValue(c.constants.items[constant]);
     std.debug.print("'\n", .{});
     return offset + 4;
+}
+
+fn jumpInstruction(name: []const u8, c: *Chunk, offset: usize) usize {
+    const lo = c.code.items[offset + 1];
+    const hi = c.code.items[offset + 2];
+    const jump: i16 = @bitCast(@as(u16, lo) | (@as(u16, hi) << 8));
+    const target: isize = @as(isize, @intCast(offset)) + 3 + jump;
+    std.debug.print("{s:<22} {d} -> {d}\n", .{ name, jump, target });
+    return offset + 3;
 }
 
 fn simpleInstruction(name: []const u8, offset: usize) usize {

@@ -1,0 +1,9 @@
+-- Match a C-style identifier: letter or underscore, then any
+-- combination of letters, digits, and underscores.
+--
+-- Usage:
+--   echo -n "foo_123" | pars examples/identifier.pars
+
+rule alpha = ['a'-'z' 'A'-'Z']
+rule digit = ['0'-'9']
+rule ident = (alpha / '_') (alpha / digit / '_')*

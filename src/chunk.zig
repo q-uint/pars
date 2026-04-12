@@ -22,6 +22,29 @@ pub const OpCode = enum(u8) {
     // the current position is a member of the set.
     op_match_charset,
     op_match_charset_wide,
+    // Call a named rule. The operand is a constant-pool index holding
+    // the rule name (an ObjLiteral). At runtime the VM looks up the
+    // name in its rule table and transfers control to the rule's chunk.
+    op_call,
+    op_call_wide,
+    // Return from a rule body, restoring the caller's chunk and ip.
+    op_return,
+    // Push a backtrack frame saving the current input position and
+    // the given forward jump target. If a match instruction fails
+    // while this frame is on the stack, the VM restores the saved
+    // position and jumps to the target (the start of the alternative).
+    // 3 bytes: opcode + signed 16-bit offset.
+    op_choice,
+    // Pop the top backtrack frame (the preceding alternative succeeded)
+    // and jump by the signed 16-bit offset. Used both for forward jumps
+    // (past the alternative in ordered choice) and backward jumps
+    // (looping in quantifiers).
+    // 3 bytes: opcode + signed 16-bit offset.
+    op_commit,
+    // Explicitly trigger a match failure. If a backtrack frame exists,
+    // restore state and continue; otherwise propagate .no_match.
+    // 1 byte.
+    op_fail,
     op_halt, // 1 byte
 };
 
@@ -97,6 +120,35 @@ pub const Chunk = struct {
             try self.write(@intCast(index & 0xff), line);
             try self.write(@intCast((index >> 8) & 0xff), line);
             try self.write(@intCast((index >> 16) & 0xff), line);
+        }
+    }
+
+    // Insert `count` zero bytes at `offset`, shifting existing code
+    // to the right. The line-info run covering `offset` is extended
+    // so that the new bytes inherit the same source line.
+    pub fn insertBytesAt(self: *Chunk, offset: usize, count: usize) !void {
+        const old_len = self.code.items.len;
+        // Grow code array by `count` bytes.
+        for (0..count) |_| try self.code.append(self.allocator, 0);
+        // Shift existing bytes to the right.
+        std.mem.copyBackwards(
+            u8,
+            self.code.items[offset + count .. old_len + count],
+            self.code.items[offset..old_len],
+        );
+        // Zero the inserted gap.
+        @memset(self.code.items[offset..][0..count], 0);
+        // Extend the line-info run that covers the insertion point.
+        var pos: usize = 0;
+        for (self.lines.items) |*run| {
+            if (pos + run.count > offset) {
+                run.count += count;
+                return;
+            }
+            pos += run.count;
+        }
+        if (self.lines.items.len > 0) {
+            self.lines.items[self.lines.items.len - 1].count += count;
         }
     }
 

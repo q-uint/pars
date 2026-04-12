@@ -1,5 +1,4 @@
 const std = @import("std");
-const Value = @import("value.zig").Value;
 
 pub const OpCode = enum(u8) {
     // Match a single byte from the input against an inline byte operand.
@@ -33,7 +32,7 @@ pub const Chunk = struct {
     // LineRun. getLine() walks the runs to resolve a bytecode offset
     // to a source line -- acceptable because it only runs on errors.
     lines: std.ArrayList(LineRun),
-    constants: std.ArrayList(Value),
+    constants: std.ArrayList([]const u8),
     allocator: std.mem.Allocator,
 
     pub fn init(allocator: std.mem.Allocator) Chunk {
@@ -67,7 +66,7 @@ pub const Chunk = struct {
         unreachable;
     }
 
-    pub fn addConstant(self: *Chunk, val: Value) !usize {
+    pub fn addConstant(self: *Chunk, val: []const u8) !usize {
         try self.constants.append(self.allocator, val);
         return self.constants.items.len - 1;
     }
@@ -79,7 +78,7 @@ pub const Chunk = struct {
         self: *Chunk,
         op_narrow: OpCode,
         op_wide: OpCode,
-        val: Value,
+        val: []const u8,
         line: usize,
     ) !void {
         const index = try self.addConstant(val);

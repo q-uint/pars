@@ -2,7 +2,7 @@ const std = @import("std");
 const chunk = @import("chunk.zig");
 const OpCode = chunk.OpCode;
 const Chunk = chunk.Chunk;
-const printValue = @import("value.zig").printValue;
+const printConstant = @import("value.zig").printConstant;
 
 pub fn disassembleChunk(c: *Chunk, name: []const u8) void {
     std.debug.print("== {s} ==\n", .{name});
@@ -51,7 +51,7 @@ fn byteInstruction(name: []const u8, c: *Chunk, offset: usize) usize {
 fn constantInstruction(name: []const u8, c: *Chunk, offset: usize) usize {
     const constant = c.code.items[offset + 1];
     std.debug.print("{s:<22} {d:>4} '", .{ name, constant });
-    printValue(c.constants.items[constant]);
+    printConstant(c.constants.items[constant]);
     std.debug.print("'\n", .{});
     return offset + 2;
 }
@@ -61,7 +61,7 @@ fn constantWideInstruction(name: []const u8, c: *Chunk, offset: usize) usize {
         (@as(usize, c.code.items[offset + 2]) << 8) |
         (@as(usize, c.code.items[offset + 3]) << 16);
     std.debug.print("{s:<22} {d:>4} '", .{ name, constant });
-    printValue(c.constants.items[constant]);
+    printConstant(c.constants.items[constant]);
     std.debug.print("'\n", .{});
     return offset + 4;
 }

@@ -2,8 +2,9 @@ const std = @import("std");
 const chunk_mod = @import("chunk.zig");
 const Chunk = chunk_mod.Chunk;
 const OpCode = chunk_mod.OpCode;
-const Value = @import("value.zig").Value;
-const printValue = @import("value.zig").printValue;
+const value_mod = @import("value.zig");
+const Value = value_mod.Value;
+const printValue = value_mod.printValue;
 const debug = @import("debug.zig");
 const compiler = @import("compiler.zig");
 
@@ -108,8 +109,10 @@ pub fn Vm(comptime stack_size: ?comptime_int) type {
                 }
 
                 const instruction = self.readByte();
-                const op = std.meta.intToEnum(OpCode, instruction) catch
+                const op = std.meta.intToEnum(OpCode, instruction) catch {
+                    self.runtimeError("unknown opcode {d}", .{instruction});
                     return .runtime_error;
+                };
                 switch (op) {
                     .op_match_char => {
                         const byte = self.readByte();
@@ -176,6 +179,18 @@ pub fn Vm(comptime stack_size: ?comptime_int) type {
                 (@as(usize, self.readByte()) << 8) |
                 (@as(usize, self.readByte()) << 16);
             return self.chunk.?.constants.items[index];
+        }
+
+        fn runtimeError(self: *Self, comptime fmt: []const u8, args: anytype) void {
+            var buf: [1024]u8 = undefined;
+            var w = std.fs.File.stderr().writer(&buf);
+            w.interface.print(fmt, args) catch {};
+            w.interface.print("\n", .{}) catch {};
+
+            // ip points past the offending instruction, so subtract 1.
+            const line = self.chunk.?.getLine(self.ip - 1);
+            w.interface.print("[line {d}] in script\n", .{line}) catch {};
+            w.interface.flush() catch {};
         }
 
         pub fn deinit(self: *Self) void {

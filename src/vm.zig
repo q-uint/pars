@@ -6,9 +6,10 @@ const value_mod = @import("value.zig");
 const Value = value_mod.Value;
 const printValue = value_mod.printValue;
 const debug = @import("debug.zig");
-const compiler = @import("compiler.zig");
+const compiler_mod = @import("compiler.zig");
 const object = @import("object.zig");
-const RuleTable = compiler.RuleTable;
+const RuleTable = compiler_mod.RuleTable;
+const Compiler = compiler_mod.Compiler;
 
 // Comptime toggle: per-instruction disassembly during run(). Off by
 // default so the REPL and scripts produce clean output; flip to true
@@ -18,6 +19,10 @@ const trace_execution = false;
 const CallFrame = struct {
     chunk: *Chunk,
     ip: usize,
+    // Input position when this frame was entered. Used to detect
+    // left recursion: if we call the same rule at the same position,
+    // no input can ever be consumed and the parse would loop forever.
+    entry_pos: usize,
 };
 
 const max_frames = 64;
@@ -71,9 +76,10 @@ pub fn Vm(comptime stack_size: ?comptime_int) type {
         bt_stack: [max_bt]BacktrackFrame,
         bt_top: usize,
         allocator: std.mem.Allocator,
+        obj_pool: object.ObjPool,
+        compiler: Compiler,
 
         pub fn init(allocator: std.mem.Allocator) Self {
-            object.init(allocator);
             return .{
                 .chunk = null,
                 .ip = 0,
@@ -86,6 +92,8 @@ pub fn Vm(comptime stack_size: ?comptime_int) type {
                 .bt_stack = undefined,
                 .bt_top = 0,
                 .allocator = allocator,
+                .obj_pool = object.ObjPool.init(allocator),
+                .compiler = Compiler.init(allocator),
             };
         }
 
@@ -113,8 +121,8 @@ pub fn Vm(comptime stack_size: ?comptime_int) type {
             var c = Chunk.init(self.allocator);
             defer c.deinit();
 
-            if (!compiler.compile(self.allocator, source, &c, &self.rules)) {
-                renderCompileErrorsToStderr(source);
+            if (!self.compiler.compile(source, &c, &self.rules, &self.obj_pool)) {
+                self.renderCompileErrorsToStderr(source);
                 return .compile_error;
             }
 
@@ -281,6 +289,22 @@ pub fn Vm(comptime stack_size: ?comptime_int) type {
                 self.runtimeError("Undefined rule '{s}'.", .{name});
                 return false;
             };
+            // Detect left recursion: if we are already inside a call
+            // to the same rule at the same input position, no input
+            // can ever be consumed and the parse would loop forever.
+            for (self.frames[0..self.frame_count]) |f| {
+                if (f.chunk == rule_chunk and f.entry_pos == self.pos) {
+                    const name = if (index < self.rules.names.items.len)
+                        self.rules.names.items[index]
+                    else
+                        "(unknown)";
+                    self.runtimeError(
+                        "Left recursion detected in rule '{s}'.",
+                        .{name},
+                    );
+                    return false;
+                }
+            }
             if (self.frame_count >= max_frames) {
                 self.runtimeError("Call stack overflow.", .{});
                 return false;
@@ -288,6 +312,7 @@ pub fn Vm(comptime stack_size: ?comptime_int) type {
             self.frames[self.frame_count] = .{
                 .chunk = self.chunk.?,
                 .ip = self.ip,
+                .entry_pos = self.pos,
             };
             self.frame_count += 1;
             self.chunk = rule_chunk;
@@ -373,11 +398,18 @@ pub fn Vm(comptime stack_size: ?comptime_int) type {
             w.interface.flush() catch {};
         }
 
+        fn renderCompileErrorsToStderr(self: *Self, source: []const u8) void {
+            var buf: [1024]u8 = undefined;
+            var stderr_writer = std.fs.File.stderr().writer(&buf);
+            self.compiler.renderErrors(source, &stderr_writer.interface) catch return;
+            stderr_writer.interface.flush() catch return;
+        }
+
         pub fn deinit(self: *Self) void {
             self.stack.deinit();
             self.rules.deinit(self.allocator);
-            compiler.deinit(self.allocator);
-            object.freeObjects();
+            self.compiler.deinit();
+            self.obj_pool.deinit();
         }
     };
 }
@@ -447,13 +479,6 @@ const DynamicStack = struct {
         self.items.deinit(self.allocator);
     }
 };
-
-fn renderCompileErrorsToStderr(source: []const u8) void {
-    var buf: [1024]u8 = undefined;
-    var stderr_writer = std.fs.File.stderr().writer(&buf);
-    compiler.renderErrors(source, &stderr_writer.interface) catch return;
-    stderr_writer.interface.flush() catch return;
-}
 
 fn haltChunk(alloc: std.mem.Allocator) !Chunk {
     var c = Chunk.init(alloc);
@@ -764,6 +789,14 @@ test "combined: optional sign with unsigned" {
             "rule integer = sign? digit+",
         "42",
         .ok,
+    );
+}
+
+test "left-recursive rule produces left-recursion error" {
+    try expectMatch(
+        "rule expr = expr \"+\" expr / ['0'-'9']",
+        "1+2",
+        .runtime_error,
     );
 }
 

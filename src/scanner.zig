@@ -90,7 +90,7 @@ pub const Token = struct {
     len: usize,
 };
 
-const Scanner = struct {
+pub const Scanner = struct {
     start: usize,
     current: usize,
     line: usize,
@@ -104,73 +104,215 @@ const Scanner = struct {
     /// Snapshot of the token's starting column, taken at the same time.
     token_col: usize,
     source: []const u8,
+
+    pub fn init(source: []const u8) Scanner {
+        return .{
+            .source = source,
+            .start = 0,
+            .current = 0,
+            .line = 1,
+            .line_start = 0,
+            .token_line = 1,
+            .token_col = 1,
+        };
+    }
+
+    pub fn scanToken(self: *Scanner) Token {
+        self.skipWhitespace();
+        self.start = self.current;
+        self.token_line = self.line;
+        self.token_col = self.start - self.line_start + 1;
+
+        if (self.isAtEnd()) return self.makeToken(.eof);
+
+        const c = self.advance();
+
+        if (c == 'i' and self.peek() == '"') {
+            _ = self.advance();
+            const tok = self.string();
+            if (tok.type == .err) return tok;
+            return self.makeToken(.string_i);
+        }
+
+        if (isAlpha(c)) return self.identifier();
+
+        switch (c) {
+            '(' => return self.makeToken(.left_paren),
+            ')' => return self.makeToken(.right_paren),
+            '[' => return self.makeToken(.left_bracket),
+            ']' => return self.makeToken(.right_bracket),
+            '{' => return self.makeToken(.left_brace),
+            '}' => return self.makeToken(.right_brace),
+            ',' => return self.makeToken(.comma),
+            ':' => return self.makeToken(.colon),
+            '.' => return self.makeToken(.dot),
+            '%' => return self.makeToken(.percent),
+            '^' => return self.makeToken(.caret),
+            '-' => return self.makeToken(.minus),
+            '/' => return self.makeToken(.slash),
+            '|' => return self.makeToken(.pipe),
+            '*' => return self.makeToken(.star),
+            '+' => return self.makeToken(.plus),
+            '?' => return self.makeToken(.question),
+            '!' => return self.makeToken(.bang),
+            '&' => return self.makeToken(.amp),
+            '=' => return self.makeToken(if (self.match('>')) .arrow else .equal),
+            '"' => return self.string(),
+            '\'' => return self.charLiteral(),
+            else => return self.errorToken("Unexpected character."),
+        }
+    }
+
+    fn isAtEnd(self: *const Scanner) bool {
+        return self.current >= self.source.len;
+    }
+
+    fn advance(self: *Scanner) u8 {
+        const c = self.source[self.current];
+        self.current += 1;
+        return c;
+    }
+
+    fn peek(self: *const Scanner) u8 {
+        if (self.isAtEnd()) return 0;
+        return self.source[self.current];
+    }
+
+    fn peekNext(self: *const Scanner) u8 {
+        if (self.current + 1 >= self.source.len) return 0;
+        return self.source[self.current + 1];
+    }
+
+    fn match(self: *Scanner, expected: u8) bool {
+        if (self.isAtEnd()) return false;
+        if (self.source[self.current] != expected) return false;
+        self.current += 1;
+        return true;
+    }
+
+    fn identifier(self: *Scanner) Token {
+        while (isAlpha(self.peek()) or isDigit(self.peek())) _ = self.advance();
+        return self.makeToken(self.identifierType());
+    }
+
+    fn identifierType(self: *const Scanner) TokenType {
+        const lexeme = self.source[self.start..self.current];
+        switch (lexeme[0]) {
+            'e' => return self.checkKeyword(1, "xtends", .kw_extends),
+            'g' => return self.checkKeyword(1, "rammar", .kw_grammar),
+            'l' => return self.checkKeyword(1, "et", .kw_let),
+            'r' => return self.checkKeyword(1, "ule", .kw_rule),
+            's' => return self.checkKeyword(1, "uper", .kw_super),
+            else => return .identifier,
+        }
+    }
+
+    fn checkKeyword(self: *const Scanner, kw_start: usize, rest: []const u8, token_type: TokenType) TokenType {
+        const lexeme = self.source[self.start..self.current];
+        if (lexeme.len == kw_start + rest.len and std.mem.eql(u8, lexeme[kw_start..], rest)) {
+            return token_type;
+        }
+        return .identifier;
+    }
+
+    fn string(self: *Scanner) Token {
+        if (self.peek() == '"' and self.peekNext() == '"') {
+            _ = self.advance();
+            _ = self.advance();
+            return self.tripleString();
+        }
+
+        while (self.peek() != '"' and !self.isAtEnd()) {
+            if (self.peek() == '\n') {
+                self.line += 1;
+                self.line_start = self.current + 1;
+            }
+            _ = self.advance();
+        }
+
+        if (self.isAtEnd()) return self.errorToken("Unterminated string.");
+
+        _ = self.advance();
+        return self.makeToken(.string);
+    }
+
+    fn tripleString(self: *Scanner) Token {
+        while (!self.isAtEnd()) {
+            if (self.peek() == '"' and self.peekNext() == '"' and
+                self.current + 2 < self.source.len and
+                self.source[self.current + 2] == '"')
+            {
+                _ = self.advance();
+                _ = self.advance();
+                _ = self.advance();
+                return self.makeToken(.string);
+            }
+            if (self.peek() == '\n') {
+                self.line += 1;
+                self.line_start = self.current + 1;
+            }
+            _ = self.advance();
+        }
+        return self.errorToken("Unterminated triple-quoted string.");
+    }
+
+    fn charLiteral(self: *Scanner) Token {
+        while (self.peek() != '\'' and !self.isAtEnd()) {
+            if (self.peek() == '\n') return self.errorToken("Unterminated character literal.");
+            _ = self.advance();
+        }
+
+        if (self.isAtEnd()) return self.errorToken("Unterminated character literal.");
+
+        _ = self.advance();
+        return self.makeToken(.char);
+    }
+
+    fn skipWhitespace(self: *Scanner) void {
+        while (true) {
+            switch (self.peek()) {
+                ' ', '\r', '\t' => {
+                    _ = self.advance();
+                },
+                '\n' => {
+                    self.line += 1;
+                    _ = self.advance();
+                    self.line_start = self.current;
+                },
+                '-' => {
+                    if (self.peekNext() == '-') {
+                        while (self.peek() != '\n' and !self.isAtEnd()) _ = self.advance();
+                    } else {
+                        return;
+                    }
+                },
+                else => return,
+            }
+        }
+    }
+
+    fn makeToken(self: *const Scanner, token_type: TokenType) Token {
+        return .{
+            .type = token_type,
+            .lexeme = self.source[self.start..self.current],
+            .line = self.token_line,
+            .column = self.token_col,
+            .start = self.start,
+            .len = self.current - self.start,
+        };
+    }
+
+    fn errorToken(self: *const Scanner, message: []const u8) Token {
+        return .{
+            .type = .err,
+            .lexeme = message,
+            .line = self.token_line,
+            .column = self.token_col,
+            .start = self.start,
+            .len = self.current - self.start,
+        };
+    }
 };
-
-var scanner: Scanner = undefined;
-
-pub fn init(source: []const u8) void {
-    scanner.source = source;
-    scanner.start = 0;
-    scanner.current = 0;
-    scanner.line = 1;
-    scanner.line_start = 0;
-    scanner.token_line = 1;
-    scanner.token_col = 1;
-}
-
-pub fn getSource() []const u8 {
-    return scanner.source;
-}
-
-pub fn scanToken() Token {
-    skipWhitespace();
-    scanner.start = scanner.current;
-    scanner.token_line = scanner.line;
-    scanner.token_col = scanner.start - scanner.line_start + 1;
-
-    if (isAtEnd()) return makeToken(.eof);
-
-    const c = advance();
-
-    if (c == 'i' and peek() == '"') {
-        _ = advance();
-        const tok = string();
-        if (tok.type == .err) return tok;
-        return makeToken(.string_i);
-    }
-
-    if (isAlpha(c)) return identifier();
-
-    switch (c) {
-        '(' => return makeToken(.left_paren),
-        ')' => return makeToken(.right_paren),
-        '[' => return makeToken(.left_bracket),
-        ']' => return makeToken(.right_bracket),
-        '{' => return makeToken(.left_brace),
-        '}' => return makeToken(.right_brace),
-        ',' => return makeToken(.comma),
-        ':' => return makeToken(.colon),
-        '.' => return makeToken(.dot),
-        '%' => return makeToken(.percent),
-        '^' => return makeToken(.caret),
-        '-' => return makeToken(.minus),
-        '/' => return makeToken(.slash),
-        '|' => return makeToken(.pipe),
-        '*' => return makeToken(.star),
-        '+' => return makeToken(.plus),
-        '?' => return makeToken(.question),
-        '!' => return makeToken(.bang),
-        '&' => return makeToken(.amp),
-        '=' => return makeToken(if (match('>')) .arrow else .equal),
-        '"' => return string(),
-        '\'' => return charLiteral(),
-        else => return errorToken("Unexpected character."),
-    }
-}
-
-fn isAtEnd() bool {
-    return scanner.current >= scanner.source.len;
-}
 
 fn isAlpha(c: u8) bool {
     return (c >= 'a' and c <= 'z') or
@@ -182,162 +324,16 @@ fn isDigit(c: u8) bool {
     return c >= '0' and c <= '9';
 }
 
-fn advance() u8 {
-    const c = scanner.source[scanner.current];
-    scanner.current += 1;
-    return c;
-}
-
-fn peek() u8 {
-    if (isAtEnd()) return 0;
-    return scanner.source[scanner.current];
-}
-
-fn peekNext() u8 {
-    if (scanner.current + 1 >= scanner.source.len) return 0;
-    return scanner.source[scanner.current + 1];
-}
-
-fn match(expected: u8) bool {
-    if (isAtEnd()) return false;
-    if (scanner.source[scanner.current] != expected) return false;
-    scanner.current += 1;
-    return true;
-}
-
-fn identifier() Token {
-    while (isAlpha(peek()) or isDigit(peek())) _ = advance();
-    return makeToken(identifierType());
-}
-
-fn identifierType() TokenType {
-    const lexeme = scanner.source[scanner.start..scanner.current];
-    switch (lexeme[0]) {
-        'e' => return checkKeyword(1, "xtends", .kw_extends),
-        'g' => return checkKeyword(1, "rammar", .kw_grammar),
-        'l' => return checkKeyword(1, "et", .kw_let),
-        'r' => return checkKeyword(1, "ule", .kw_rule),
-        's' => return checkKeyword(1, "uper", .kw_super),
-        else => return .identifier,
-    }
-}
-
-fn checkKeyword(start: usize, rest: []const u8, token_type: TokenType) TokenType {
-    const lexeme = scanner.source[scanner.start..scanner.current];
-    if (lexeme.len == start + rest.len and std.mem.eql(u8, lexeme[start..], rest)) {
-        return token_type;
-    }
-    return .identifier;
-}
-
-fn string() Token {
-    if (peek() == '"' and peekNext() == '"') {
-        _ = advance();
-        _ = advance();
-        return tripleString();
-    }
-
-    while (peek() != '"' and !isAtEnd()) {
-        if (peek() == '\n') {
-            scanner.line += 1;
-            scanner.line_start = scanner.current + 1;
-        }
-        _ = advance();
-    }
-
-    if (isAtEnd()) return errorToken("Unterminated string.");
-
-    _ = advance();
-    return makeToken(.string);
-}
-
-fn tripleString() Token {
-    while (!isAtEnd()) {
-        if (peek() == '"' and peekNext() == '"' and
-            scanner.current + 2 < scanner.source.len and
-            scanner.source[scanner.current + 2] == '"')
-        {
-            _ = advance();
-            _ = advance();
-            _ = advance();
-            return makeToken(.string);
-        }
-        if (peek() == '\n') {
-            scanner.line += 1;
-            scanner.line_start = scanner.current + 1;
-        }
-        _ = advance();
-    }
-    return errorToken("Unterminated triple-quoted string.");
-}
-
-fn charLiteral() Token {
-    while (peek() != '\'' and !isAtEnd()) {
-        if (peek() == '\n') return errorToken("Unterminated character literal.");
-        _ = advance();
-    }
-
-    if (isAtEnd()) return errorToken("Unterminated character literal.");
-
-    _ = advance();
-    return makeToken(.char);
-}
-
-fn skipWhitespace() void {
-    while (true) {
-        switch (peek()) {
-            ' ', '\r', '\t' => {
-                _ = advance();
-            },
-            '\n' => {
-                scanner.line += 1;
-                _ = advance();
-                scanner.line_start = scanner.current;
-            },
-            '-' => {
-                if (peekNext() == '-') {
-                    while (peek() != '\n' and !isAtEnd()) _ = advance();
-                } else {
-                    return;
-                }
-            },
-            else => return,
-        }
-    }
-}
-
-fn makeToken(token_type: TokenType) Token {
-    return .{
-        .type = token_type,
-        .lexeme = scanner.source[scanner.start..scanner.current],
-        .line = scanner.token_line,
-        .column = scanner.token_col,
-        .start = scanner.start,
-        .len = scanner.current - scanner.start,
-    };
-}
-
-fn errorToken(message: []const u8) Token {
-    return .{
-        .type = .err,
-        .lexeme = message,
-        .line = scanner.token_line,
-        .column = scanner.token_col,
-        .start = scanner.start,
-        .len = scanner.current - scanner.start,
-    };
-}
-
 const Expected = struct { type: TokenType, lexeme: []const u8 };
 
 fn expectTokens(source: []const u8, expected: []const Expected) !void {
-    init(source);
+    var s = Scanner.init(source);
     for (expected) |e| {
-        const tok = scanToken();
+        const tok = s.scanToken();
         try std.testing.expectEqual(e.type, tok.type);
         try std.testing.expectEqualStrings(e.lexeme, tok.lexeme);
     }
-    const tail = scanToken();
+    const tail = s.scanToken();
     try std.testing.expectEqual(TokenType.eof, tail.type);
 }
 
@@ -412,10 +408,11 @@ test "plain string literal" {
 }
 
 test "triple-quoted string allows newlines" {
-    try expectTokens("\"\"\"a\nb\"\"\"", &.{
-        .{ .type = .string, .lexeme = "\"\"\"a\nb\"\"\"" },
-    });
-    try std.testing.expectEqual(@as(usize, 2), scanner.line);
+    var s = Scanner.init("\"\"\"a\nb\"\"\"");
+    const tok = s.scanToken();
+    try std.testing.expectEqual(TokenType.string, tok.type);
+    try std.testing.expectEqualStrings("\"\"\"a\nb\"\"\"", tok.lexeme);
+    try std.testing.expectEqual(@as(usize, 2), s.line);
 }
 
 test "case-insensitive string literal" {
@@ -425,15 +422,15 @@ test "case-insensitive string literal" {
 }
 
 test "unterminated string produces error" {
-    init("\"oops");
-    const tok = scanToken();
+    var s = Scanner.init("\"oops");
+    const tok = s.scanToken();
     try std.testing.expectEqual(TokenType.err, tok.type);
     try std.testing.expectEqualStrings("Unterminated string.", tok.lexeme);
 }
 
 test "unterminated triple-quoted string" {
-    init("\"\"\"oops");
-    const tok = scanToken();
+    var s = Scanner.init("\"\"\"oops");
+    const tok = s.scanToken();
     try std.testing.expectEqual(TokenType.err, tok.type);
     try std.testing.expectEqualStrings("Unterminated triple-quoted string.", tok.lexeme);
 }
@@ -445,15 +442,15 @@ test "character literal" {
 }
 
 test "unterminated character literal at eof" {
-    init("'a");
-    const tok = scanToken();
+    var s = Scanner.init("'a");
+    const tok = s.scanToken();
     try std.testing.expectEqual(TokenType.err, tok.type);
     try std.testing.expectEqualStrings("Unterminated character literal.", tok.lexeme);
 }
 
 test "character literal rejects newline" {
-    init("'\n'");
-    const tok = scanToken();
+    var s = Scanner.init("'\n'");
+    const tok = s.scanToken();
     try std.testing.expectEqual(TokenType.err, tok.type);
 }
 
@@ -473,10 +470,10 @@ test "identifier starting with i is not a case-insensitive string" {
 }
 
 test "newline bumps line counter" {
-    init("a\nb");
-    const first = scanToken();
+    var s = Scanner.init("a\nb");
+    const first = s.scanToken();
     try std.testing.expectEqual(@as(usize, 1), first.line);
-    const second = scanToken();
+    const second = s.scanToken();
     try std.testing.expectEqual(@as(usize, 2), second.line);
 }
 

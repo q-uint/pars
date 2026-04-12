@@ -250,6 +250,41 @@ test "repl: unknown meta command and eof exit" {
     try std.testing.expectEqualStrings(expected, aw.writer.buffered());
 }
 
+fn runExample(comptime grammar_path: []const u8, input: []const u8) !void {
+    const alloc = std.testing.allocator;
+    var vm = VM.init(alloc);
+    defer vm.deinit();
+    const source = try std.fs.cwd().readFileAlloc(alloc, grammar_path, std.math.maxInt(usize));
+    defer alloc.free(source);
+    const result = vm.match(source, input);
+    try std.testing.expectEqual(.ok, result);
+    try std.testing.expectEqual(input.len, vm.pos);
+}
+
+test "example: csv-line" {
+    try runExample("examples/csv-line.pars", "alice,30,new york");
+}
+
+test "example: http-request-line" {
+    try runExample("examples/http-request-line.pars", "GET /index.html HTTP/1.1");
+}
+
+test "example: identifier" {
+    try runExample("examples/identifier.pars", "foo_123");
+}
+
+test "example: integer (negative)" {
+    try runExample("examples/integer.pars", "-42");
+}
+
+test "example: integer (unsigned)" {
+    try runExample("examples/integer.pars", "100");
+}
+
+test "example: ipv4" {
+    try runExample("examples/ipv4.pars", "192.168.1.1");
+}
+
 test "repl: help command lists all meta commands" {
     const alloc = std.testing.allocator;
 

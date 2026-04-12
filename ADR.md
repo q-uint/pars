@@ -70,24 +70,28 @@ to retrofit a real analysis phase later.
    them. We resolve rule names at runtime via the rule registry. Costs one
    hash lookup per call; buys us order-independent rule definitions.
 
-2. _Left recursion._ `rule expr = expr "+" term / term` will infinite-loop at
-   runtime. Detecting it requires building a call graph and asking which
-   rules can reach themselves via a first-position call without consuming
-   input — a whole-grammar analysis. For now, left recursion is a runtime
-   failure caught by a stack-depth guard. Not good, but tractable.
+2. _Left recursion._ `rule expr = expr "+" term / term` will infinite-loop
+   without intervention. Detecting it statically requires building a call
+   graph and asking which rules can reach themselves via a first-position
+   call without consuming input — a whole-grammar analysis. The VM detects
+   it at runtime instead: each call frame records the input position at
+   entry, and `callRule` scans the frame stack for a duplicate
+   (same rule, same position). When found, the VM reports
+   `Left recursion detected in rule 'expr'.` and halts. Correct but
+   linear in call-stack depth per rule call.
 
 3. _Memoization policy._ Memoizing every rule gives linear-time parsing but
    wastes memory; memoizing nothing is fast and small but degrades on
-   pathological inputs. The optimal choice needs call-graph analysis. For
-   now, we memoize every top-level `rule` and inline every `let` binding.
-   Suboptimal but simple.
+   pathological inputs. The optimal choice needs call-graph analysis.
+   There is no memoization yet. Adding it is planned once the cost on
+   real grammars justifies the complexity.
 
-The crossover point is when call frames and grammar modules land. By then
-the cost of these three compromises will have grown enough that adding a
-pre-pass over the parsed AST will feel cheaper than keeping the workarounds.
-At that point we retrofit left-recursion detection, smart memoization, and
-any other whole-grammar optimizations onto a real analysis phase. Until
-then, document each compromise at the site where it bites.
+The crossover point is when grammar modules land. By then the cost of
+these compromises will have grown enough that adding a pre-pass over the
+parsed AST will feel cheaper than keeping the workarounds. At that point
+we retrofit static left-recursion detection, smart memoization, and any
+other whole-grammar optimizations onto a real analysis phase. Until then,
+document each compromise at the site where it bites.
 
 ## 005 — Sequence is an invisible infix operator in the Pratt table
 

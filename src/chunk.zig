@@ -189,8 +189,8 @@ test "getLine resolves offsets across multiple runs" {
 test "emitOpConstant switches to wide form after 256 constants" {
     const object = @import("object.zig");
     const alloc = std.testing.allocator;
-    object.init(alloc);
-    defer object.freeObjects();
+    var pool = object.ObjPool.init(alloc);
+    defer pool.deinit();
 
     var c = Chunk.init(alloc);
     defer c.deinit();
@@ -204,7 +204,7 @@ test "emitOpConstant switches to wide form after 256 constants" {
 
     // The 257th should use the wide form.
     const code_len_before = c.code.items.len;
-    const lit = try object.copyLiteral("wide");
+    const lit = try pool.copyLiteral("wide");
     try c.emitOpConstant(.op_match_string, .op_match_string_wide, .{ .obj = lit.asObj() }, 2);
 
     // Wide form is 4 bytes: opcode + 3-byte index.
@@ -223,13 +223,13 @@ test "emitOpConstant switches to wide form after 256 constants" {
 test "addConstant deduplicates identical values" {
     const object = @import("object.zig");
     const alloc = std.testing.allocator;
-    object.init(alloc);
-    defer object.freeObjects();
+    var pool = object.ObjPool.init(alloc);
+    defer pool.deinit();
 
     var c = Chunk.init(alloc);
     defer c.deinit();
 
-    const lit = try object.copyLiteral("digit");
+    const lit = try pool.copyLiteral("digit");
     const idx0 = try c.addConstant(.{ .obj = lit.asObj() });
     const idx1 = try c.addConstant(.{ .obj = lit.asObj() });
     const idx2 = try c.addConstant(.{ .obj = lit.asObj() });

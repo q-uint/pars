@@ -15,6 +15,8 @@ pub const TokenType = enum {
     right_brace,
     /// ',' - separates parameters in parameterized rules and fields in actions.
     comma,
+    /// ';' - terminates a rule declaration or where-clause sub-rule.
+    semicolon,
     /// ':' - separates keys from values inside action bodies.
     colon,
     /// '=' - binds a rule name to its body, or a let-capture to a pattern.
@@ -57,8 +59,6 @@ pub const TokenType = enum {
     /// A character literal in single quotes, e.g. 'a'.
     char,
 
-    /// 'rule' - top-level rule declaration keyword.
-    kw_rule,
     /// 'let' - names the span matched by a sub-pattern within a rule body.
     kw_let,
     /// 'grammar' - opens a named collection of related rules.
@@ -67,6 +67,10 @@ pub const TokenType = enum {
     kw_extends,
     /// 'super' - invokes the parent grammar's definition of a rule.
     kw_super,
+    /// 'where' - introduces locally-scoped rule definitions for the enclosing rule.
+    kw_where,
+    /// 'end' - closes a 'where' block and terminates the enclosing rule declaration.
+    kw_end,
 
     /// An unrecognized or malformed lexeme; carries the diagnostic message.
     err,
@@ -144,6 +148,7 @@ pub const Scanner = struct {
             '{' => return self.makeToken(.left_brace),
             '}' => return self.makeToken(.right_brace),
             ',' => return self.makeToken(.comma),
+            ';' => return self.makeToken(.semicolon),
             ':' => return self.makeToken(.colon),
             '.' => return self.makeToken(.dot),
             '%' => return self.makeToken(.percent),
@@ -198,11 +203,15 @@ pub const Scanner = struct {
     fn identifierType(self: *const Scanner) TokenType {
         const lexeme = self.source[self.start..self.current];
         switch (lexeme[0]) {
-            'e' => return self.checkKeyword(1, "xtends", .kw_extends),
+            'e' => return switch (self.source[self.start..self.current].len) {
+                3 => self.checkKeyword(1, "nd", .kw_end),
+                7 => self.checkKeyword(1, "xtends", .kw_extends),
+                else => .identifier,
+            },
             'g' => return self.checkKeyword(1, "rammar", .kw_grammar),
             'l' => return self.checkKeyword(1, "et", .kw_let),
-            'r' => return self.checkKeyword(1, "ule", .kw_rule),
             's' => return self.checkKeyword(1, "uper", .kw_super),
+            'w' => return self.checkKeyword(1, "here", .kw_where),
             else => return .identifier,
         }
     }
@@ -346,8 +355,8 @@ test "whitespace only yields eof" {
 }
 
 test "line comment is skipped" {
-    try expectTokens("-- nothing here\nrule", &.{
-        .{ .type = .kw_rule, .lexeme = "rule" },
+    try expectTokens("-- nothing here\nwhere", &.{
+        .{ .type = .kw_where, .lexeme = "where" },
     });
 }
 
@@ -382,12 +391,20 @@ test "equal vs arrow" {
 }
 
 test "keywords" {
-    try expectTokens("rule let grammar extends super", &.{
-        .{ .type = .kw_rule, .lexeme = "rule" },
+    try expectTokens("let grammar extends super where end", &.{
         .{ .type = .kw_let, .lexeme = "let" },
         .{ .type = .kw_grammar, .lexeme = "grammar" },
         .{ .type = .kw_extends, .lexeme = "extends" },
         .{ .type = .kw_super, .lexeme = "super" },
+        .{ .type = .kw_where, .lexeme = "where" },
+        .{ .type = .kw_end, .lexeme = "end" },
+    });
+}
+
+test "near-miss end is identifier" {
+    try expectTokens("endo ended", &.{
+        .{ .type = .identifier, .lexeme = "endo" },
+        .{ .type = .identifier, .lexeme = "ended" },
     });
 }
 
@@ -486,30 +503,14 @@ test "cut with label is two tokens" {
 
 test "full rule body tokenizes" {
     try expectTokens(
-        "rule kv = let k = ident \"=\" let v = ident => { key: k, value: v }",
+        "kv = ident \"=\" ident;",
         &.{
-            .{ .type = .kw_rule, .lexeme = "rule" },
             .{ .type = .identifier, .lexeme = "kv" },
-            .{ .type = .equal, .lexeme = "=" },
-            .{ .type = .kw_let, .lexeme = "let" },
-            .{ .type = .identifier, .lexeme = "k" },
             .{ .type = .equal, .lexeme = "=" },
             .{ .type = .identifier, .lexeme = "ident" },
             .{ .type = .string, .lexeme = "\"=\"" },
-            .{ .type = .kw_let, .lexeme = "let" },
-            .{ .type = .identifier, .lexeme = "v" },
-            .{ .type = .equal, .lexeme = "=" },
             .{ .type = .identifier, .lexeme = "ident" },
-            .{ .type = .arrow, .lexeme = "=>" },
-            .{ .type = .left_brace, .lexeme = "{" },
-            .{ .type = .identifier, .lexeme = "key" },
-            .{ .type = .colon, .lexeme = ":" },
-            .{ .type = .identifier, .lexeme = "k" },
-            .{ .type = .comma, .lexeme = "," },
-            .{ .type = .identifier, .lexeme = "value" },
-            .{ .type = .colon, .lexeme = ":" },
-            .{ .type = .identifier, .lexeme = "v" },
-            .{ .type = .right_brace, .lexeme = "}" },
+            .{ .type = .semicolon, .lexeme = ";" },
         },
     );
 }

@@ -86,6 +86,21 @@ const Parser = struct {
     panic_mode: bool,
 };
 
+// One local in scope during the current rule body. Where-bound sub-rules
+// are the only locals for now. The compiler pre-registers them before
+// compiling the main body so forward references work. At runtime no slot
+// is allocated; rule_index is used directly to emit op_call.
+const Local = struct {
+    name: Token,
+    // Scope depth at which this local was declared. -1 marks a local
+    // that has been declared but not yet initialized, which guards
+    // against self-referential patterns like `let x = x`.
+    depth: i32,
+    // Rule table index for where-bound sub-rules. namedRule checks
+    // locals[] first and emits op_call with this index on a hit.
+    rule_index: u32 = 0,
+};
+
 // Binding powers from loosest to tightest. A prefix parser compiles the
 // first primary of an expression; an infix parser then loops in
 // parsePrecedence as long as the next token's row in the rules table has
@@ -124,6 +139,15 @@ pub const Compiler = struct {
     last_expr_start: usize = 0,
     obj_pool: *object.ObjPool = undefined,
     scanner: Scanner = undefined,
+    // Locals in scope during the current rule body. Indexed by compile-
+    // time slot number; the VM reads them by the same index at runtime.
+    // Capped at 256 so slot indices fit in a single byte operand.
+    locals: [256]Local = undefined,
+    local_count: usize = 0,
+    // Nesting depth of the current scope within a rule body. 0 at the
+    // outermost level, incremented by beginScope and decremented by
+    // endScope. Used to decide which locals to pop when a scope exits.
+    scope_depth: u32 = 0,
 
     const ParseFn = *const fn (self: *Compiler) void;
 
@@ -139,6 +163,58 @@ pub const Compiler = struct {
 
     fn currentChunk(self: *Compiler) *Chunk {
         return self.compiling_chunk;
+    }
+
+    fn beginScope(self: *Compiler) void {
+        self.scope_depth += 1;
+    }
+
+    fn endScope(self: *Compiler) void {
+        self.scope_depth -= 1;
+        // Discard every local whose depth exceeds the new scope level.
+        // Where-rules live in the rule table, not on the value stack,
+        // so no op_pop is emitted -- the compiler just forgets them.
+        while (self.local_count > 0 and
+            self.locals[self.local_count - 1].depth > @as(i32, @intCast(self.scope_depth)))
+        {
+            self.local_count -= 1;
+        }
+    }
+
+    fn identifiersEqual(a: Token, b: Token) bool {
+        return std.mem.eql(u8, a.lexeme, b.lexeme);
+    }
+
+    fn addLocal(self: *Compiler, name: Token) void {
+        if (self.local_count >= 256) {
+            self.errorAtPrevious("Too many local variables in rule.");
+            return;
+        }
+        self.locals[self.local_count] = .{ .name = name, .depth = -1 };
+        self.local_count += 1;
+    }
+
+    // Record the existence of a local. Checks for a duplicate name in
+    // the current scope before delegating to addLocal. Locals are added
+    // with depth=-1 (uninitialized) until markInitialized is called.
+    fn declareVariable(self: *Compiler, name: Token) void {
+        var i = self.local_count;
+        while (i > 0) {
+            i -= 1;
+            const local = self.locals[i];
+            if (local.depth != -1 and local.depth < @as(i32, @intCast(self.scope_depth))) break;
+            if (identifiersEqual(name, local.name)) {
+                self.errorAtPrevious("Already a variable with this name in this scope.");
+                return;
+            }
+        }
+        self.addLocal(name);
+    }
+
+    // Mark the most recently declared local as fully initialized by
+    // recording its actual scope depth (replacing the -1 sentinel).
+    fn markInitialized(self: *Compiler) void {
+        self.locals[self.local_count - 1].depth = @intCast(self.scope_depth);
     }
 
     /// Diagnostics produced by the most recent `compile` call. The slice is
@@ -160,6 +236,8 @@ pub const Compiler = struct {
 
         self.parser.had_error = false;
         self.parser.panic_mode = false;
+        self.local_count = 0;
+        self.scope_depth = 0;
 
         self.advance();
 
@@ -211,8 +289,18 @@ pub const Compiler = struct {
         self.parsePrecedence(.choice);
     }
 
+    // Return true when the current token is an identifier immediately
+    // followed by '=', which signals a rule declaration.
+    fn peekIsEqual(self: *const Compiler) bool {
+        var peek = self.scanner;
+        while (true) {
+            const tok = peek.scanToken();
+            if (tok.type != .err) return tok.type == .equal;
+        }
+    }
+
     fn declaration(self: *Compiler) void {
-        if (self.match(.kw_rule)) {
+        if (self.check(.identifier) and self.peekIsEqual()) {
             self.ruleDeclaration();
         } else {
             self.statement();
@@ -229,6 +317,103 @@ pub const Compiler = struct {
         self.had_expression = true;
     }
 
+    // Advance the scanner without emitting diagnostics. Used by the
+    // where pre-scan pass, which restores parser state afterwards.
+    fn advanceRaw(self: *Compiler) void {
+        self.parser.previous = self.parser.current;
+        self.parser.current = self.scanner.scanToken();
+    }
+
+    // Pre-scan the token stream to find the 'where' block (if any) and
+    // register every sub-rule name in locals[] before the main body is
+    // compiled. This gives the main body and each sub-rule body the full
+    // set of where-bound names in scope, supporting mutual recursion.
+    // Scanner and parser state are restored after the scan.
+    fn preRegisterWhereNames(self: *Compiler) void {
+        const saved_scanner = self.scanner;
+        const saved_parser = self.parser;
+
+        // Skip tokens until 'where', 'end', or eof.
+        while (self.parser.current.type != .kw_where and
+            self.parser.current.type != .kw_end and
+            self.parser.current.type != .eof)
+        {
+            self.advanceRaw();
+        }
+
+        if (self.parser.current.type == .kw_where) {
+            self.advanceRaw(); // consume 'where'
+            while (self.parser.current.type != .kw_end and
+                self.parser.current.type != .eof)
+            {
+                if (self.parser.current.type == .identifier) {
+                    const name_tok = self.parser.current;
+                    self.advanceRaw(); // consume identifier
+                    if (self.parser.current.type == .equal) {
+                        // This identifier begins a sub-rule declaration.
+                        const rule_idx = self.compiling_rules.?.getOrCreateIndex(
+                            self.alloc,
+                            name_tok.lexeme,
+                        ) catch break;
+                        if (self.local_count < 256) {
+                            self.locals[self.local_count] = .{
+                                .name = name_tok,
+                                .depth = @intCast(self.scope_depth),
+                                .rule_index = rule_idx,
+                            };
+                            self.local_count += 1;
+                        }
+                    }
+                } else {
+                    self.advanceRaw();
+                }
+            }
+        }
+
+        self.scanner = saved_scanner;
+        self.parser = saved_parser;
+    }
+
+    // Compile a 'where' block: a sequence of sub-rule declarations
+    // terminated by 'end'. Each sub-rule has the form 'name = body'
+    // with an optional trailing semicolon. The 'end' keyword serves as
+    // both the block terminator and the outer rule's statement terminator
+    // (no additional ';' is needed after 'end').
+    fn whereBlock(self: *Compiler) void {
+        while (!self.check(.kw_end) and !self.check(.eof)) {
+            self.consume(.identifier, "Expect sub-rule name in 'where'.");
+            const name_tok = self.parser.previous;
+            self.consume(.equal, "Expect '=' after sub-rule name in 'where'.");
+
+            // Find the pre-registered local index for this name.
+            var rule_idx: ?u32 = null;
+            for (self.locals[0..self.local_count]) |local| {
+                if (identifiersEqual(name_tok, local.name)) {
+                    rule_idx = local.rule_index;
+                    break;
+                }
+            }
+            if (rule_idx == null) {
+                self.errorAtPrevious("Internal: where sub-rule name was not pre-registered.");
+                return;
+            }
+
+            // Compile the sub-rule body into its own chunk.
+            const saved_chunk = self.compiling_chunk;
+            var sub_chunk = Chunk.init(self.alloc);
+            self.compiling_chunk = &sub_chunk;
+            self.expression();
+            self.emitByte(@intFromEnum(OpCode.op_return));
+            self.compiling_chunk = saved_chunk;
+
+            self.compiling_rules.?.setChunk(rule_idx.?, sub_chunk);
+
+            // Trailing ';' is optional before 'end'.
+            _ = self.match(.semicolon);
+        }
+        self.consume(.kw_end, "Expect 'end' to close 'where' block.");
+    }
+
     fn ruleDeclaration(self: *Compiler) void {
         self.consume(.identifier, "Expect rule name.");
         const name_token = self.parser.previous;
@@ -239,12 +424,24 @@ pub const Compiler = struct {
             return;
         };
 
-        // Compile the rule body into its own chunk.
+        // Compile the rule body into its own chunk. Each rule is an
+        // independent scope, so local state starts fresh for every rule.
         const saved_chunk = self.compiling_chunk;
         var rule_chunk = Chunk.init(self.alloc);
         self.compiling_chunk = &rule_chunk;
+        self.local_count = 0;
+        self.scope_depth = 0;
 
+        // Pre-scan for 'where' sub-rule names so the main body can
+        // reference them. Must happen inside the scope.
+        self.beginScope();
+        self.preRegisterWhereNames();
         self.expression();
+        const has_where = self.match(.kw_where);
+        if (has_where) {
+            self.whereBlock(); // consumes 'end'
+        }
+        self.endScope();
         self.emitByte(@intFromEnum(OpCode.op_return));
 
         if (comptime print_code) {
@@ -257,19 +454,37 @@ pub const Compiler = struct {
 
         self.compiling_rules.?.setChunk(index, rule_chunk);
         self.last_rule_name = name_token;
+        if (has_where) {
+            // ';' after 'end' is optional.
+            _ = self.match(.semicolon);
+        } else {
+            self.consume(.semicolon, "Expect ';' after rule body.");
+        }
     }
 
     fn synchronize(self: *Compiler) void {
         self.parser.panic_mode = false;
 
         while (self.parser.current.type != .eof) {
-            if (self.parser.current.type == .kw_rule) return;
+            if (self.parser.previous.type == .semicolon) return;
+            if (self.parser.previous.type == .kw_end) return;
             self.advance();
         }
     }
 
     fn namedRule(self: *Compiler) void {
         const name = self.parser.previous;
+        // Check where-bound locals first (innermost scope wins).
+        var i = self.local_count;
+        while (i > 0) {
+            i -= 1;
+            const local = &self.locals[i];
+            if (local.depth != -1 and identifiersEqual(name, local.name)) {
+                self.emitRuleCall(local.rule_index);
+                return;
+            }
+        }
+        // Fall through to the global rule table.
         const index = self.compiling_rules.?.getOrCreateIndex(self.alloc, name.lexeme) catch {
             self.errorAtPrevious("Out of memory.");
             return;
@@ -803,7 +1018,7 @@ test "renderErrors produces snippet with caret pointing at token" {
 
 test "rule declaration populates rule table" {
     const alloc = std.testing.allocator;
-    var result = try compileForTest(alloc, "rule digit = ['0'-'9']");
+    var result = try compileForTest(alloc, "digit = ['0'-'9'];");
     defer result.deinit();
 
     try std.testing.expect(result.ok);
@@ -815,7 +1030,7 @@ test "multiple rule declarations populate rule table" {
     const alloc = std.testing.allocator;
     var result = try compileForTest(
         alloc,
-        "rule digit = ['0'-'9']\nrule alpha = ['a'-'z']",
+        "digit = ['0'-'9'];\nalpha = ['a'-'z'];",
     );
     defer result.deinit();
 
@@ -827,7 +1042,7 @@ test "multiple rule declarations populate rule table" {
 
 test "auto-call emits op_call for last rule in main chunk" {
     const alloc = std.testing.allocator;
-    var result = try compileForTest(alloc, "rule digit = ['0'-'9']");
+    var result = try compileForTest(alloc, "digit = ['0'-'9'];");
     defer result.deinit();
 
     try std.testing.expect(result.ok);
@@ -844,7 +1059,7 @@ test "error recovery skips to next rule" {
     // First rule has a bad body; second rule is valid.
     var result = try compileForTest(
         alloc,
-        "rule bad = )\nrule digit = ['0'-'9']",
+        "bad = );\ndigit = ['0'-'9'];",
     );
     defer result.deinit();
 
@@ -858,7 +1073,7 @@ test "repeated rule calls emit the same index operand" {
     // The rule body contains three calls to "digit" via sequence.
     var result = try compileForTest(
         alloc,
-        "rule digit = ['0'-'9']\nrule triple = digit digit digit",
+        "digit = ['0'-'9'];\ntriple = digit digit digit;",
     );
     defer result.deinit();
 

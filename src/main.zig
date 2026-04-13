@@ -285,6 +285,28 @@ test "example: ipv4" {
     try runExample("examples/ipv4.pars", "192.168.1.1");
 }
 
+test "repl: where clause on a single line" {
+    const alloc = std.testing.allocator;
+
+    var vm = VM.init(alloc);
+    defer vm.deinit();
+
+    const script =
+        ":input abc:123\n" ++
+        "kv = k \":\" v where k = ['a'-'z']+; v = ['0'-'9']+ end\n" ++
+        ":exit\n";
+
+    var reader = std.Io.Reader.fixed(script);
+
+    var aw = std.Io.Writer.Allocating.init(alloc);
+    defer aw.deinit();
+
+    try runRepl(&vm, alloc, &reader, &aw.writer);
+
+    const out = aw.writer.buffered();
+    try std.testing.expect(std.mem.indexOf(u8, out, "ok:") != null);
+}
+
 test "repl: help command lists all meta commands" {
     const alloc = std.testing.allocator;
 

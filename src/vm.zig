@@ -606,56 +606,32 @@ test "charset in sequence" {
 }
 
 test "single rule declaration matches via auto-call" {
-    try expectMatch(
-        "rule digit = ['0'-'9']",
-        "5",
-        .ok,
-    );
+    try expectMatch("digit = ['0'-'9'];", "5", .ok);
 }
 
 test "single rule declaration rejects non-matching input" {
-    try expectMatch(
-        "rule digit = ['0'-'9']",
-        "x",
-        .no_match,
-    );
+    try expectMatch("digit = ['0'-'9'];", "x", .no_match);
 }
 
 test "rule calling another rule" {
-    try expectMatch(
-        "rule digit = ['0'-'9']\nrule two_digits = digit digit",
-        "42",
-        .ok,
-    );
+    try expectMatch("digit = ['0'-'9'];\ntwo_digits = digit digit;", "42", .ok);
 }
 
 test "rule calling another rule fails on short input" {
-    try expectMatch(
-        "rule digit = ['0'-'9']\nrule two_digits = digit digit",
-        "4",
-        .no_match,
-    );
+    try expectMatch("digit = ['0'-'9'];\ntwo_digits = digit digit;", "4", .no_match);
 }
 
 test "forward rule reference" {
-    try expectMatch(
-        "rule pair = digit digit\nrule digit = ['0'-'9']",
-        "42",
-        .ok,
-    );
+    try expectMatch("pair = digit digit;\ndigit = ['0'-'9'];", "42", .ok);
 }
 
 test "undefined rule produces runtime error" {
-    try expectMatch(
-        "bogus",
-        "x",
-        .runtime_error,
-    );
+    try expectMatch("bogus", "x", .runtime_error);
 }
 
 test "rule with sequence body" {
     try expectMatch(
-        "rule http_ver = \"HTTP/\" ['0'-'9'] '.' ['0'-'9']",
+        "http_ver = \"HTTP/\" ['0'-'9'] '.' ['0'-'9'];",
         "HTTP/1.1",
         .ok,
     );
@@ -705,7 +681,7 @@ test "pipe is synonym for slash" {
 
 test "choice in rules" {
     try expectMatch(
-        "rule method = \"GET\" / \"POST\" / \"PUT\"\nrule req = method \" /\"",
+        "method = \"GET\" / \"POST\" / \"PUT\";\nreq = method \" /\";",
         "PUT /",
         .ok,
     );
@@ -755,18 +731,14 @@ test "quantifier with charset" {
 }
 
 test "quantifier in rule" {
-    try expectMatch(
-        "rule digit = ['0'-'9']\nrule number = digit+",
-        "42",
-        .ok,
-    );
+    try expectMatch("digit = ['0'-'9'];\nnumber = digit+;", "42", .ok);
 }
 
 test "combined: choice and quantifiers" {
     try expectMatch(
-        "rule alpha = ['a'-'z' 'A'-'Z']\n" ++
-            "rule digit = ['0'-'9']\n" ++
-            "rule ident = alpha (alpha / digit)*",
+        "alpha = ['a'-'z' 'A'-'Z'];\n" ++
+            "digit = ['0'-'9'];\n" ++
+            "ident = alpha (alpha / digit)*;",
         "foo123",
         .ok,
     );
@@ -774,9 +746,9 @@ test "combined: choice and quantifiers" {
 
 test "combined: optional and sequence" {
     try expectMatch(
-        "rule digit = ['0'-'9']\n" ++
-            "rule sign = '+' / '-'\n" ++
-            "rule integer = sign? digit+",
+        "digit = ['0'-'9'];\n" ++
+            "sign = '+' / '-';\n" ++
+            "integer = sign? digit+;",
         "-42",
         .ok,
     );
@@ -784,9 +756,9 @@ test "combined: optional and sequence" {
 
 test "combined: optional sign with unsigned" {
     try expectMatch(
-        "rule digit = ['0'-'9']\n" ++
-            "rule sign = '+' / '-'\n" ++
-            "rule integer = sign? digit+",
+        "digit = ['0'-'9'];\n" ++
+            "sign = '+' / '-';\n" ++
+            "integer = sign? digit+;",
         "42",
         .ok,
     );
@@ -794,9 +766,57 @@ test "combined: optional sign with unsigned" {
 
 test "left-recursive rule produces left-recursion error" {
     try expectMatch(
-        "rule expr = expr \"+\" expr / ['0'-'9']",
+        "expr = expr \"+\" expr / ['0'-'9'];",
         "1+2",
         .runtime_error,
+    );
+}
+
+test "where clause: sub-rule used in body" {
+    try expectMatch(
+        "x = y where y = \"y\" end;",
+        "y",
+        .ok,
+    );
+}
+
+test "where clause: trailing semicolon on last sub-rule is optional" {
+    try expectMatch(
+        "x = y where y = \"y\"; end;",
+        "y",
+        .ok,
+    );
+}
+
+test "where clause: multiple sub-rules" {
+    try expectMatch(
+        "kv = k \":\" v where k = ['a'-'z']+; v = ['0'-'9']+ end;",
+        "abc:123",
+        .ok,
+    );
+}
+
+test "where clause: sub-rule references another sub-rule" {
+    try expectMatch(
+        "pair = a a where a = ['a'-'z'] end;",
+        "xy",
+        .ok,
+    );
+}
+
+test "where clause: no semicolon after end is valid" {
+    try expectMatch(
+        "x = y where y = \"y\" end",
+        "y",
+        .ok,
+    );
+}
+
+test "where clause: body not matched when sub-rule fails" {
+    try expectMatch(
+        "x = y where y = \"y\" end;",
+        "z",
+        .no_match,
     );
 }
 
@@ -805,7 +825,7 @@ test "rules persist across REPL iterations" {
     defer machine.deinit();
 
     // First iteration: define a rule.
-    const r1 = machine.match("rule digit = ['0'-'9']", "5");
+    const r1 = machine.match("digit = ['0'-'9'];", "5");
     try std.testing.expectEqual(.ok, r1);
 
     // Second iteration: call the rule by name.

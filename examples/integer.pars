@@ -4,6 +4,8 @@
 --   echo -n "-42" | pars examples/integer.pars
 --   echo -n "100" | pars examples/integer.pars
 
-rule digit   = ['0'-'9']
-rule sign    = '+' / '-'
-rule integer = sign? digit+
+integer = sign? digit+
+  where
+    digit = ['0'-'9'];
+    sign  = '+' / '-'
+  end

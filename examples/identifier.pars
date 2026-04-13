@@ -4,6 +4,8 @@
 -- Usage:
 --   echo -n "foo_123" | pars examples/identifier.pars
 
-rule alpha = ['a'-'z' 'A'-'Z']
-rule digit = ['0'-'9']
-rule ident = (alpha / '_') (alpha / digit / '_')*
+ident = (alpha / '_') (alpha / digit / '_')*
+  where
+    alpha = ['a'-'z' 'A'-'Z'];
+    digit = ['0'-'9']
+  end

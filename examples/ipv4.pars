@@ -4,8 +4,9 @@
 -- Usage:
 --   echo -n "192.168.1.1" | pars examples/ipv4.pars
 
+use "std/abnf";
+
 ipv4 = octet '.' octet '.' octet '.' octet
   where
-    digit = ['0'-'9'];
-    octet = digit+
+    octet = DIGIT+
   end

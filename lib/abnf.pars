@@ -1,0 +1,18 @@
+-- RFC 5234 Appendix B.1 core rules.
+
+ALPHA  = ['A'-'Z' 'a'-'z'];
+BIT    = '0' / '1';
+CHAR   = ['\x01'-'\x7F'];
+CR     = '\r';
+CRLF   = CR LF;
+CTL    = ['\x00'-'\x1F' '\x7F'];
+DIGIT  = ['0'-'9'];
+DQUOTE = '"';
+HEXDIG = DIGIT / ['A'-'F' 'a'-'f'];
+HTAB   = '\t';
+LF     = '\n';
+LWSP   = (WSP / CRLF WSP)*;
+OCTET  = .;
+SP     = ' ';
+VCHAR  = ['\x21'-'\x7E'];
+WSP    = SP / HTAB;

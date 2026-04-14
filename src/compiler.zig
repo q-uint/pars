@@ -1,4 +1,5 @@
 const std = @import("std");
+const pars_stdlib = @import("pars_stdlib");
 const scanner_mod = @import("scanner.zig");
 const chunk_mod = @import("chunk.zig");
 const debug = @import("debug.zig");
@@ -300,12 +301,48 @@ pub const Compiler = struct {
     }
 
     fn declaration(self: *Compiler) void {
-        if (self.check(.identifier) and self.peekIsEqual()) {
+        if (self.check(.kw_use)) {
+            self.advance();
+            self.useDeclaration();
+        } else if (self.check(.identifier) and self.peekIsEqual()) {
             self.ruleDeclaration();
         } else {
             self.statement();
         }
         if (self.parser.panic_mode) self.synchronize();
+    }
+
+    // Resolve a "std/..." module path to its embedded source. Returns null
+    // if the name is not a known stdlib module.
+    fn resolveStdlib(path: []const u8) ?[]const u8 {
+        if (std.mem.eql(u8, path, "std/abnf")) return pars_stdlib.abnf;
+        return null;
+    }
+
+    // Compile and merge a module's rules into the current rule table.
+    // The module's "main" chunk (entry point) is discarded; only the
+    // rule declarations it defines are kept.
+    fn useDeclaration(self: *Compiler) void {
+        self.consume(.string, "Expect a module path string after 'use'.");
+        if (self.parser.had_error) return;
+
+        const raw = self.parser.previous.lexeme;
+        const path = stripStringDelimiters(raw, 0);
+
+        const src = resolveStdlib(path) orelse {
+            self.errorAtPrevious("Unknown module. Relative imports are not yet supported.");
+            return;
+        };
+
+        var sub = Compiler.init(self.alloc);
+        defer sub.deinit();
+        var dummy = Chunk.init(self.alloc);
+        defer dummy.deinit();
+        if (!sub.compile(src, &dummy, self.compiling_rules.?, self.obj_pool)) {
+            self.errorAtPrevious("Module failed to compile.");
+        }
+
+        _ = self.match(.semicolon);
     }
 
     fn statement(self: *Compiler) void {
@@ -577,15 +614,8 @@ pub const Compiler = struct {
     }
 
     fn charLiteral(self: *Compiler) void {
-        const lexeme = self.parser.previous.lexeme;
-        // Lexeme includes the surrounding single quotes: 'a' -> length 3.
-        // Only single-byte character literals are supported at this stage;
-        // escapes and multi-byte forms will land with extended charset work.
-        if (lexeme.len != 3) {
-            self.errorAtPrevious("Character literal must be a single byte.");
-            return;
-        }
-        self.emitBytes(@intFromEnum(OpCode.op_match_char), lexeme[1]);
+        const b = self.extractCharByte(self.parser.previous.lexeme) orelse return;
+        self.emitBytes(@intFromEnum(OpCode.op_match_char), b);
     }
 
     fn stringLiteral(self: *Compiler) void {
@@ -663,11 +693,53 @@ pub const Compiler = struct {
     }
 
     fn extractCharByte(self: *Compiler, lexeme: []const u8) ?u8 {
-        if (lexeme.len != 3) {
-            self.errorAtPrevious("Character literal must be a single byte.");
+        // lexeme includes surrounding single quotes, e.g. 'a', '\n', '\x41'.
+        const inner = lexeme[1 .. lexeme.len - 1];
+
+        if (inner.len == 0) {
+            self.errorAtPrevious("Empty character literal.");
             return null;
         }
-        return lexeme[1];
+
+        if (inner[0] != '\\') {
+            if (inner.len != 1) {
+                self.errorAtPrevious("Character literal must be a single byte.");
+                return null;
+            }
+            return inner[0];
+        }
+
+        // Escape sequence.
+        if (inner.len < 2) {
+            self.errorAtPrevious("Incomplete escape sequence in character literal.");
+            return null;
+        }
+        switch (inner[1]) {
+            'n' => return '\n',
+            'r' => return '\r',
+            't' => return '\t',
+            '\\' => return '\\',
+            '\'' => return '\'',
+            'x' => {
+                if (inner.len != 4) {
+                    self.errorAtPrevious("Hex escape must be two digits: \\xNN.");
+                    return null;
+                }
+                const hi = std.fmt.charToDigit(inner[2], 16) catch {
+                    self.errorAtPrevious("Invalid hex digit in escape sequence.");
+                    return null;
+                };
+                const lo = std.fmt.charToDigit(inner[3], 16) catch {
+                    self.errorAtPrevious("Invalid hex digit in escape sequence.");
+                    return null;
+                };
+                return (hi << 4) | lo;
+            },
+            else => {
+                self.errorAtPrevious("Unknown escape sequence in character literal.");
+                return null;
+            },
+        }
     }
 
     fn emitRuleCall(self: *Compiler, index: u32) void {
@@ -1102,4 +1174,84 @@ test "scanner error surfaces through compile with correct location" {
     try std.testing.expectEqual(@as(usize, 1), errs.len);
     try std.testing.expectEqualStrings("Unterminated string.", errs[0].message);
     try std.testing.expectEqual(@as(usize, 1), errs[0].column);
+}
+
+test "use std/abnf populates DIGIT in rule table" {
+    const alloc = std.testing.allocator;
+    var result = try compileForTest(alloc, "use \"std/abnf\";");
+    defer result.deinit();
+    try std.testing.expect(result.ok);
+    try std.testing.expect(result.rules.get("DIGIT") != null);
+    try std.testing.expect(result.rules.get("ALPHA") != null);
+}
+
+test "use unknown module is a compile error" {
+    const alloc = std.testing.allocator;
+    var result = try compileForTest(alloc, "use \"std/bogus\";");
+    defer result.deinit();
+    try std.testing.expect(!result.ok);
+}
+
+test "char literal escape \\n compiles successfully" {
+    const alloc = std.testing.allocator;
+    var result = try compileForTest(alloc, "'\\n'");
+    defer result.deinit();
+    try std.testing.expect(result.ok);
+    // Main chunk: OP_MATCH_CHAR 0x0A OP_HALT
+    try std.testing.expectEqual(@as(usize, 3), result.chunk.code.items.len);
+    try std.testing.expectEqual(@intFromEnum(OpCode.op_match_char), result.chunk.code.items[0]);
+    try std.testing.expectEqual(@as(u8, '\n'), result.chunk.code.items[1]);
+}
+
+test "char literal escape \\r compiles successfully" {
+    const alloc = std.testing.allocator;
+    var result = try compileForTest(alloc, "'\\r'");
+    defer result.deinit();
+    try std.testing.expect(result.ok);
+    try std.testing.expectEqual(@as(u8, '\r'), result.chunk.code.items[1]);
+}
+
+test "char literal escape \\t compiles successfully" {
+    const alloc = std.testing.allocator;
+    var result = try compileForTest(alloc, "'\\t'");
+    defer result.deinit();
+    try std.testing.expect(result.ok);
+    try std.testing.expectEqual(@as(u8, '\t'), result.chunk.code.items[1]);
+}
+
+test "char literal hex escape \\x41 compiles to 0x41" {
+    const alloc = std.testing.allocator;
+    var result = try compileForTest(alloc, "'\\x41'");
+    defer result.deinit();
+    try std.testing.expect(result.ok);
+    try std.testing.expectEqual(@as(u8, 0x41), result.chunk.code.items[1]);
+}
+
+test "char literal hex escape \\x00 compiles to 0x00" {
+    const alloc = std.testing.allocator;
+    var result = try compileForTest(alloc, "'\\x00'");
+    defer result.deinit();
+    try std.testing.expect(result.ok);
+    try std.testing.expectEqual(@as(u8, 0x00), result.chunk.code.items[1]);
+}
+
+test "charset with hex escaped range compiles successfully" {
+    const alloc = std.testing.allocator;
+    var result = try compileForTest(alloc, "['\\x00'-'\\x1F']");
+    defer result.deinit();
+    try std.testing.expect(result.ok);
+}
+
+test "char literal unknown escape is a compile error" {
+    const alloc = std.testing.allocator;
+    var result = try compileForTest(alloc, "'\\z'");
+    defer result.deinit();
+    try std.testing.expect(!result.ok);
+}
+
+test "char literal hex escape with bad digit is a compile error" {
+    const alloc = std.testing.allocator;
+    var result = try compileForTest(alloc, "'\\xZZ'");
+    defer result.deinit();
+    try std.testing.expect(!result.ok);
 }

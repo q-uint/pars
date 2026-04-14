@@ -4,10 +4,16 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
+    // Embed stdlib .pars sources as compile-time constants so vm.zig can
+    // pre-load them without @embedFile crossing the module boundary.
+    const stdlib_opts = b.addOptions();
+    stdlib_opts.addOption([]const u8, "abnf", @embedFile("lib/abnf.pars"));
+
     const mod = b.addModule("pars", .{
         .root_source_file = b.path("src/root.zig"),
         .target = target,
     });
+    mod.addImport("pars_stdlib", stdlib_opts.createModule());
 
     const exe = b.addExecutable(.{
         .name = "pars",

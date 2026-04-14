@@ -67,6 +67,8 @@ pub const TokenType = enum {
     kw_extends,
     /// 'super' - invokes the parent grammar's definition of a rule.
     kw_super,
+    /// 'use' - imports rules from a module into the current grammar.
+    kw_use,
     /// 'where' - introduces locally-scoped rule definitions for the enclosing rule.
     kw_where,
     /// 'end' - closes a 'where' block and terminates the enclosing rule declaration.
@@ -211,6 +213,7 @@ pub const Scanner = struct {
             'g' => return self.checkKeyword(1, "rammar", .kw_grammar),
             'l' => return self.checkKeyword(1, "et", .kw_let),
             's' => return self.checkKeyword(1, "uper", .kw_super),
+            'u' => return self.checkKeyword(1, "se", .kw_use),
             'w' => return self.checkKeyword(1, "here", .kw_where),
             else => return .identifier,
         }
@@ -391,13 +394,21 @@ test "equal vs arrow" {
 }
 
 test "keywords" {
-    try expectTokens("let grammar extends super where end", &.{
+    try expectTokens("use let grammar extends super where end", &.{
+        .{ .type = .kw_use, .lexeme = "use" },
         .{ .type = .kw_let, .lexeme = "let" },
         .{ .type = .kw_grammar, .lexeme = "grammar" },
         .{ .type = .kw_extends, .lexeme = "extends" },
         .{ .type = .kw_super, .lexeme = "super" },
         .{ .type = .kw_where, .lexeme = "where" },
         .{ .type = .kw_end, .lexeme = "end" },
+    });
+}
+
+test "near-miss use is identifier" {
+    try expectTokens("user used", &.{
+        .{ .type = .identifier, .lexeme = "user" },
+        .{ .type = .identifier, .lexeme = "used" },
     });
 }
 

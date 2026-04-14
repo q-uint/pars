@@ -4,8 +4,9 @@
 --   echo -n "-42" | pars examples/integer.pars
 --   echo -n "100" | pars examples/integer.pars
 
-integer = sign? digit+
+use "std/abnf";
+
+integer = sign? DIGIT+
   where
-    digit = ['0'-'9'];
-    sign  = '+' / '-'
+    sign = '+' / '-'
   end

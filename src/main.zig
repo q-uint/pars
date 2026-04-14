@@ -41,6 +41,11 @@ fn repl(vm: *VM, alloc: std.mem.Allocator) !void {
 // persists across iterations. Meta commands (lines starting with `:`)
 // manipulate the buffer; every other line is compiled as a pars
 // expression and matched against whatever the buffer currently holds.
+//
+// Multi-line input is supported: if a statement looks syntactically
+// incomplete (all parse errors land at EOF), the REPL shows a `... `
+// continuation prompt and accumulates further lines before executing.
+//
 // Extracted from `repl()` so tests can drive it with in-memory reader
 // and writer.
 fn runRepl(
@@ -51,11 +56,14 @@ fn runRepl(
 ) !void {
     var sticky: std.ArrayList(u8) = .empty;
     defer sticky.deinit(alloc);
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(alloc);
 
     try stdout.writeAll("pars REPL. type :help for commands.\n");
 
     while (true) {
-        try stdout.writeAll("> ");
+        const prompt: []const u8 = if (buf.items.len == 0) "> " else "... ";
+        try stdout.writeAll(prompt);
         try stdout.flush();
 
         const line = (try stdin.takeDelimiter('\n')) orelse {
@@ -68,15 +76,22 @@ fn runRepl(
         if (trimmed.len == 0) continue;
 
         if (trimmed[0] == ':') {
-            const exit = try handleMeta(trimmed, &sticky, alloc, stdout);
+            buf.clearRetainingCapacity();
+            const exit = try handleMeta(trimmed, &sticky, alloc, stdout, vm);
             try stdout.flush();
             if (exit) return;
             continue;
         }
 
-        const result = vm.match(trimmed, sticky.items);
+        if (buf.items.len > 0) try buf.append(alloc, '\n');
+        try buf.appendSlice(alloc, trimmed);
+
+        if (vm.isIncomplete(buf.items)) continue;
+
+        const result = vm.match(buf.items, sticky.items);
         try reportResult(stdout, result, vm);
         try stdout.flush();
+        buf.clearRetainingCapacity();
     }
 }
 
@@ -85,6 +100,7 @@ fn handleMeta(
     sticky: *std.ArrayList(u8),
     alloc: std.mem.Allocator,
     stdout: anytype,
+    vm: *VM,
 ) !bool {
     // Split on the first space: everything before is the command,
     // everything after (left-trimmed) is the argument.
@@ -103,12 +119,25 @@ fn handleMeta(
     } else if (std.mem.eql(u8, cmd, ":clear")) {
         sticky.clearRetainingCapacity();
         try stdout.writeAll("input cleared\n");
+    } else if (std.mem.eql(u8, cmd, ":use")) {
+        if (arg.len == 0) {
+            try stdout.writeAll("usage: :use <module>\n");
+        } else {
+            const source = try std.fmt.allocPrint(alloc, "use \"{s}\";", .{arg});
+            defer alloc.free(source);
+            switch (vm.match(source, "")) {
+                .ok => try stdout.print("loaded {s}\n", .{arg}),
+                .compile_error => {}, // vm.match already wrote the error to stderr
+                else => try stdout.writeAll("failed to load module\n"),
+            }
+        }
     } else if (std.mem.eql(u8, cmd, ":help")) {
         try stdout.writeAll(
             \\commands:
             \\  :input <text>  set the sticky input buffer
             \\  :input         show the current input
             \\  :clear         clear the sticky input
+            \\  :use <module>  load a module (e.g. :use std/abnf)
             \\  :exit / :quit  exit the REPL
             \\  :help          this message
             \\
@@ -285,6 +314,35 @@ test "example: ipv4" {
     try runExample("examples/ipv4.pars", "192.168.1.1");
 }
 
+test "repl: multiline where block accumulates across prompts" {
+    const alloc = std.testing.allocator;
+
+    var vm = VM.init(alloc);
+    defer vm.deinit();
+
+    const script =
+        ":input abc:123\n" ++
+        "kv = k \":\" v\n" ++
+        "  where\n" ++
+        "    k = ['a'-'z']+;\n" ++
+        "    v = ['0'-'9']+\n" ++
+        "  end\n" ++
+        ":exit\n";
+
+    var reader = std.Io.Reader.fixed(script);
+
+    var aw = std.Io.Writer.Allocating.init(alloc);
+    defer aw.deinit();
+
+    try runRepl(&vm, alloc, &reader, &aw.writer);
+
+    const out = aw.writer.buffered();
+    // Continuation prompts appear while the where block is open.
+    try std.testing.expect(std.mem.indexOf(u8, out, "... ") != null);
+    // The complete rule ultimately matches.
+    try std.testing.expect(std.mem.indexOf(u8, out, "ok:") != null);
+}
+
 test "repl: where clause on a single line" {
     const alloc = std.testing.allocator;
 
@@ -307,6 +365,53 @@ test "repl: where clause on a single line" {
     try std.testing.expect(std.mem.indexOf(u8, out, "ok:") != null);
 }
 
+test "repl: stdlib rules available after use directive" {
+    const alloc = std.testing.allocator;
+
+    var vm = VM.init(alloc);
+    defer vm.deinit();
+
+    const script =
+        ":input abc123\n" ++
+        "use \"std/abnf\";\n" ++
+        "ALPHA+ DIGIT+\n" ++
+        ":exit\n";
+
+    var reader = std.Io.Reader.fixed(script);
+
+    var aw = std.Io.Writer.Allocating.init(alloc);
+    defer aw.deinit();
+
+    try runRepl(&vm, alloc, &reader, &aw.writer);
+
+    const out = aw.writer.buffered();
+    try std.testing.expect(std.mem.indexOf(u8, out, "ok:") != null);
+}
+
+test "repl: :use loads a stdlib module" {
+    const alloc = std.testing.allocator;
+
+    var vm = VM.init(alloc);
+    defer vm.deinit();
+
+    const script =
+        ":input abc123\n" ++
+        ":use std/abnf\n" ++
+        "ALPHA+ DIGIT+\n" ++
+        ":exit\n";
+
+    var reader = std.Io.Reader.fixed(script);
+
+    var aw = std.Io.Writer.Allocating.init(alloc);
+    defer aw.deinit();
+
+    try runRepl(&vm, alloc, &reader, &aw.writer);
+
+    const out = aw.writer.buffered();
+    try std.testing.expect(std.mem.indexOf(u8, out, "loaded std/abnf") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "ok:") != null);
+}
+
 test "repl: help command lists all meta commands" {
     const alloc = std.testing.allocator;
 
@@ -325,6 +430,7 @@ test "repl: help command lists all meta commands" {
     const out = aw.writer.buffered();
     try std.testing.expect(std.mem.indexOf(u8, out, ":input <text>") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, ":clear") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, ":use <module>") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, ":exit / :quit") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, ":help") != null);
 }

@@ -4,13 +4,13 @@
 --   echo -n "GET /index.html HTTP/1.1" | pars examples/http-request-line.pars
 --   pars examples/http-request-line.pars examples/http-request-line.input
 
-request_line = method sp path sp version
+use "std/abnf";
+
+request_line = method SP path SP version
   where
     upper     = ['A'-'Z'];
     method    = upper+;
     path_char = ['a'-'z' 'A'-'Z' '0'-'9' '.' '/' '_'];
     path      = path_char+;
-    digit     = ['0'-'9'];
-    version   = "HTTP/" digit '.' digit;
-    sp        = ' '
+    version   = "HTTP/" DIGIT '.' DIGIT
   end

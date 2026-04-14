@@ -113,6 +113,25 @@ pub fn Vm(comptime stack_size: ?comptime_int) type {
             return self.match(source, "");
         }
 
+        // Returns true when `source` appears syntactically incomplete:
+        // all compile errors land at EOF, which means the input was cut
+        // off in the middle of a statement rather than being malformed.
+        // Uses a throwaway rule table so the real VM state is not touched.
+        pub fn isIncomplete(self: *Self, source: []const u8) bool {
+            var chunk = Chunk.init(self.allocator);
+            defer chunk.deinit();
+            var rules: RuleTable = .{};
+            defer rules.deinit(self.allocator);
+            var probe = Compiler.init(self.allocator);
+            defer probe.deinit();
+            const ok = probe.compile(source, &chunk, &rules, &self.obj_pool);
+            if (ok) return false;
+            for (probe.getErrors()) |e| {
+                if (!e.at_eof) return false;
+            }
+            return true;
+        }
+
         pub fn match(
             self: *Self,
             source: []const u8,

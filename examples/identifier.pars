@@ -4,8 +4,6 @@
 -- Usage:
 --   echo -n "foo_123" | pars examples/identifier.pars
 
-ident = (alpha / '_') (alpha / digit / '_')*
-  where
-    alpha = ['a'-'z' 'A'-'Z'];
-    digit = ['0'-'9']
-  end
+use "std/abnf";
+
+ident = (ALPHA / '_') (ALPHA / DIGIT / '_')*;

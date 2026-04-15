@@ -100,6 +100,10 @@ const Local = struct {
     // Rule table index for where-bound sub-rules. namedRule checks
     // locals[] first and emits op_call with this index on a hit.
     rule_index: u32 = 0,
+    // Set to true the first time namedRule resolves this binding. At
+    // endScope, any local still false is reported as unused so a typo
+    // like `where k = ident end => kk` surfaces immediately.
+    used: bool = false,
 };
 
 // Binding powers from loosest to tightest. A prefix parser compiles the
@@ -179,11 +183,44 @@ pub const Compiler = struct {
         // Discard every local whose depth exceeds the new scope level.
         // Where-rules live in the rule table, not on the value stack,
         // so no op_pop is emitted -- the compiler just forgets them.
+        // Report any local that was never resolved by namedRule so typos
+        // and leftover bindings surface. Skipped when the current rule
+        // body is already in error recovery to avoid noise on broken
+        // input.
         while (self.local_count > 0 and
             self.locals[self.local_count - 1].depth > @as(i32, @intCast(self.scope_depth)))
         {
+            const local = self.locals[self.local_count - 1];
+            if (!local.used and !self.parser.panic_mode) {
+                self.reportUnusedLocal(local);
+            }
             self.local_count -= 1;
         }
+    }
+
+    // Emit an "unused where-binding" diagnostic for `local`. Bypasses the
+    // errorAt panic gate so every unused binding in the same scope gets
+    // reported in one pass, and points the caret at the original name
+    // token recorded when the binding was registered.
+    fn reportUnusedLocal(self: *Compiler, local: Local) void {
+        const buf = std.fmt.allocPrint(
+            self.alloc,
+            "Unused where-binding '{s}'.",
+            .{local.name.lexeme},
+        ) catch return;
+        self.owned_error_messages.append(self.alloc, buf) catch {
+            self.alloc.free(buf);
+            return;
+        };
+        self.errors.append(self.alloc, .{
+            .line = local.name.line,
+            .column = local.name.column,
+            .start = local.name.start,
+            .len = local.name.len,
+            .message = buf,
+            .at_eof = false,
+        }) catch return;
+        self.parser.had_error = true;
     }
 
     fn identifiersEqual(a: Token, b: Token) bool {
@@ -559,6 +596,7 @@ pub const Compiler = struct {
             i -= 1;
             const local = &self.locals[i];
             if (local.depth != -1 and identifiersEqual(name, local.name)) {
+                local.used = true;
                 self.emitRuleCall(local.rule_index);
                 return;
             }
@@ -1310,6 +1348,78 @@ test "char literal hex escape with bad digit is a compile error" {
     var result = try compileForTest(alloc, "'\\xZZ'");
     defer result.deinit();
     try std.testing.expect(!result.ok);
+}
+
+test "unused where-binding is reported" {
+    const alloc = std.testing.allocator;
+    const src =
+        "foo = \"x\"\n" ++
+        "  where\n" ++
+        "    a = \"y\"\n" ++
+        "  end\n";
+    var result = try compileForTest(alloc, src);
+    defer result.deinit();
+
+    try std.testing.expect(!result.ok);
+    const errs = result.compiler.getErrors();
+    try std.testing.expectEqual(@as(usize, 1), errs.len);
+    try std.testing.expectEqualStrings(
+        "Unused where-binding 'a'.",
+        errs[0].message,
+    );
+    try std.testing.expectEqual(@as(usize, 3), errs[0].line);
+    try std.testing.expectEqual(@as(usize, 5), errs[0].column);
+}
+
+test "used where-binding is not reported" {
+    const alloc = std.testing.allocator;
+    const src =
+        "foo = a\n" ++
+        "  where\n" ++
+        "    a = \"y\"\n" ++
+        "  end\n";
+    var result = try compileForTest(alloc, src);
+    defer result.deinit();
+
+    try std.testing.expect(result.ok);
+}
+
+test "where-binding only referenced by a typo is flagged as unused" {
+    const alloc = std.testing.allocator;
+    // 'k' is bound but the body references 'kk', so 'k' goes unused.
+    // 'kk' falls through to the global rule table and is fine at
+    // compile time, exactly like any other forward-declared rule.
+    const src =
+        "foo = kk\n" ++
+        "  where\n" ++
+        "    k = \"x\"\n" ++
+        "  end\n";
+    var result = try compileForTest(alloc, src);
+    defer result.deinit();
+
+    try std.testing.expect(!result.ok);
+    const errs = result.compiler.getErrors();
+    try std.testing.expectEqual(@as(usize, 1), errs.len);
+    try std.testing.expectEqualStrings(
+        "Unused where-binding 'k'.",
+        errs[0].message,
+    );
+}
+
+test "multiple unused where-bindings are all reported" {
+    const alloc = std.testing.allocator;
+    const src =
+        "foo = \"x\"\n" ++
+        "  where\n" ++
+        "    a = \"y\";\n" ++
+        "    b = \"z\"\n" ++
+        "  end\n";
+    var result = try compileForTest(alloc, src);
+    defer result.deinit();
+
+    try std.testing.expect(!result.ok);
+    const errs = result.compiler.getErrors();
+    try std.testing.expectEqual(@as(usize, 2), errs.len);
 }
 
 test "duplicate where-binding reports prior declaration location" {

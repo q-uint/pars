@@ -3,36 +3,37 @@ const pars = @import("pars");
 const VM = pars.vm.Vm(null);
 const InterpretResult = pars.vm.InterpretResult;
 
-pub fn main() !void {
+pub fn main(init: std.process.Init) !void {
     const alloc = std.heap.page_allocator;
+    const io = init.io;
 
     var vm = VM.init(alloc);
     defer vm.deinit();
 
-    const args = try std.process.argsAlloc(alloc);
-    defer std.process.argsFree(alloc, args);
+    const args = try init.minimal.args.toSlice(alloc);
+    defer alloc.free(args);
 
     if (args.len == 1) {
-        try repl(&vm, alloc);
+        try repl(&vm, alloc, io);
     } else if (args.len == 2 or args.len == 3) {
         const input = if (args.len == 3)
-            readInput(alloc, args[2])
+            readInput(alloc, io, args[2])
         else
-            readStdin(alloc);
+            readStdin(alloc, io);
         defer alloc.free(input);
-        try runFile(&vm, args[1], input);
+        try runFile(&vm, alloc, io, args[1], input);
     } else {
         std.debug.print("Usage: pars <grammar> [input]\n", .{});
         std.process.exit(64);
     }
 }
 
-fn repl(vm: *VM, alloc: std.mem.Allocator) !void {
+fn repl(vm: *VM, alloc: std.mem.Allocator, io: std.Io) !void {
     var stdin_buf: [4096]u8 = undefined;
-    var stdin_reader = std.fs.File.stdin().reader(&stdin_buf);
+    var stdin_reader = std.Io.File.stdin().reader(io, &stdin_buf);
 
     var stdout_buf: [256]u8 = undefined;
-    var stdout_writer = std.fs.File.stdout().writer(&stdout_buf);
+    var stdout_writer = std.Io.File.stdout().writer(io, &stdout_buf);
 
     try runRepl(vm, alloc, &stdin_reader.interface, &stdout_writer.interface);
 }
@@ -106,7 +107,7 @@ fn handleMeta(
     // everything after (left-trimmed) is the argument.
     const space = std.mem.indexOfScalar(u8, line, ' ');
     const cmd = if (space) |s| line[0..s] else line;
-    const arg = if (space) |s| std.mem.trimLeft(u8, line[s + 1 ..], " \t") else "";
+    const arg = if (space) |s| std.mem.trimStart(u8, line[s + 1 ..], " \t") else "";
 
     if (std.mem.eql(u8, cmd, ":input")) {
         if (arg.len == 0) {
@@ -163,8 +164,8 @@ fn reportResult(stdout: anytype, result: InterpretResult, vm: *VM) !void {
     }
 }
 
-fn readInput(alloc: std.mem.Allocator, path: []const u8) []const u8 {
-    return std.fs.cwd().readFileAlloc(alloc, path, std.math.maxInt(usize)) catch |err| switch (err) {
+fn readInput(alloc: std.mem.Allocator, io: std.Io, path: []const u8) []const u8 {
+    return std.Io.Dir.cwd().readFileAlloc(io, path, alloc, .unlimited) catch |err| switch (err) {
         error.FileNotFound, error.AccessDenied => {
             std.debug.print("Could not open input file \"{s}\".\n", .{path});
             std.process.exit(74);
@@ -180,21 +181,17 @@ fn readInput(alloc: std.mem.Allocator, path: []const u8) []const u8 {
     };
 }
 
-fn readStdin(alloc: std.mem.Allocator) []const u8 {
+fn readStdin(alloc: std.mem.Allocator, io: std.Io) []const u8 {
     var buf: [4096]u8 = undefined;
-    var reader = std.fs.File.stdin().reader(&buf);
+    var reader = std.Io.File.stdin().reader(io, &buf);
     return reader.interface.allocRemaining(alloc, .unlimited) catch {
         std.debug.print("Could not read stdin.\n", .{});
         std.process.exit(74);
     };
 }
 
-fn runFile(vm: *VM, path: []const u8, input: []const u8) !void {
-    const source = std.fs.cwd().readFileAlloc(
-        std.heap.page_allocator,
-        path,
-        std.math.maxInt(usize),
-    ) catch |err| switch (err) {
+fn runFile(vm: *VM, alloc: std.mem.Allocator, io: std.Io, path: []const u8, input: []const u8) !void {
+    const source = std.Io.Dir.cwd().readFileAlloc(io, path, alloc, .unlimited) catch |err| switch (err) {
         error.FileNotFound, error.AccessDenied => {
             std.debug.print("Could not open file \"{s}\".\n", .{path});
             std.process.exit(74);
@@ -208,7 +205,7 @@ fn runFile(vm: *VM, path: []const u8, input: []const u8) !void {
             std.process.exit(74);
         },
     };
-    defer std.heap.page_allocator.free(source);
+    defer alloc.free(source);
 
     const result = vm.match(source, input);
     switch (result) {
@@ -283,7 +280,7 @@ fn runExample(comptime grammar_path: []const u8, input: []const u8) !void {
     const alloc = std.testing.allocator;
     var vm = VM.init(alloc);
     defer vm.deinit();
-    const source = try std.fs.cwd().readFileAlloc(alloc, grammar_path, std.math.maxInt(usize));
+    const source = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, grammar_path, alloc, .unlimited);
     defer alloc.free(source);
     const result = vm.match(source, input);
     try std.testing.expectEqual(.ok, result);

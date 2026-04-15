@@ -17,9 +17,9 @@ const TokenType = scanner_mod.TokenType;
 /// compile time; at runtime op_call uses the index to jump straight
 /// to the chunk without a hash lookup.
 pub const RuleTable = struct {
-    by_name: std.StringHashMapUnmanaged(u32) = .{},
-    chunks: std.ArrayListUnmanaged(?Chunk) = .{},
-    names: std.ArrayListUnmanaged([]const u8) = .{},
+    by_name: std.StringHashMapUnmanaged(u32) = .empty,
+    chunks: std.ArrayListUnmanaged(?Chunk) = .empty,
+    names: std.ArrayListUnmanaged([]const u8) = .empty,
 
     /// Return the index for `name`, allocating a new slot if this is
     /// the first reference. Forward references get a null chunk that

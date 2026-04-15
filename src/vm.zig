@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const chunk_mod = @import("chunk.zig");
 const Chunk = chunk_mod.Chunk;
 const OpCode = chunk_mod.OpCode;
@@ -175,7 +176,7 @@ pub fn Vm(comptime stack_size: ?comptime_int) type {
                 }
 
                 const instruction = self.readByte();
-                const op = std.meta.intToEnum(OpCode, instruction) catch {
+                const op = std.enums.fromInt(OpCode, instruction) orelse {
                     self.runtimeError("unknown opcode {d}", .{instruction});
                     return .runtime_error;
                 };
@@ -406,22 +407,21 @@ pub fn Vm(comptime stack_size: ?comptime_int) type {
         }
 
         fn runtimeError(self: *Self, comptime fmt: []const u8, args: anytype) void {
-            var buf: [1024]u8 = undefined;
-            var w = std.fs.File.stderr().writer(&buf);
-            w.interface.print(fmt, args) catch {};
-            w.interface.print("\n", .{}) catch {};
+            if (builtin.is_test) return;
+            std.debug.print(fmt, args);
+            std.debug.print("\n", .{});
 
             // ip points past the offending instruction, so subtract 1.
             const line = self.chunk.?.getLine(self.ip - 1);
-            w.interface.print("[line {d}] in script\n", .{line}) catch {};
-            w.interface.flush() catch {};
+            std.debug.print("[line {d}] in script\n", .{line});
         }
 
         fn renderCompileErrorsToStderr(self: *Self, source: []const u8) void {
-            var buf: [1024]u8 = undefined;
-            var stderr_writer = std.fs.File.stderr().writer(&buf);
-            self.compiler.renderErrors(source, &stderr_writer.interface) catch return;
-            stderr_writer.interface.flush() catch return;
+            if (builtin.is_test) return;
+            var aw = std.Io.Writer.Allocating.init(self.allocator);
+            defer aw.deinit();
+            self.compiler.renderErrors(source, &aw.writer) catch return;
+            std.debug.print("{s}", .{aw.writer.buffered()});
         }
 
         pub fn deinit(self: *Self) void {

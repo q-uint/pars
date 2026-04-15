@@ -128,6 +128,10 @@ pub const Compiler = struct {
     parser: Parser = undefined,
     compiling_chunk: *Chunk = undefined,
     errors: std.ArrayList(CompileError) = .empty,
+    // Backing buffers for diagnostics whose messages are formatted at
+    // runtime. Freed at the start of each compile and in deinit; errors
+    // whose messages are string literals are not tracked here.
+    owned_error_messages: std.ArrayList([]u8) = .empty,
     alloc: std.mem.Allocator,
     compiling_source: []const u8 = &.{},
     compiling_rules: ?*RuleTable = null,
@@ -234,6 +238,8 @@ pub const Compiler = struct {
         self.had_expression = false;
 
         self.errors.clearRetainingCapacity();
+        for (self.owned_error_messages.items) |buf| self.alloc.free(buf);
+        self.owned_error_messages.clearRetainingCapacity();
 
         self.parser.had_error = false;
         self.parser.panic_mode = false;
@@ -255,6 +261,9 @@ pub const Compiler = struct {
     pub fn deinit(self: *Compiler) void {
         self.errors.deinit(self.alloc);
         self.errors = .empty;
+        for (self.owned_error_messages.items) |buf| self.alloc.free(buf);
+        self.owned_error_messages.deinit(self.alloc);
+        self.owned_error_messages = .empty;
     }
 
     fn advance(self: *Compiler) void {
@@ -417,9 +426,35 @@ pub const Compiler = struct {
     // both the block terminator and the outer rule's statement terminator
     // (no additional ';' is needed after 'end').
     fn whereBlock(self: *Compiler) void {
+        // Tracks sub-rule names already declared in this block so a second
+        // declaration of the same name is reported with a pointer back to
+        // the first one, instead of silently overwriting its body.
+        var seen: [256]Token = undefined;
+        var seen_count: usize = 0;
+
         while (!self.check(.kw_end) and !self.check(.eof)) {
             self.consume(.identifier, "Expect sub-rule name in 'where'.");
             const name_tok = self.parser.previous;
+
+            var duplicate_of: ?Token = null;
+            for (seen[0..seen_count]) |prev| {
+                if (identifiersEqual(name_tok, prev)) {
+                    duplicate_of = prev;
+                    break;
+                }
+            }
+            if (duplicate_of) |prev| {
+                // previous still points at name_tok (the duplicate) here,
+                // so the caret lands on the offending identifier.
+                self.errorAtPreviousFmt(
+                    "Duplicate where-binding '{s}'. Previous declaration at line {d}, column {d}.",
+                    .{ name_tok.lexeme, prev.line, prev.column },
+                );
+            } else if (seen_count < seen.len) {
+                seen[seen_count] = name_tok;
+                seen_count += 1;
+            }
+
             self.consume(.equal, "Expect '=' after sub-rule name in 'where'.");
 
             // Find the pre-registered local index for this name.
@@ -435,7 +470,10 @@ pub const Compiler = struct {
                 return;
             }
 
-            // Compile the sub-rule body into its own chunk.
+            // Compile the sub-rule body into its own chunk. For a duplicate
+            // we still walk the body to surface any further errors inside
+            // it, but drop the chunk afterwards so the first declaration's
+            // body remains authoritative.
             const saved_chunk = self.compiling_chunk;
             var sub_chunk = Chunk.init(self.alloc);
             self.compiling_chunk = &sub_chunk;
@@ -443,7 +481,11 @@ pub const Compiler = struct {
             self.emitByte(@intFromEnum(OpCode.op_return));
             self.compiling_chunk = saved_chunk;
 
-            self.compiling_rules.?.setChunk(rule_idx.?, sub_chunk);
+            if (duplicate_of == null) {
+                self.compiling_rules.?.setChunk(rule_idx.?, sub_chunk);
+            } else {
+                sub_chunk.deinit();
+            }
 
             // Trailing ';' is optional before 'end'.
             _ = self.match(.semicolon);
@@ -915,6 +957,20 @@ pub const Compiler = struct {
         self.errorAt(&self.parser.previous, message);
     }
 
+    fn errorAtPreviousFmt(self: *Compiler, comptime fmt: []const u8, args: anytype) void {
+        if (self.parser.panic_mode) return;
+        const buf = std.fmt.allocPrint(self.alloc, fmt, args) catch {
+            self.errorAt(&self.parser.previous, "Out of memory.");
+            return;
+        };
+        self.owned_error_messages.append(self.alloc, buf) catch {
+            self.alloc.free(buf);
+            self.errorAt(&self.parser.previous, "Out of memory.");
+            return;
+        };
+        self.errorAt(&self.parser.previous, buf);
+    }
+
     fn errorAt(self: *Compiler, token: *const Token, message: []const u8) void {
         if (self.parser.panic_mode) return;
         self.parser.panic_mode = true;
@@ -1254,4 +1310,38 @@ test "char literal hex escape with bad digit is a compile error" {
     var result = try compileForTest(alloc, "'\\xZZ'");
     defer result.deinit();
     try std.testing.expect(!result.ok);
+}
+
+test "duplicate where-binding reports prior declaration location" {
+    const alloc = std.testing.allocator;
+    const src =
+        "foo = a\n" ++
+        "  where\n" ++
+        "    a = \"x\";\n" ++
+        "    a = \"y\"\n" ++
+        "  end\n";
+    var result = try compileForTest(alloc, src);
+    defer result.deinit();
+
+    try std.testing.expect(!result.ok);
+    const errs = result.compiler.getErrors();
+    try std.testing.expectEqual(@as(usize, 1), errs.len);
+
+    const e = errs[0];
+    try std.testing.expectEqual(@as(usize, 4), e.line);
+    try std.testing.expectEqual(@as(usize, 5), e.column);
+    try std.testing.expectEqualStrings(
+        "Duplicate where-binding 'a'. Previous declaration at line 3, column 5.",
+        e.message,
+    );
+
+    var aw = std.Io.Writer.Allocating.init(alloc);
+    defer aw.deinit();
+    try result.compiler.renderErrors(src, &aw.writer);
+    const expected =
+        "error: Duplicate where-binding 'a'. Previous declaration at line 3, column 5.\n" ++
+        " --> line 4, column 5\n" ++
+        "   4 |     a = \"y\"\n" ++
+        "     |     ^ Duplicate where-binding 'a'. Previous declaration at line 3, column 5.\n";
+    try std.testing.expectEqualStrings(expected, aw.writer.buffered());
 }

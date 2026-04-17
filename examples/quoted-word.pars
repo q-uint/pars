@@ -1,0 +1,13 @@
+-- Match a word surrounded by a pair of matching quotes. The opening
+-- and closing quote must be the same character: 'hello' and "hello"
+-- match, but 'hello" does not. Demonstrates capture back-references.
+--
+-- Usage:
+--   echo -n "'hello'"  | pars examples/quoted-word.pars
+--   echo -n '"hello"'  | pars examples/quoted-word.pars
+
+quoted_word = <q: quote> word q
+  where
+    quote = '"' / "'";
+    word  = ['a'-'z' 'A'-'Z']+
+  end

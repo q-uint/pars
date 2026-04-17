@@ -45,6 +45,10 @@ pub const TokenType = enum {
     /// '&' - positive lookahead: succeeds without consuming input.
     amp,
 
+    /// '<' - opens a capture binding.
+    left_angle,
+    /// '>' - closes a capture binding.
+    right_angle,
     /// '=>' - introduces a semantic action attached to a rule body.
     arrow,
 
@@ -163,6 +167,8 @@ pub const Scanner = struct {
             '?' => return self.makeToken(.question),
             '!' => return self.makeToken(.bang),
             '&' => return self.makeToken(.amp),
+            '<' => return self.makeToken(.left_angle),
+            '>' => return self.makeToken(.right_angle),
             '=' => return self.makeToken(if (self.match('>')) .arrow else .equal),
             '"' => return self.string(),
             '\'' => return self.charLiteral(),
@@ -364,13 +370,15 @@ test "line comment is skipped" {
 }
 
 test "single-character punctuation" {
-    try expectTokens("()[]{},:.%^/|*+?!&", &.{
+    try expectTokens("()[]{}<>,:.%^/|*+?!&", &.{
         .{ .type = .left_paren, .lexeme = "(" },
         .{ .type = .right_paren, .lexeme = ")" },
         .{ .type = .left_bracket, .lexeme = "[" },
         .{ .type = .right_bracket, .lexeme = "]" },
         .{ .type = .left_brace, .lexeme = "{" },
         .{ .type = .right_brace, .lexeme = "}" },
+        .{ .type = .left_angle, .lexeme = "<" },
+        .{ .type = .right_angle, .lexeme = ">" },
         .{ .type = .comma, .lexeme = "," },
         .{ .type = .colon, .lexeme = ":" },
         .{ .type = .dot, .lexeme = "." },

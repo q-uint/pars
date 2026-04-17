@@ -76,6 +76,11 @@ pub fn Vm(comptime stack_size: ?comptime_int) type {
         // before a speculative match attempt.
         bt_stack: [max_bt]BacktrackFrame,
         bt_top: usize,
+        // Capture slots for let-bindings. capture_starts holds the
+        // input position saved by op_capture_begin; captures holds the
+        // completed Span after op_capture_end.
+        capture_starts: [256]usize,
+        captures: [256]value_mod.Span,
         allocator: std.mem.Allocator,
         obj_pool: object.ObjPool,
         compiler: Compiler,
@@ -92,6 +97,8 @@ pub fn Vm(comptime stack_size: ?comptime_int) type {
                 .frame_count = 0,
                 .bt_stack = undefined,
                 .bt_top = 0,
+                .capture_starts = undefined,
+                .captures = undefined,
                 .allocator = allocator,
                 .obj_pool = object.ObjPool.init(allocator),
                 .compiler = Compiler.init(allocator),
@@ -273,6 +280,23 @@ pub fn Vm(comptime stack_size: ?comptime_int) type {
                     },
                     .op_fail => {
                         if (self.fail() == .no_match) return .no_match;
+                    },
+                    .op_capture_begin => {
+                        const slot = self.readByte();
+                        self.capture_starts[slot] = self.pos;
+                    },
+                    .op_capture_end => {
+                        const slot = self.readByte();
+                        const start = self.capture_starts[slot];
+                        self.captures[slot] = .{ .start = start, .len = self.pos - start };
+                    },
+                    .op_match_backref => {
+                        const slot = self.readByte();
+                        const span = self.captures[slot];
+                        const text = self.input[span.start..][0..span.len];
+                        if (!self.consumePrefix(text)) {
+                            if (self.fail() == .no_match) return .no_match;
+                        }
                     },
                     .op_halt => return .ok,
                 }
@@ -854,4 +878,74 @@ test "rules persist across REPL iterations" {
     // Third iteration: rule still available.
     const r3 = machine.match("digit digit", "42");
     try std.testing.expectEqual(.ok, r3);
+}
+
+test "capture records matched span" {
+    var machine = VmTest.init(std.testing.allocator);
+    defer machine.deinit();
+    const result = machine.match("<k: ['a'-'z']+>", "hello123");
+    try std.testing.expectEqual(.ok, result);
+    try std.testing.expectEqual(@as(usize, 0), machine.captures[0].start);
+    try std.testing.expectEqual(@as(usize, 5), machine.captures[0].len);
+}
+
+test "captures in sequence get distinct slots" {
+    var machine = VmTest.init(std.testing.allocator);
+    defer machine.deinit();
+    const result = machine.match(
+        "<k: ['a'-'z']+> \":\" <v: ['0'-'9']+>",
+        "abc:123",
+    );
+    try std.testing.expectEqual(.ok, result);
+    try std.testing.expectEqual(@as(usize, 0), machine.captures[0].start);
+    try std.testing.expectEqual(@as(usize, 3), machine.captures[0].len);
+    try std.testing.expectEqual(@as(usize, 4), machine.captures[1].start);
+    try std.testing.expectEqual(@as(usize, 3), machine.captures[1].len);
+}
+
+test "capture wraps choice inside brackets" {
+    var machine = VmTest.init(std.testing.allocator);
+    defer machine.deinit();
+    const r1 = machine.match("<s: \"http\" / \"ftp\"> \"://\"", "http://");
+    try std.testing.expectEqual(.ok, r1);
+    try std.testing.expectEqual(@as(usize, 0), machine.captures[0].start);
+    try std.testing.expectEqual(@as(usize, 4), machine.captures[0].len);
+}
+
+test "capture inside rule declaration" {
+    var machine = VmTest.init(std.testing.allocator);
+    defer machine.deinit();
+    const result = machine.match(
+        "kv = <k: ['a'-'z']+> \"=\" <v: ['0'-'9']+>;",
+        "abc=42",
+    );
+    try std.testing.expectEqual(.ok, result);
+    try std.testing.expectEqual(@as(usize, 0), machine.captures[0].start);
+    try std.testing.expectEqual(@as(usize, 3), machine.captures[0].len);
+    try std.testing.expectEqual(@as(usize, 4), machine.captures[1].start);
+    try std.testing.expectEqual(@as(usize, 2), machine.captures[1].len);
+}
+
+test "back-reference matches same text" {
+    var machine = VmTest.init(std.testing.allocator);
+    defer machine.deinit();
+    const result = machine.match("<w: ['a'-'z']+> \"-\" w", "abc-abc");
+    try std.testing.expectEqual(.ok, result);
+}
+
+test "back-reference rejects different text" {
+    var machine = VmTest.init(std.testing.allocator);
+    defer machine.deinit();
+    const result = machine.match("<w: ['a'-'z']+> \"-\" w", "abc-xyz");
+    try std.testing.expectEqual(.no_match, result);
+}
+
+test "capture survives backtracking in choice" {
+    var machine = VmTest.init(std.testing.allocator);
+    defer machine.deinit();
+    const result = machine.match(
+        "(<k: \"ab\"> \"X\") / \"abc\"",
+        "abc",
+    );
+    try std.testing.expectEqual(.ok, result);
 }

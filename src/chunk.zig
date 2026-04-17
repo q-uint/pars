@@ -45,6 +45,18 @@ pub const OpCode = enum(u8) {
     // restore state and continue; otherwise propagate .no_match.
     // 1 byte.
     op_fail,
+    // Save the current input position into the given capture slot.
+    // 2 bytes: opcode + slot index.
+    op_capture_begin,
+    // Compute a Span from the saved position in the capture slot to
+    // the current input position and store it back into the slot.
+    // 2 bytes: opcode + slot index.
+    op_capture_end,
+    // Back-reference: match the exact text previously captured in the
+    // given slot. Fails if the input at the current position does not
+    // match the captured span byte-for-byte.
+    // 2 bytes: opcode + slot index.
+    op_match_backref,
     op_halt, // 1 byte
 };
 

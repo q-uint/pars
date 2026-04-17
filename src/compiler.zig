@@ -87,10 +87,10 @@ const Parser = struct {
     panic_mode: bool,
 };
 
-// One local in scope during the current rule body. Where-bound sub-rules
-// are the only locals for now. The compiler pre-registers them before
-// compiling the main body so forward references work. At runtime no slot
-// is allocated; rule_index is used directly to emit op_call.
+// One local in scope during the current rule body. A local is either a
+// where-bound sub-rule (resolved via rule_index) or a let-capture
+// (resolved via capture_slot). The compiler pre-registers where-bindings
+// before compiling the main body so forward references work.
 const Local = struct {
     name: Token,
     // Scope depth at which this local was declared. -1 marks a local
@@ -100,6 +100,12 @@ const Local = struct {
     // Rule table index for where-bound sub-rules. namedRule checks
     // locals[] first and emits op_call with this index on a hit.
     rule_index: u32 = 0,
+    // VM capture slot for let-bindings. At runtime op_capture_begin
+    // saves the input position into this slot and op_capture_end
+    // stores the resulting Span.
+    capture_slot: u8 = 0,
+    // True when this local is a let-capture rather than a where-binding.
+    is_capture: bool = false,
     // Set to true the first time namedRule resolves this binding. At
     // endScope, any local still false is reported as unused so a typo
     // like `where k = ident end => kk` surfaces immediately.
@@ -157,6 +163,9 @@ pub const Compiler = struct {
     // outermost level, incremented by beginScope and decremented by
     // endScope. Used to decide which locals to pop when a scope exits.
     scope_depth: u32 = 0,
+    // Number of capture slots allocated in the current rule body.
+    // Each `let` binding gets the next slot. Reset per rule.
+    capture_count: u8 = 0,
 
     const ParseFn = *const fn (self: *Compiler) void;
 
@@ -191,7 +200,10 @@ pub const Compiler = struct {
             self.locals[self.local_count - 1].depth > @as(i32, @intCast(self.scope_depth)))
         {
             const local = self.locals[self.local_count - 1];
-            if (!local.used and !self.parser.panic_mode) {
+            // Capture bindings are useful by their existence (they record
+            // spans); skip the unused check for them. Where-bindings that
+            // are never referenced are likely typos and are still reported.
+            if (!local.used and !local.is_capture and !self.parser.panic_mode) {
                 self.reportUnusedLocal(local);
             }
             self.local_count -= 1;
@@ -203,10 +215,11 @@ pub const Compiler = struct {
     // reported in one pass, and points the caret at the original name
     // token recorded when the binding was registered.
     fn reportUnusedLocal(self: *Compiler, local: Local) void {
+        const kind = if (local.is_capture) "capture" else "where";
         const buf = std.fmt.allocPrint(
             self.alloc,
-            "Unused where-binding '{s}'.",
-            .{local.name.lexeme},
+            "Unused {s}-binding '{s}'.",
+            .{ kind, local.name.lexeme },
         ) catch return;
         self.owned_error_messages.append(self.alloc, buf) catch {
             self.alloc.free(buf);
@@ -282,6 +295,7 @@ pub const Compiler = struct {
         self.parser.panic_mode = false;
         self.local_count = 0;
         self.scope_depth = 0;
+        self.capture_count = 0;
 
         self.advance();
 
@@ -547,6 +561,7 @@ pub const Compiler = struct {
         self.compiling_chunk = &rule_chunk;
         self.local_count = 0;
         self.scope_depth = 0;
+        self.capture_count = 0;
 
         // Pre-scan for 'where' sub-rule names so the main body can
         // reference them. Must happen inside the scope.
@@ -590,13 +605,17 @@ pub const Compiler = struct {
 
     fn namedRule(self: *Compiler) void {
         const name = self.parser.previous;
-        // Check where-bound locals first (innermost scope wins).
+        // Check locals first (innermost scope wins).
         var i = self.local_count;
         while (i > 0) {
             i -= 1;
             const local = &self.locals[i];
             if (local.depth != -1 and identifiersEqual(name, local.name)) {
                 local.used = true;
+                if (local.is_capture) {
+                    self.emitBytes(@intFromEnum(OpCode.op_match_backref), local.capture_slot);
+                    return;
+                }
                 self.emitRuleCall(local.rule_index);
                 return;
             }
@@ -607,6 +626,34 @@ pub const Compiler = struct {
             return;
         };
         self.emitRuleCall(index);
+    }
+
+    // Prefix parser for `<name: pattern>`. The angle brackets provide
+    // explicit visual boundaries for the captured region. Inside the
+    // brackets, a full expression is parsed (choice-level precedence)
+    // since `>` acts as an unambiguous terminator. After a successful
+    // match, the name is available as a back-reference that matches the
+    // same text byte-for-byte.
+    fn capture(self: *Compiler) void {
+        self.consume(.identifier, "Expect binding name after '<'.");
+        const name = self.parser.previous;
+        self.consume(.colon, "Expect ':' after capture name.");
+
+        self.declareVariable(name);
+        if (self.capture_count >= 255) {
+            self.errorAtPrevious("Too many capture bindings in rule.");
+            return;
+        }
+        const slot = self.capture_count;
+        self.locals[self.local_count - 1].is_capture = true;
+        self.locals[self.local_count - 1].capture_slot = slot;
+        self.capture_count += 1;
+
+        self.emitBytes(@intFromEnum(OpCode.op_capture_begin), slot);
+        self.expression();
+        self.markInitialized();
+        self.emitBytes(@intFromEnum(OpCode.op_capture_end), slot);
+        self.consume(.right_angle, "Expect '>' to close capture.");
     }
 
     // Pratt loop. Sequence is the only operator without a token of its own:
@@ -670,6 +717,7 @@ pub const Compiler = struct {
         t[@intFromEnum(TokenType.char)] = .{ .prefix = charLiteral, .infix = null, .precedence = .none };
         t[@intFromEnum(TokenType.dot)] = .{ .prefix = anyChar, .infix = null, .precedence = .none };
         t[@intFromEnum(TokenType.identifier)] = .{ .prefix = namedRule, .infix = null, .precedence = .none };
+        t[@intFromEnum(TokenType.left_angle)] = .{ .prefix = capture, .infix = null, .precedence = .none };
 
         t[@intFromEnum(TokenType.slash)] = .{ .prefix = null, .infix = choiceOp, .precedence = .choice };
         t[@intFromEnum(TokenType.pipe)] = .{ .prefix = null, .infix = choiceOp, .precedence = .choice };
@@ -1454,4 +1502,76 @@ test "duplicate where-binding reports prior declaration location" {
         "   4 |     a = \"y\"\n" ++
         "     |     ^ Duplicate where-binding 'a'. Previous declaration at line 3, column 5.\n";
     try std.testing.expectEqualStrings(expected, aw.writer.buffered());
+}
+
+test "capture emits capture-begin and capture-end opcodes" {
+    const alloc = std.testing.allocator;
+    var result = try compileForTest(alloc, "<k: \"x\">");
+    defer result.deinit();
+
+    try std.testing.expect(result.ok);
+    const code = result.chunk.code.items;
+    // op_capture_begin 0, op_match_string X, op_capture_end 0, op_halt
+    try std.testing.expectEqual(@intFromEnum(OpCode.op_capture_begin), code[0]);
+    try std.testing.expectEqual(@as(u8, 0), code[1]);
+    const halt_pos = code.len - 1;
+    try std.testing.expectEqual(@intFromEnum(OpCode.op_halt), code[halt_pos]);
+    try std.testing.expectEqual(@intFromEnum(OpCode.op_capture_end), code[halt_pos - 2]);
+    try std.testing.expectEqual(@as(u8, 0), code[halt_pos - 1]);
+}
+
+test "multiple captures get distinct slots" {
+    const alloc = std.testing.allocator;
+    var result = try compileForTest(alloc, "<a: \"x\"> <b: \"y\">");
+    defer result.deinit();
+
+    try std.testing.expect(result.ok);
+    const code = result.chunk.code.items;
+    // First capture uses slot 0.
+    try std.testing.expectEqual(@intFromEnum(OpCode.op_capture_begin), code[0]);
+    try std.testing.expectEqual(@as(u8, 0), code[1]);
+    // Find second capture_begin; its slot should be 1.
+    var found_second = false;
+    for (code[2..], 2..) |byte, i| {
+        if (byte == @intFromEnum(OpCode.op_capture_begin) and i > 1) {
+            try std.testing.expectEqual(@as(u8, 1), code[i + 1]);
+            found_second = true;
+            break;
+        }
+    }
+    try std.testing.expect(found_second);
+}
+
+test "unreferenced capture is not flagged as unused" {
+    const alloc = std.testing.allocator;
+    var result = try compileForTest(alloc, "foo = <k: \"x\">;");
+    defer result.deinit();
+
+    try std.testing.expect(result.ok);
+}
+
+test "back-reference emits op_match_backref" {
+    const alloc = std.testing.allocator;
+    var result = try compileForTest(alloc, "<k: \"x\"> k");
+    defer result.deinit();
+
+    try std.testing.expect(result.ok);
+    const code = result.chunk.code.items;
+    // Find op_match_backref after the capture_end.
+    var found = false;
+    for (code) |byte| {
+        if (byte == @intFromEnum(OpCode.op_match_backref)) {
+            found = true;
+            break;
+        }
+    }
+    try std.testing.expect(found);
+}
+
+test "capture allows choice inside brackets" {
+    const alloc = std.testing.allocator;
+    var result = try compileForTest(alloc, "<s: \"http\" / \"ftp\">");
+    defer result.deinit();
+
+    try std.testing.expect(result.ok);
 }

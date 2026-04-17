@@ -47,6 +47,9 @@ pub fn disassembleInstruction(c: *Chunk, offset: usize) usize {
         .op_choice => jumpInstruction("OP_CHOICE", c, offset),
         .op_commit => jumpInstruction("OP_COMMIT", c, offset),
         .op_fail => simpleInstruction("OP_FAIL", offset),
+        .op_capture_begin => indexInstruction("OP_CAPTURE_BEGIN", c, offset),
+        .op_capture_end => indexInstruction("OP_CAPTURE_END", c, offset),
+        .op_match_backref => indexInstruction("OP_MATCH_BACKREF", c, offset),
         .op_halt => simpleInstruction("OP_HALT", offset),
     };
 }

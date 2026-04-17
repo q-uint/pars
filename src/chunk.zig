@@ -57,6 +57,18 @@ pub const OpCode = enum(u8) {
     // match the captured span byte-for-byte.
     // 2 bytes: opcode + slot index.
     op_match_backref,
+    // Pop the top backtrack frame without restoring state, then trigger
+    // a failure that unwinds through the next frame down. Used to
+    // implement negative lookahead `!A`: when A matches, the outer
+    // context must fail rather than accept the match.
+    // 1 byte.
+    op_fail_twice,
+    // Pop the top backtrack frame, restore the saved input position
+    // from it, then jump by the signed 16-bit offset. Used to
+    // implement positive lookahead `&A`: when A matches, rewind to
+    // the position before A and continue past the lookahead.
+    // 3 bytes: opcode + signed 16-bit offset.
+    op_back_commit,
     op_halt, // 1 byte
 };
 

@@ -1,0 +1,18 @@
+-- Match a non-keyword identifier. Demonstrates negative lookahead
+-- (`!A`) in two roles: outer exclusion ("the word is not a reserved
+-- keyword") and inner boundary check ("the keyword ends here, not in
+-- the middle of a longer identifier").
+--
+-- Usage:
+--   echo -n "hello"   | pars examples/keyword-exclusion.pars   # matches
+--   echo -n "if"      | pars examples/keyword-exclusion.pars   # no match
+--   echo -n "ifx"     | pars examples/keyword-exclusion.pars   # matches
+--   echo -n "while"   | pars examples/keyword-exclusion.pars   # no match
+--   echo -n "whiley"  | pars examples/keyword-exclusion.pars   # matches
+
+word = !keyword ident
+  where
+    keyword    = ("if" / "else" / "while") !ident_char;
+    ident      = ident_char+;
+    ident_char = ['a'-'z' 'A'-'Z' '_' '0'-'9']
+  end

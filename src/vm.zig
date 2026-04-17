@@ -298,6 +298,25 @@ pub fn Vm(comptime stack_size: ?comptime_int) type {
                             if (self.fail() == .no_match) return .no_match;
                         }
                     },
+                    .op_fail_twice => {
+                        if (self.bt_top == 0) {
+                            self.runtimeError("op_fail_twice with empty backtrack stack", .{});
+                            return .runtime_error;
+                        }
+                        self.bt_top -= 1;
+                        if (self.fail() == .no_match) return .no_match;
+                    },
+                    .op_back_commit => {
+                        const offset = self.readJumpOffset();
+                        if (self.bt_top == 0) {
+                            self.runtimeError("op_back_commit with empty backtrack stack", .{});
+                            return .runtime_error;
+                        }
+                        self.bt_top -= 1;
+                        const frame = self.bt_stack[self.bt_top];
+                        self.pos = frame.pos;
+                        self.ip = @intCast(@as(isize, @intCast(self.ip)) + offset);
+                    },
                     .op_halt => return .ok,
                 }
             }
@@ -948,4 +967,66 @@ test "capture survives backtracking in choice" {
         "abc",
     );
     try std.testing.expectEqual(.ok, result);
+}
+
+test "negative lookahead passes when operand does not match" {
+    var machine = VmTest.init(std.testing.allocator);
+    defer machine.deinit();
+    const result = machine.match("!\"no\" ['a'-'z']+", "yes");
+    try std.testing.expectEqual(.ok, result);
+}
+
+test "negative lookahead fails when operand matches" {
+    var machine = VmTest.init(std.testing.allocator);
+    defer machine.deinit();
+    const result = machine.match("!\"no\" ['a'-'z']+", "nope");
+    try std.testing.expectEqual(.no_match, result);
+}
+
+test "negative lookahead does not consume input" {
+    // If `!'a'` consumed input, the subsequent `'b'` would see the
+    // second byte 'b' at position 1 instead of position 0 on a
+    // non-matching case, or miss the 'b' on a matching case.
+    var machine = VmTest.init(std.testing.allocator);
+    defer machine.deinit();
+    const ok = machine.match("!\"a\" \"b\"", "b");
+    try std.testing.expectEqual(.ok, ok);
+}
+
+test "keyword exclusion pattern with nested negative lookaheads" {
+    var machine = VmTest.init(std.testing.allocator);
+    defer machine.deinit();
+
+    const source =
+        "word = !keyword ident" ++
+        "  where" ++
+        "    keyword    = (\"if\" / \"else\") !ident_char;" ++
+        "    ident      = ident_char+;" ++
+        "    ident_char = ['a'-'z']" ++
+        "  end";
+
+    // Reserved keywords are rejected.
+    try std.testing.expectEqual(.no_match, machine.match(source, "if"));
+    try std.testing.expectEqual(.no_match, machine.match(source, "else"));
+    // Identifiers that happen to start with a keyword still match,
+    // because the trailing `!ident_char` rules them out as keywords.
+    try std.testing.expectEqual(.ok, machine.match(source, "ifx"));
+    try std.testing.expectEqual(.ok, machine.match(source, "elsewhere"));
+    // Plain non-keyword identifiers match.
+    try std.testing.expectEqual(.ok, machine.match(source, "hello"));
+}
+
+test "positive lookahead passes when operand matches, without consuming" {
+    var machine = VmTest.init(std.testing.allocator);
+    defer machine.deinit();
+    // &"a" asserts 'a' at position 0, then 'a' consumes it.
+    const result = machine.match("&\"a\" \"a\" \"b\"", "ab");
+    try std.testing.expectEqual(.ok, result);
+}
+
+test "positive lookahead fails when operand does not match" {
+    var machine = VmTest.init(std.testing.allocator);
+    defer machine.deinit();
+    const result = machine.match("&\"a\" \"b\"", "b");
+    try std.testing.expectEqual(.no_match, result);
 }

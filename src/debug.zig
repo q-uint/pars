@@ -50,6 +50,8 @@ pub fn disassembleInstruction(c: *Chunk, offset: usize) usize {
         .op_capture_begin => indexInstruction("OP_CAPTURE_BEGIN", c, offset),
         .op_capture_end => indexInstruction("OP_CAPTURE_END", c, offset),
         .op_match_backref => indexInstruction("OP_MATCH_BACKREF", c, offset),
+        .op_fail_twice => simpleInstruction("OP_FAIL_TWICE", offset),
+        .op_back_commit => jumpInstruction("OP_BACK_COMMIT", c, offset),
         .op_halt => simpleInstruction("OP_HALT", offset),
     };
 }

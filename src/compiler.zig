@@ -121,8 +121,8 @@ const Precedence = enum(u8) {
     none,
     choice, // '/'
     sequence, // juxtaposition (no token)
+    lookahead, // '!' '&' — prefix, binds looser than quantifier so `!A*` is `!(A*)`.
     quantifier, // '*' '+' '?'
-    lookahead, // '!' '&'
     primary,
 
     fn next(self: Precedence) Precedence {
@@ -656,6 +656,50 @@ pub const Compiler = struct {
         self.consume(.right_angle, "Expect '>' to close capture.");
     }
 
+    // !A : negative lookahead. Succeeds when A fails to match at the
+    // current position; consumes no input either way.
+    //
+    // Emits:
+    //     op_choice L1
+    //     <A>
+    //     op_fail_twice
+    //   L1:
+    //
+    // If A succeeds, op_fail_twice pops our choice frame and propagates
+    // failure to the surrounding context. If A fails, the choice frame
+    // restores the pre-A position and transfers control to L1, where
+    // execution continues past the lookahead.
+    fn notLookahead(self: *Compiler) void {
+        const choice_offset = self.emitJump(.op_choice);
+        self.parsePrecedence(Precedence.lookahead.next());
+        self.emitByte(@intFromEnum(OpCode.op_fail_twice));
+        self.patchJump(choice_offset);
+    }
+
+    // &A : positive lookahead. Succeeds when A matches at the current
+    // position; consumes no input either way.
+    //
+    // Emits:
+    //     op_choice L1
+    //     <A>
+    //     op_back_commit L2
+    //   L1:
+    //     op_fail
+    //   L2:
+    //
+    // If A succeeds, op_back_commit pops the choice frame, restores the
+    // saved position (so A is not consumed), and jumps past the failure
+    // tail. If A fails, control lands at L1 and op_fail propagates the
+    // failure outward.
+    fn andLookahead(self: *Compiler) void {
+        const choice_offset = self.emitJump(.op_choice);
+        self.parsePrecedence(Precedence.lookahead.next());
+        const back_commit_offset = self.emitJump(.op_back_commit);
+        self.patchJump(choice_offset);
+        self.emitByte(@intFromEnum(OpCode.op_fail));
+        self.patchJump(back_commit_offset);
+    }
+
     // Pratt loop. Sequence is the only operator without a token of its own:
     // two juxtaposed primaries are a sequence with no opcode between them.
     // The loop handles it as a second case after infix dispatch (see ADR 005):
@@ -718,6 +762,8 @@ pub const Compiler = struct {
         t[@intFromEnum(TokenType.dot)] = .{ .prefix = anyChar, .infix = null, .precedence = .none };
         t[@intFromEnum(TokenType.identifier)] = .{ .prefix = namedRule, .infix = null, .precedence = .none };
         t[@intFromEnum(TokenType.left_angle)] = .{ .prefix = capture, .infix = null, .precedence = .none };
+        t[@intFromEnum(TokenType.bang)] = .{ .prefix = notLookahead, .infix = null, .precedence = .none };
+        t[@intFromEnum(TokenType.amp)] = .{ .prefix = andLookahead, .infix = null, .precedence = .none };
 
         t[@intFromEnum(TokenType.slash)] = .{ .prefix = null, .infix = choiceOp, .precedence = .choice };
         t[@intFromEnum(TokenType.pipe)] = .{ .prefix = null, .infix = choiceOp, .precedence = .choice };
@@ -1574,4 +1620,67 @@ test "capture allows choice inside brackets" {
     defer result.deinit();
 
     try std.testing.expect(result.ok);
+}
+
+test "negative lookahead emits choice, operand, fail_twice" {
+    const alloc = std.testing.allocator;
+    var result = try compileForTest(alloc, "!\"x\"");
+    defer result.deinit();
+
+    try std.testing.expect(result.ok);
+    const code = result.chunk.code.items;
+    try std.testing.expectEqual(@intFromEnum(OpCode.op_choice), code[0]);
+    try std.testing.expectEqual(@intFromEnum(OpCode.op_match_string), code[3]);
+    try std.testing.expectEqual(@intFromEnum(OpCode.op_fail_twice), code[5]);
+    try std.testing.expectEqual(@intFromEnum(OpCode.op_halt), code[6]);
+}
+
+test "positive lookahead emits choice, operand, back_commit, fail" {
+    const alloc = std.testing.allocator;
+    var result = try compileForTest(alloc, "&\"x\"");
+    defer result.deinit();
+
+    try std.testing.expect(result.ok);
+    const code = result.chunk.code.items;
+    try std.testing.expectEqual(@intFromEnum(OpCode.op_choice), code[0]);
+    try std.testing.expectEqual(@intFromEnum(OpCode.op_match_string), code[3]);
+    try std.testing.expectEqual(@intFromEnum(OpCode.op_back_commit), code[5]);
+    try std.testing.expectEqual(@intFromEnum(OpCode.op_fail), code[8]);
+    try std.testing.expectEqual(@intFromEnum(OpCode.op_halt), code[9]);
+}
+
+test "lookahead binds looser than quantifier: !A* parses as !(A*)" {
+    // If `*` is inside the lookahead's operand, the emitted bytecode
+    // contains the quantifier loop between the choice and the fail_twice,
+    // not after it.
+    const alloc = std.testing.allocator;
+    var result = try compileForTest(alloc, "!\"x\"*");
+    defer result.deinit();
+
+    try std.testing.expect(result.ok);
+    const code = result.chunk.code.items;
+    // Outer choice for the lookahead, then the star's own choice/commit
+    // pair wrapping the match, then fail_twice, then halt.
+    try std.testing.expectEqual(@intFromEnum(OpCode.op_choice), code[0]);
+    // Scan for fail_twice; everything before it (after the outer choice's
+    // 3-byte header) belongs to the operand.
+    var fail_twice_at: ?usize = null;
+    for (code, 0..) |byte, i| {
+        if (byte == @intFromEnum(OpCode.op_fail_twice)) {
+            fail_twice_at = i;
+            break;
+        }
+    }
+    try std.testing.expect(fail_twice_at != null);
+    // The quantifier must have been compiled inside the operand: a
+    // second op_choice appears between the outer one and fail_twice.
+    var inner_choice_found = false;
+    var i: usize = 3;
+    while (i < fail_twice_at.?) : (i += 1) {
+        if (code[i] == @intFromEnum(OpCode.op_choice)) {
+            inner_choice_found = true;
+            break;
+        }
+    }
+    try std.testing.expect(inner_choice_found);
 }

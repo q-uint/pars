@@ -27,7 +27,7 @@ pub fn disassembleInstruction(c: *Chunk, offset: usize) usize {
     }
 
     const instruction = c.code.items[offset];
-    const op = std.meta.intToEnum(OpCode, instruction) catch {
+    const op = std.enums.fromInt(OpCode, instruction) orelse {
         std.debug.print("Unknown opcode {d}\n", .{instruction});
         return offset + 1;
     };

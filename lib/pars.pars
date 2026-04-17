@@ -1,0 +1,110 @@
+-- The grammar of pars, written in pars. Recognizes the subset the
+-- current compiler accepts: top-level `use` imports, rule
+-- declarations, optional where-blocks, the PEG operator hierarchy,
+-- captures with back-references, and the literal forms (plain,
+-- triple-quoted, case-insensitive, char, charset).
+--
+-- Not covered, because these are not yet wired up in the compiler:
+-- parameterized rules, grammar modules (`grammar`/`extends`/`super`),
+-- semantic action bodies (`=> { ... }`), cut labels (`^"..."`), and
+-- the separator-list sugar (`A % B`).
+
+-- Whitespace and line comments are skipped between tokens.
+
+nl      = '\n' / '\r';
+ws      = ' ' / '\t' / '\r' / '\n';
+comment = '-' '-' (!nl .)*;
+sp      = (ws / comment)*;
+
+-- Identifiers. `word_end` prevents a keyword lexeme from being
+-- matched as a prefix of a longer identifier (e.g. `ending` is not
+-- the keyword `end`).
+
+alpha    = ['a'-'z' 'A'-'Z' '_'];
+digit    = ['0'-'9'];
+id_tail  = alpha / digit;
+word_end = !id_tail;
+ident    = alpha id_tail*;
+
+-- A `name` is any identifier that is not one of the scanner-reserved
+-- keywords.
+
+name = !kw ident
+  where
+    kw = ("let" / "grammar" / "extends" / "super" / "use" / "where" / "end")
+         word_end
+  end
+
+-- String literals. `triple` is tried before `plain` so three
+-- consecutive quotes are not consumed as two empty strings.
+
+string = triple / plain
+  where
+    tq     = '"' '"' '"';
+    triple = tq (!tq .)* tq;
+    plain  = '"' (!'"' .)* '"'
+  end
+
+istring = 'i' string;
+
+-- A literal single quote has no spelling inside `'...'`, so the
+-- `'` byte is expressed here via its hex escape `\x27`.
+
+char_lit = squote (!squote !nl .)* squote
+  where
+    squote = '\x27'
+  end
+
+-- A charset is one or more items, each a single char literal or a
+-- range between two char literals.
+
+charset = '[' sp set_item (sp set_item)* sp ']'
+  where
+    range    = char_lit sp '-' sp char_lit;
+    set_item = range / char_lit
+  end
+
+any_byte = '.';
+
+-- Expression grammar, loosest to tightest: choice, sequence,
+-- quantifier, prefix lookahead, primary. Sequence is the invisible
+-- juxtaposition operator: repeated `prefix` with only whitespace
+-- between adjacent occurrences.
+
+capture = '<' sp name sp ':' sp expr sp '>';
+group   = '(' sp expr sp ')';
+
+primary = istring
+        / string
+        / char_lit
+        / charset
+        / any_byte
+        / capture
+        / group
+        / name;
+
+quantified = primary (sp ('*' / '+' / '?'))*;
+
+prefix = ('!' / '&') sp prefix
+       / quantified;
+
+sequence = prefix (sp prefix)*;
+
+expr = sequence (sp ('/' / '|') sp sequence)*;
+
+-- Declarations. A rule without a where-block requires a trailing
+-- semicolon; a rule with a where-block accepts one but does not
+-- require it, since `end` already terminates the declaration.
+
+rule_decl = name sp '=' sp expr (sp where_blk (sp ';')? / sp ';')
+  where
+    sub_rule  = name sp '=' sp expr;
+    where_blk = "where" word_end sp (sub_rule (sp ';')? sp)* "end" word_end
+  end
+
+use_decl = "use" word_end sp string (sp ';')?;
+
+-- Top level. `!.` anchors the match at end of input so trailing
+-- garbage is rejected rather than silently accepted.
+
+program = sp ((use_decl / rule_decl) sp)* !.;

@@ -18,11 +18,22 @@ const Compiler = compiler_mod.Compiler;
 const trace_execution = false;
 
 const CallFrame = struct {
+    // Caller's chunk and ip, restored on OP_RETURN so execution
+    // resumes at the instruction after the OP_CALL.
     chunk: *Chunk,
     ip: usize,
-    // Input position when this frame was entered. Used to detect
-    // left recursion: if we call the same rule at the same position,
-    // no input can ever be consumed and the parse would loop forever.
+    // Callee's chunk: the rule actually active in this frame. Kept
+    // separate from `chunk` so left-recursion detection can compare
+    // against the rule being executed, not the rule that made the
+    // call. Comparing against the caller falsely flags right-
+    // recursion through shared dispatch rules (e.g. primary → capture
+    // → expr → primary, where the inner primary's call to capture
+    // would match the outer capture's own outgoing call).
+    callee: *Chunk,
+    // Input position at which the callee was entered. Used to detect
+    // left recursion: if the same rule is already active at the same
+    // position, no input can ever be consumed and the parse would
+    // loop forever.
     entry_pos: usize,
 };
 
@@ -352,11 +363,13 @@ pub fn Vm(comptime stack_size: ?comptime_int) type {
                 self.runtimeError("Undefined rule '{s}'.", .{name});
                 return false;
             };
-            // Detect left recursion: if we are already inside a call
-            // to the same rule at the same input position, no input
-            // can ever be consumed and the parse would loop forever.
+            // Detect left recursion: if the target rule is already
+            // active at the same input position, no input can ever
+            // be consumed and the parse would loop forever. Compare
+            // against each frame's callee (the rule it is executing),
+            // not its caller chunk.
             for (self.frames[0..self.frame_count]) |f| {
-                if (f.chunk == rule_chunk and f.entry_pos == self.pos) {
+                if (f.callee == rule_chunk and f.entry_pos == self.pos) {
                     const name = if (index < self.rules.names.items.len)
                         self.rules.names.items[index]
                     else
@@ -374,6 +387,7 @@ pub fn Vm(comptime stack_size: ?comptime_int) type {
             }
             self.frames[self.frame_count] = .{
                 .chunk = self.chunk.?,
+                .callee = rule_chunk,
                 .ip = self.ip,
                 .entry_pos = self.pos,
             };
@@ -834,6 +848,17 @@ test "left-recursive rule produces left-recursion error" {
     );
 }
 
+test "mutual right-recursion through a dispatch rule is not flagged" {
+    // A dispatches to B; B consumes a byte before calling A again.
+    // No position is ever revisited by the same rule, so this must
+    // parse cleanly rather than tripping left-recursion detection.
+    try expectMatch(
+        "A = B; B = 'x' A / 'y';",
+        "xxy",
+        .ok,
+    );
+}
+
 test "where clause: sub-rule used in body" {
     try expectMatch(
         "x = y where y = \"y\" end;",
@@ -879,6 +904,18 @@ test "where clause: body not matched when sub-rule fails" {
         "x = y where y = \"y\" end;",
         "z",
         .no_match,
+    );
+}
+
+test "where clause: prior plain rule does not leak into scan" {
+    // The pre-scan for where-bindings must stop at the current rule's
+    // terminating ';'. Otherwise a trailing rule's where-block is
+    // registered as locals of the preceding rule and surfaces as a
+    // spurious "unused where-binding" error.
+    try expectMatch(
+        "a = \"a\"; x = y where y = \"y\" end;",
+        "y",
+        .ok,
     );
 }
 

@@ -1,0 +1,11 @@
+-- Validate that the input is a well-formed pars program. Imports
+-- the pars grammar from the stdlib and applies it to the input.
+--
+-- Usage:
+--   pars examples/grammar.pars examples/identifier.pars
+--   pars examples/grammar.pars examples/ipv4.pars
+--   pars examples/grammar.pars examples/grammar.pars
+
+use "std/pars";
+
+valid = program;

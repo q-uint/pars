@@ -376,6 +376,7 @@ pub const Compiler = struct {
     // if the name is not a known stdlib module.
     fn resolveStdlib(path: []const u8) ?[]const u8 {
         if (std.mem.eql(u8, path, "std/abnf")) return pars_stdlib.abnf;
+        if (std.mem.eql(u8, path, "std/pars")) return pars_stdlib.pars;
         return null;
     }
 
@@ -430,9 +431,15 @@ pub const Compiler = struct {
         const saved_scanner = self.scanner;
         const saved_parser = self.parser;
 
-        // Skip tokens until 'where', 'end', or eof.
+        // Skip tokens until the current rule's 'where' block, or the
+        // rule's terminator. Stopping at ';' matters: without it, a
+        // rule that has no where-block causes the scan to run on into
+        // the next rule and register its sub-rules as locals of the
+        // current scope, which then surface as spurious "unused
+        // where-binding" errors at the current rule's endScope.
         while (self.parser.current.type != .kw_where and
             self.parser.current.type != .kw_end and
+            self.parser.current.type != .semicolon and
             self.parser.current.type != .eof)
         {
             self.advanceRaw();

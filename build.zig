@@ -8,6 +8,7 @@ pub fn build(b: *std.Build) void {
     // pre-load them without @embedFile crossing the module boundary.
     const stdlib_opts = b.addOptions();
     stdlib_opts.addOption([]const u8, "abnf", @embedFile("lib/abnf.pars"));
+    stdlib_opts.addOption([]const u8, "pars", @embedFile("lib/pars.pars"));
 
     const mod = b.addModule("pars", .{
         .root_source_file = b.path("src/root.zig"),

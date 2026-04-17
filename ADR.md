@@ -63,12 +63,12 @@ _Guideline._
 
 The compiler is single-pass: the Pratt parser walks the source once and emits
 bytecode as it goes. Some PEG-specific concerns cannot be answered with a
-peephole view of the source, so we accept three compromises up front and plan
+peephole view of the source, so I accept three compromises up front and plan
 to retrofit a real analysis phase later.
 
 1. _Forward rule references._ Grammars routinely call rules before defining
-   them. We resolve rule names at runtime via the rule registry. Costs one
-   hash lookup per call; buys us order-independent rule definitions.
+   them. Rule names resolve at runtime via the rule registry. Costs one
+   hash lookup per call; buys order-independent rule definitions.
 
 2. _Left recursion._ `rule expr = expr "+" term / term` will infinite-loop
    without intervention. Detecting it statically requires building a call
@@ -88,8 +88,8 @@ to retrofit a real analysis phase later.
 
 The crossover point is when grammar modules land. By then the cost of
 these compromises will have grown enough that adding a pre-pass over the
-parsed AST will feel cheaper than keeping the workarounds. At that point
-we retrofit static left-recursion detection, smart memoization, and any
+parsed AST will feel cheaper than keeping the workarounds. The pre-pass
+then retrofits static left-recursion detection, smart memoization, and any
 other whole-grammar optimizations onto a real analysis phase. Until then,
 document each compromise at the site where it bites.
 
@@ -149,7 +149,7 @@ capture buffer when let-bindings land, and the REPL will print the matched
 span range recovered from the VM's input cursor positions rather than
 popping a value.
 
-If semantic-action values grow complex enough to justify a second stack, we
+If semantic-action values grow complex enough to justify a second stack,
 revisit and move toward the side-channel model. Until then, one stack for
 backtrack frames is enough.
 
@@ -190,3 +190,54 @@ classes or code-point-level operations. Users who want `\p{Letter}`
 style classes must build them from byte-level rules or a future
 standard library. If enough grammars need Unicode support, a standard
 `utf8` grammar module is the right place for it, not the VM.
+
+## 008 — Cuts commit the innermost choice, with optional failure labels
+
+_Decision._
+
+A *cut* (`^`) marks a point in a grammar past which backtracking to the
+enclosing ordered choice is no longer allowed. The scanner already emits a
+`caret` token and recognizes the optional string-label form (`^"expected ')'"`).
+Three sub-decisions define the runtime semantics.
+
+_Scope: per-choice, not per-rule._ A cut commits the innermost enclosing `/`,
+not the whole rule body. The alternative — per-rule scope, where any cut
+anywhere in a rule commits the entire rule — was rejected because it is
+strictly less expressive. An author who wants rule-wide scope under per-choice
+semantics lifts the cut to the outermost `/` of the rule; under per-rule
+semantics there is no way to go finer. Per-choice also falls out of the
+existing frame discipline: `op_choice` and `op_commit` already pair in LIFO
+order, so the innermost choice frame on the backtrack stack is the one a cut
+should target.
+
+_Label form: both `^` and `^"..."` are valid._ The bare form is the commit
+itself: drop the innermost choice frame, keep parsing, and if later matching
+fails let the failure propagate outward like any other failure. The labelled
+form adds a diagnostic contract: if matching fails anywhere between the cut
+and the end of the committed region, the VM raises a runtime error whose
+message is the label string, rather than silently propagating. The bare form
+is the memory/performance knob (prunes backtrack frames that can never be
+revisited, and later will prune the memo entries associated with them). The
+labelled form is the diagnostic knob ("expected ')' after expression" instead
+of a generic "no alternative matched"). One syntax, one opcode with an
+optional constant-index operand.
+
+_Lookaheads: cuts inside `!(...)` or `&(...)` are a compile error._ Lookaheads
+promise that the enclosed pattern has no effect on the caller's backtracking
+state — checking without committing is their whole reason to exist. A cut
+inside a lookahead leaks a commit out of a scope that is supposed to be
+transparent. Forbidding this at compile time avoids a class of subtle bugs
+where a lookahead unexpectedly prunes outer alternatives. Cuts inside
+quantifiers (`*`, `+`, `?`) are allowed: a cut within an iteration body binds
+to whichever `/` is lexically innermost at that point, and the quantifier's
+own backtrack frame is skipped over because it is tagged as a quantifier
+frame, not a choice frame.
+
+The runtime cost is that backtrack frames gain a kind tag (choice, quantifier,
+lookahead) so `op_cut` can walk past non-choice frames to find its target,
+and the compiler needs a lookahead-nesting counter to reject cuts at the
+wrong lexical depth. The benefit is a cut semantics that is local,
+composable, and implementable without whole-grammar analysis — consistent
+with ADR 004's single-pass stance. Revisit if experience shows that
+per-choice scope is too fine-grained for common diagnostics, or that
+labelled cuts want to carry more structured information than a single string.

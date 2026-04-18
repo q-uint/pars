@@ -57,6 +57,7 @@ const rules: [token_count]ParseRule = blk: {
     t[@intFromEnum(TokenType.star)] = .{ .prefix = null, .infix = Compiler.starOp, .precedence = .quantifier };
     t[@intFromEnum(TokenType.plus)] = .{ .prefix = null, .infix = Compiler.plusOp, .precedence = .quantifier };
     t[@intFromEnum(TokenType.question)] = .{ .prefix = null, .infix = Compiler.questionOp, .precedence = .quantifier };
+    t[@intFromEnum(TokenType.left_brace)] = .{ .prefix = null, .infix = Compiler.boundedOp, .precedence = .quantifier };
 
     break :blk t;
 };

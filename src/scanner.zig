@@ -62,6 +62,9 @@ pub const TokenType = enum {
     string_i,
     /// A character literal in single quotes, e.g. 'a'.
     char,
+    /// A decimal integer literal. Currently appears only inside bounded
+    /// quantifier braces, e.g. the `3` and `5` in `A{3,5}`.
+    number,
 
     /// 'let' - names the span matched by a sub-pattern within a rule body.
     kw_let,
@@ -145,6 +148,7 @@ pub const Scanner = struct {
         }
 
         if (isAlpha(c)) return self.identifier();
+        if (isDigit(c)) return self.number();
 
         switch (c) {
             '(' => return self.makeToken(.left_paren),
@@ -272,6 +276,11 @@ pub const Scanner = struct {
             _ = self.advance();
         }
         return self.errorToken("Unterminated triple-quoted string.");
+    }
+
+    fn number(self: *Scanner) Token {
+        while (isDigit(self.peek())) _ = self.advance();
+        return self.makeToken(.number);
     }
 
     fn charLiteral(self: *Scanner) Token {
@@ -517,6 +526,29 @@ test "cut with label is two tokens" {
     try expectTokens("^\"expected rparen\"", &.{
         .{ .type = .caret, .lexeme = "^" },
         .{ .type = .string, .lexeme = "\"expected rparen\"" },
+    });
+}
+
+test "number literal tokenizes" {
+    try expectTokens("42", &.{
+        .{ .type = .number, .lexeme = "42" },
+    });
+}
+
+test "bounded quantifier body tokenizes" {
+    try expectTokens("{3,5}", &.{
+        .{ .type = .left_brace, .lexeme = "{" },
+        .{ .type = .number, .lexeme = "3" },
+        .{ .type = .comma, .lexeme = "," },
+        .{ .type = .number, .lexeme = "5" },
+        .{ .type = .right_brace, .lexeme = "}" },
+    });
+}
+
+test "identifier starting with digit is not valid" {
+    try expectTokens("3abc", &.{
+        .{ .type = .number, .lexeme = "3" },
+        .{ .type = .identifier, .lexeme = "abc" },
     });
 }
 

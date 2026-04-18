@@ -251,6 +251,56 @@ test "question matches one occurrence" {
     try expectMatch("'a'? 'b'", "ab", .ok);
 }
 
+test "bounded exact matches exactly n" {
+    try expectMatch("'a'{3}", "aaa", .ok);
+    try expectMatch("'a'{3}", "aa", .no_match);
+    try expectMatch("'a'{3} !.", "aaaa", .no_match);
+    try expectMatch("'a'{3}", "aaaa", .ok);
+}
+
+test "bounded range matches between min and max" {
+    try expectMatch("'a'{2,4} !.", "aa", .ok);
+    try expectMatch("'a'{2,4} !.", "aaa", .ok);
+    try expectMatch("'a'{2,4} !.", "aaaa", .ok);
+    try expectMatch("'a'{2,4}", "a", .no_match);
+    try expectMatch("'a'{2,4} !.", "aaaaa", .no_match);
+}
+
+test "bounded at-least matches n or more" {
+    try expectMatch("'a'{2,} !.", "aa", .ok);
+    try expectMatch("'a'{2,} !.", "aaaaaaaa", .ok);
+    try expectMatch("'a'{2,}", "a", .no_match);
+}
+
+test "bounded at-most matches zero through max" {
+    try expectMatch("'a'{,3} !.", "", .ok);
+    try expectMatch("'a'{,3} !.", "a", .ok);
+    try expectMatch("'a'{,3} !.", "aaa", .ok);
+    try expectMatch("'a'{,3} !.", "aaaa", .no_match);
+}
+
+test "bounded over a rule call" {
+    try expectMatch(
+        "digit = ['0'-'9'];\nyear = digit{4};",
+        "2026",
+        .ok,
+    );
+    try expectMatch(
+        "digit = ['0'-'9'];\nyear = digit{4} !.;",
+        "202",
+        .no_match,
+    );
+}
+
+test "bounded over a grouped expression" {
+    try expectMatch("('a' 'b'){2} !.", "abab", .ok);
+    try expectMatch("('a' 'b'){2} !.", "abababab", .no_match);
+}
+
+test "bounded followed by sequence" {
+    try expectMatch("['0'-'9']{3} '-' ['0'-'9']{4}", "555-1212", .ok);
+}
+
 test "quantifier with charset" {
     try expectMatch("['a'-'z']+", "hello", .ok);
     try expectMatch("['a'-'z']+", "HELLO", .no_match);

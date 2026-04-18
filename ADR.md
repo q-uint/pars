@@ -241,3 +241,50 @@ composable, and implementable without whole-grammar analysis — consistent
 with ADR 004's single-pass stance. Revisit if experience shows that
 per-choice scope is too fine-grained for common diagnostics, or that
 labelled cuts want to carry more structured information than a single string.
+
+## 009 — Bounded repetition desugars to existing quantifier opcodes
+
+_Decision._
+
+A *bounded quantifier* spells `A{n}`, `A{n,m}`, `A{n,}`, or `A{,m}`: match
+`A` exactly `n` times, between `n` and `m` times, at least `n` times, or at
+most `m` times respectively. The notation is the regex spelling, chosen
+because it is immediately familiar and because the alternatives each
+collided with tokens already in use: `^n` would clash with cut (ADR 008),
+`|n..m|` with the alternate choice spelling, `<n,m>` with capture
+delimiters.
+
+_Desugaring instead of new opcodes._ Two implementation shapes were on the
+table:
+
+- _Dedicated bytecode._ A new `op_quant_range` that pushes a counter frame
+  and inspects `(min, max)` each iteration. One opcode, emitted code size
+  independent of `max`.
+- _Compile-time duplication._ Re-use `op_choice_quant` / `op_commit`. Emit
+  `n` verbatim copies of the operand followed by either `(max - n)` copies
+  wrapped as `A?` or, for the unbounded form, an `A*` tail. No new opcode;
+  the operand's bytecode is duplicated the same way `plusOp` already does.
+
+Duplication wins. The VM stays unchanged, the existing frame-kind tagging
+(ADR 008) already gives bounded repetition the right cut semantics — a cut
+inside an iteration walks past the duplicated quantifier frames just as it
+does for `*` and `+` — and the emitted bytecode reads the same as the
+hand-written composition `A A A A? A?` would. The cost is that bytecode
+size grows as `operand_len × max`. Mitigated by two caps: operand size
+≤ 256 bytes (matches `plusOp`'s existing limit) and count ≤ 255. Authors
+wanting more write the composition out by hand or use `+` / `*`.
+
+_Braces do not conflict with the planned action syntax._ Semantic action
+bodies will attach via `=> { ... }` (see the prelude in `lib/pars.pars`).
+The `=>` token is the prelude, so a `{` that opens an action body only
+appears after `=>` has been consumed. In expression position, a bare `{`
+immediately after a primary always means bounded repetition. This ADR
+fixes that arrangement: any future action syntax must remain `=>`-gated so
+the bounded-quantifier infix stays unambiguous.
+
+_Error cases are compile errors, not runtime ones._ Empty braces (`A{}`),
+lone commas (`A{,}`), zero upper bounds (`A{0}`), inverted bounds
+(`A{5,2}`), counts exceeding 255, and operands exceeding 256 bytes are all
+rejected at compile time with a diagnostic. The checks run in `boundedOp`
+and use the same error-reporting machinery as the rest of the compiler,
+so diagnostics land at the right source location without special handling.

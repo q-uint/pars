@@ -83,7 +83,11 @@ primary = istring
         / group
         / name;
 
-quantified = primary (sp ('*' / '+' / '?'))*;
+quantified = primary (sp ('*' / '+' / '?' / bounded))*
+  where
+    num     = digit+;
+    bounded = '{' sp (num sp (',' sp num? sp)? / ',' sp num sp) '}'
+  end
 
 prefix = ('!' / '&') sp prefix
        / quantified;

@@ -525,3 +525,125 @@ test "lookahead binds looser than quantifier: !A* parses as !(A*)" {
     }
     try std.testing.expect(inner_choice_found);
 }
+
+test "bounded A{3} emits three copies of the operand" {
+    const alloc = std.testing.allocator;
+    var result = try compileForTest(alloc, "'a'{3}");
+    defer result.deinit();
+
+    try std.testing.expect(result.ok);
+    const code = result.chunk.code.items;
+    // Three op_match_char 'a' pairs, then halt.
+    try std.testing.expectEqual(@as(usize, 7), code.len);
+    const match = @intFromEnum(OpCode.op_match_char);
+    try std.testing.expectEqual(match, code[0]);
+    try std.testing.expectEqual(@as(u8, 'a'), code[1]);
+    try std.testing.expectEqual(match, code[2]);
+    try std.testing.expectEqual(@as(u8, 'a'), code[3]);
+    try std.testing.expectEqual(match, code[4]);
+    try std.testing.expectEqual(@as(u8, 'a'), code[5]);
+    try std.testing.expectEqual(@intFromEnum(OpCode.op_halt), code[6]);
+}
+
+test "bounded A{0,2} wraps operand in optional and appends one more A?" {
+    const alloc = std.testing.allocator;
+    var result = try compileForTest(alloc, "'a'{0,2}");
+    defer result.deinit();
+
+    try std.testing.expect(result.ok);
+    const code = result.chunk.code.items;
+    // Two choice_quant/commit pairs, each wrapping a single match_char.
+    const choice_quant = @intFromEnum(OpCode.op_choice_quant);
+    var choices: usize = 0;
+    for (code) |byte| {
+        if (byte == choice_quant) choices += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 2), choices);
+}
+
+test "bounded A{2,} appends a star loop after required copies" {
+    const alloc = std.testing.allocator;
+    var result = try compileForTest(alloc, "'a'{2,}");
+    defer result.deinit();
+
+    try std.testing.expect(result.ok);
+    const code = result.chunk.code.items;
+    // Exactly one choice_quant (for the trailing A*), and a commit that
+    // loops backward.
+    const choice_quant = @intFromEnum(OpCode.op_choice_quant);
+    var choices: usize = 0;
+    for (code) |byte| {
+        if (byte == choice_quant) choices += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 1), choices);
+}
+
+test "bounded A{,3} is equivalent to A{0,3}" {
+    const alloc = std.testing.allocator;
+    var a = try compileForTest(alloc, "'a'{,3}");
+    defer a.deinit();
+    var b = try compileForTest(alloc, "'a'{0,3}");
+    defer b.deinit();
+
+    try std.testing.expect(a.ok);
+    try std.testing.expect(b.ok);
+    try std.testing.expectEqualSlices(u8, a.chunk.code.items, b.chunk.code.items);
+}
+
+test "bounded quantifier rejects zero upper bound" {
+    const alloc = std.testing.allocator;
+    var result = try compileForTest(alloc, "'a'{0}");
+    defer result.deinit();
+
+    try std.testing.expect(!result.ok);
+}
+
+test "bounded quantifier rejects min greater than max" {
+    const alloc = std.testing.allocator;
+    var result = try compileForTest(alloc, "'a'{5,2}");
+    defer result.deinit();
+
+    try std.testing.expect(!result.ok);
+}
+
+test "bounded quantifier rejects empty braces" {
+    const alloc = std.testing.allocator;
+    var result = try compileForTest(alloc, "'a'{}");
+    defer result.deinit();
+
+    try std.testing.expect(!result.ok);
+}
+
+test "bounded quantifier rejects lone comma" {
+    const alloc = std.testing.allocator;
+    var result = try compileForTest(alloc, "'a'{,}");
+    defer result.deinit();
+
+    try std.testing.expect(!result.ok);
+}
+
+test "bounded quantifier rejects count over limit" {
+    const alloc = std.testing.allocator;
+    var result = try compileForTest(alloc, "'a'{300}");
+    defer result.deinit();
+
+    try std.testing.expect(!result.ok);
+}
+
+test "bounded quantifier rejects operand too large" {
+    // An operand whose compiled size exceeds 256 bytes cannot be
+    // duplicated verbatim. A long sequence of match_char ops gets us
+    // there easily.
+    const alloc = std.testing.allocator;
+    var src: std.ArrayList(u8) = .empty;
+    defer src.deinit(alloc);
+    try src.appendSlice(alloc, "(");
+    var i: usize = 0;
+    while (i < 200) : (i += 1) try src.appendSlice(alloc, "'a' ");
+    try src.appendSlice(alloc, "'a'){2}");
+
+    var result = try compileForTest(alloc, src.items);
+    defer result.deinit();
+
+    try std.testing.expect(!result.ok);
+}

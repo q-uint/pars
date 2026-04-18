@@ -904,6 +904,126 @@ pub const Compiler = struct {
         self.patchJump(commit_offset);
     }
 
+    // Upper bound on the operand size (in bytes) for a bounded quantifier.
+    // Matches plusOp's copy-buffer size, since the operand is duplicated
+    // up to `max` times.
+    const bounded_operand_limit: usize = 256;
+    // Upper bound on the repetition count. Keeps the emitted bytecode
+    // proportionally small (operand_len * count) rather than allowing a
+    // grammar author to blow up the chunk with a single `{...}` clause.
+    const bounded_count_limit: u32 = 255;
+
+    // A{n}, A{n,m}, A{n,}, A{,m} : bounded repetition.
+    //
+    // Desugars to existing quantifier opcodes at compile time: `n`
+    // required copies of A's bytecode, followed by either (m - n) copies
+    // wrapped as A? or, for the unbounded form, an A* tail. No new VM
+    // machinery is involved; the operand's bytecode is duplicated
+    // verbatim, the same technique plusOp uses.
+    pub fn boundedOp(self: *Compiler) void {
+        const operand_start = self.last_expr_start;
+        const operand_len = self.currentChunk().code.items.len - operand_start;
+
+        // Parse {min}, {min,}, {min,max}, or {,max}.
+        var min: u32 = 0;
+        var max: u32 = 0;
+        var has_min = false;
+        var has_max = false;
+        var saw_comma = false;
+
+        if (self.check(.number)) {
+            self.advance();
+            min = std.fmt.parseInt(u32, self.parser.previous.lexeme, 10) catch {
+                self.errorAtPrevious("Bound value is out of range.");
+                return;
+            };
+            has_min = true;
+        }
+        if (self.match(.comma)) {
+            saw_comma = true;
+            if (self.check(.number)) {
+                self.advance();
+                max = std.fmt.parseInt(u32, self.parser.previous.lexeme, 10) catch {
+                    self.errorAtPrevious("Bound value is out of range.");
+                    return;
+                };
+                has_max = true;
+            }
+        }
+        self.consume(.right_brace, "Expect '}' to close bounded quantifier.");
+        if (self.parser.had_error) return;
+
+        if (!has_min and !has_max) {
+            self.errorAtPrevious("Bounded quantifier requires at least one bound.");
+            return;
+        }
+        // No comma means the exact form A{n}: the single bound is both min and max.
+        const unbounded = saw_comma and !has_max;
+        if (!saw_comma) max = min;
+
+        if (!unbounded) {
+            if (max == 0) {
+                self.errorAtPrevious("Upper bound must be at least 1.");
+                return;
+            }
+            if (min > max) {
+                self.errorAtPrevious("Lower bound exceeds upper bound.");
+                return;
+            }
+            if (max > bounded_count_limit) {
+                self.errorAtPrevious("Bounded quantifier upper bound is too large.");
+                return;
+            }
+        } else if (min > bounded_count_limit) {
+            self.errorAtPrevious("Bounded quantifier lower bound is too large.");
+            return;
+        }
+        if (operand_len > bounded_operand_limit) {
+            self.errorAtPrevious("Pattern too large for bounded quantifier.");
+            return;
+        }
+
+        // Snapshot the operand's bytecode before any mutation, so later
+        // array growth can't invalidate a slice into it.
+        var buf: [bounded_operand_limit]u8 = undefined;
+        @memcpy(buf[0..operand_len], self.currentChunk().code.items[operand_start..][0..operand_len]);
+
+        // When min == 0, the already-emitted operand becomes the first A?.
+        // Wrapping it in-place reuses questionOp's shape: insert an
+        // op_choice_quant before the operand and an op_commit after it.
+        if (min == 0) {
+            self.insertChoicePlaceholder(operand_start, .op_choice_quant);
+            const commit_offset = self.emitJump(.op_commit);
+            self.patchJump(operand_start);
+            self.patchJump(commit_offset);
+        }
+
+        const required_extras: u32 = if (min == 0) 0 else min - 1;
+        var i: u32 = 0;
+        while (i < required_extras) : (i += 1) {
+            for (buf[0..operand_len]) |byte| self.emitByte(byte);
+        }
+
+        if (unbounded) {
+            // Append A*: choice_quant + A + loop, same shape as starOp
+            // but with a fresh copy of the operand's bytecode.
+            const choice_offset = self.emitJump(.op_choice_quant);
+            for (buf[0..operand_len]) |byte| self.emitByte(byte);
+            self.emitLoop(choice_offset);
+            self.patchJump(choice_offset);
+        } else {
+            const optional_extras: u32 = if (min == 0) max - 1 else max - min;
+            var j: u32 = 0;
+            while (j < optional_extras) : (j += 1) {
+                const choice_offset = self.emitJump(.op_choice_quant);
+                for (buf[0..operand_len]) |byte| self.emitByte(byte);
+                const commit_offset = self.emitJump(.op_commit);
+                self.patchJump(choice_offset);
+                self.patchJump(commit_offset);
+            }
+        }
+    }
+
     fn emitMatchString(self: *Compiler, narrow: OpCode, wide: OpCode, bytes: []const u8) void {
         const lit = self.obj_pool.copyLiteral(bytes) catch {
             self.errorAtPrevious("Out of memory.");

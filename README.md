@@ -15,9 +15,9 @@ Exit code 0 means the input matched; 1 means it did not.
 
 ```
 -- examples/identifier.pars
-rule alpha = ['a'-'z' 'A'-'Z']
-rule digit = ['0'-'9']
-rule ident = (alpha / '_') (alpha / digit / '_')*
+use "std/abnf";
+
+ident = (ALPHA / '_') (ALPHA / DIGIT / '_')*;
 ```
 
 ```
@@ -44,27 +44,55 @@ entry point.
 | `['a'-'z']`     | charset: match one byte in the set           |
 | `(A B)`         | grouping                                     |
 | `name`          | call a named rule                            |
+| `<x: A>`        | capture the span matched by `A` as `x`       |
+
+Within the same rule, referencing a captured name matches the exact
+bytes it captured earlier (back-reference).
 
 ### Operators (loosest to tightest)
 
-| operator | meaning                          |
-| -------- | -------------------------------- |
-| `A / B`  | ordered choice: try A, else B    |
-| `A B`    | sequence (juxtaposition)         |
-| `A*`     | zero or more                     |
-| `A+`     | one or more                      |
-| `A?`     | optional                         |
-
-`|` is a synonym for `/`.
+| operator  | meaning                                              |
+| --------- | ---------------------------------------------------- |
+| `A / B`   | ordered choice: try A, else B (`\|` is a synonym)    |
+| `A B`     | sequence (juxtaposition)                             |
+| `!A`      | negative lookahead: succeeds when A fails            |
+| `&A`      | positive lookahead: succeeds without consuming       |
+| `A*`      | zero or more                                         |
+| `A+`      | one or more                                          |
+| `A?`      | optional                                             |
+| `A{n}`    | exactly `n` times                                    |
+| `A{n,m}`  | between `n` and `m` times                            |
+| `A{n,}`   | at least `n` times                                   |
+| `A{,m}`   | at most `m` times                                    |
+| `^`       | cut: commit the innermost `/`; `^"msg"` adds a label |
 
 ### Rules
 
 ```
-rule name = body
+name = body;
 ```
 
 Rules can reference each other in any order. The last rule in the file
 is matched against the input.
+
+A rule body may introduce locally-scoped sub-rules with `where`:
+
+```
+kv = k "=" v
+  where
+    k = ident;
+    v = ident
+  end
+```
+
+### Imports
+
+```
+use "std/abnf";
+```
+
+Makes the rules from a standard library module (currently `std/abnf`
+and `std/pars`) available in the current grammar.
 
 ## Usage
 
@@ -88,7 +116,7 @@ pars REPL. type :help for commands.
 input set (17 bytes)
 > "GET"
 ok: matched 3/17 bytes
-> rule method = ['A'-'Z']+
+> method = ['A'-'Z']+;
 ok: matched 3/17 bytes
 > method " " "/" ['a'-'z']+
 ok: matched 8/17 bytes

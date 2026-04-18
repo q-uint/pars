@@ -72,7 +72,9 @@ pub fn getRule(token_type: TokenType) ParseRule {
 // tighter so that sequence stays left-associative.
 pub fn parsePrecedence(self: *Compiler, precedence: Precedence) void {
     const saved_expr_start = self.last_expr_start;
+    const saved_expr_local_count = self.last_expr_local_count;
     self.last_expr_start = self.currentChunk().code.items.len;
+    self.last_expr_local_count = self.local_count;
 
     self.advance();
     const prefix_rule = getRule(self.parser.previous.type).prefix orelse {
@@ -107,4 +109,5 @@ pub fn parsePrecedence(self: *Compiler, precedence: Precedence) void {
     }
 
     self.last_expr_start = saved_expr_start;
+    self.last_expr_local_count = saved_expr_local_count;
 }

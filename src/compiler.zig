@@ -78,6 +78,12 @@ pub const Compiler = struct {
     // code with backtracking instructions. Saved and restored across
     // recursive parsePrecedence calls.
     last_expr_start: usize = 0,
+    // Snapshot of local_count at the start of the current expression.
+    // choiceOp uses it to know which locals were declared by the left
+    // arm so they can be dropped before the right arm is compiled,
+    // giving each arm of `A / B` its own naming scope without bumping
+    // scope_depth.
+    last_expr_local_count: usize = 0,
     obj_pool: *object.ObjPool = undefined,
     scanner: Scanner = undefined,
     // Locals in scope during the current rule body. Indexed by compile-
@@ -113,20 +119,28 @@ pub const Compiler = struct {
 
     fn endScope(self: *Compiler) void {
         self.scope_depth -= 1;
-        // Discard every local whose depth exceeds the new scope level.
-        // Where-rules live in the rule table, not on the value stack,
-        // so no op_pop is emitted -- the compiler just forgets them.
-        // Report any local that was never resolved by namedRule so typos
-        // and leftover bindings surface. Skipped when the current rule
-        // body is already in error recovery to avoid noise on broken
-        // input.
-        while (self.local_count > 0 and
-            self.locals[self.local_count - 1].depth > @as(i32, @intCast(self.scope_depth)))
+        // Find the count where locals at the new (or shallower) depth
+        // start, then drop everything above it. Where-rules live in the
+        // rule table, not on the value stack, so no op_pop is emitted --
+        // the compiler just forgets them.
+        var target = self.local_count;
+        while (target > 0 and
+            self.locals[target - 1].depth > @as(i32, @intCast(self.scope_depth)))
         {
+            target -= 1;
+        }
+        self.dropLocalsTo(target);
+    }
+
+    // Pop locals down to `target`, reporting any that were never used.
+    // Used by endScope (depth-driven) and by choiceOp (count-driven, to
+    // discard a choice arm's locals between arms without touching
+    // scope_depth). Skipped during panic mode to avoid noise on broken
+    // input. Captures are exempt from the unused check because their
+    // value is recording the span, not being read by a back-reference.
+    fn dropLocalsTo(self: *Compiler, target: usize) void {
+        while (self.local_count > target) {
             const local = self.locals[self.local_count - 1];
-            // Capture bindings are useful by their existence (they record
-            // spans); skip the unused check for them. Where-bindings that
-            // are never referenced are likely typos and are still reported.
             if (!local.used and !local.is_capture and !self.parser.panic_mode) {
                 self.reportUnusedLocal(local);
             }
@@ -190,10 +204,14 @@ pub const Compiler = struct {
         self.addLocal(name);
     }
 
-    // Mark the most recently declared local as fully initialized by
-    // recording its actual scope depth (replacing the -1 sentinel).
-    fn markInitialized(self: *Compiler) void {
-        self.locals[self.local_count - 1].depth = @intCast(self.scope_depth);
+    // Mark the local at `idx` as fully initialized by recording its
+    // actual scope depth (replacing the -1 sentinel). The caller must
+    // pass the slot explicitly because the local just declared is not
+    // always the most recent one by the time its body is compiled:
+    // a capture body can itself declare a nested capture, which leaves
+    // the outer binding below the top of the locals array.
+    fn markInitialized(self: *Compiler, idx: usize) void {
+        self.locals[idx].depth = @intCast(self.scope_depth);
     }
 
     /// Diagnostics produced by the most recent `compile` call. The slice is
@@ -576,13 +594,17 @@ pub const Compiler = struct {
             return;
         }
         const slot = self.capture_count;
-        self.locals[self.local_count - 1].is_capture = true;
-        self.locals[self.local_count - 1].capture_slot = slot;
+        // Remember which local slot this capture owns. A nested capture
+        // declared while compiling the body will push additional locals,
+        // so `self.local_count - 1` no longer points here afterwards.
+        const local_idx = self.local_count - 1;
+        self.locals[local_idx].is_capture = true;
+        self.locals[local_idx].capture_slot = slot;
         self.capture_count += 1;
 
         self.emitBytes(@intFromEnum(OpCode.op_capture_begin), slot);
         self.expression();
-        self.markInitialized();
+        self.markInitialized(local_idx);
         self.emitBytes(@intFromEnum(OpCode.op_capture_end), slot);
         self.consume(.right_angle, "Expect '>' to close capture.");
     }
@@ -636,7 +658,12 @@ pub const Compiler = struct {
     }
 
     pub fn grouping(self: *Compiler) void {
+        // A parenthesised group introduces a fresh naming scope: bindings
+        // declared inside (`<x: ...>`, captures) are not visible outside
+        // the group, and a same-named binding inside shadows one outside.
+        self.beginScope();
         self.expression();
+        self.endScope();
         self.consume(.right_paren, "Expect ')' after expression.");
     }
 
@@ -808,15 +835,27 @@ pub const Compiler = struct {
 
     // Ordered choice infix: A / B. When called, A is already compiled
     // starting at last_expr_start. We retroactively insert OP_CHOICE
-    // before A, emit OP_COMMIT after A, then compile B.
+    // before A, emit OP_COMMIT after A, then compile B. Each arm is its
+    // own naming scope: locals declared in the left arm are dropped
+    // before the right arm is compiled, and the right arm's locals are
+    // dropped before falling through to the surrounding context. Done
+    // by adjusting local_count rather than scope_depth, since the left
+    // arm has already been compiled at the outer scope by the time this
+    // infix runs.
     pub fn choiceOp(self: *Compiler) void {
         const left_start = self.last_expr_start;
+        const local_count_before_left = self.last_expr_local_count;
         self.insertChoicePlaceholder(left_start, .op_choice);
         const commit_offset = self.emitJump(.op_commit);
         // Patch OP_CHOICE: on failure, jump to start of alternative.
         self.patchJump(left_start);
+        // Drop the left arm's locals so the right arm starts fresh and
+        // can re-use the same names without colliding.
+        self.dropLocalsTo(local_count_before_left);
         // Compile right operand (right-associative: same precedence).
+        const local_count_before_right = self.local_count;
         pratt.parsePrecedence(self, .choice);
+        self.dropLocalsTo(local_count_before_right);
         // Patch OP_COMMIT: on success, jump past alternative.
         self.patchJump(commit_offset);
     }

@@ -429,6 +429,40 @@ test "capture allows choice inside brackets" {
     try std.testing.expect(result.ok);
 }
 
+test "two captures with the same name in the same scope are an error" {
+    const alloc = std.testing.allocator;
+    var result = try compileForTest(alloc, "<x: \"a\"> <x: \"b\">");
+    defer result.deinit();
+
+    try std.testing.expect(!result.ok);
+    const errs = result.compiler.getErrors();
+    try std.testing.expectEqual(@as(usize, 1), errs.len);
+    try std.testing.expectEqualStrings(
+        "Already a variable with this name in this scope.",
+        errs[0].message,
+    );
+}
+
+test "a parenthesised group opens a fresh naming scope" {
+    // The inner `<x: ...>` is in a deeper scope than the outer one,
+    // so it does not collide.
+    const alloc = std.testing.allocator;
+    var result = try compileForTest(alloc, "<x: \"a\"> (<x: \"b\">)");
+    defer result.deinit();
+
+    try std.testing.expect(result.ok);
+}
+
+test "each arm of a choice is its own naming scope" {
+    // Both arms can declare `<x: ...>` because the left arm's binding
+    // is dropped before the right arm is compiled.
+    const alloc = std.testing.allocator;
+    var result = try compileForTest(alloc, "<x: \"a\"> / <x: \"b\">");
+    defer result.deinit();
+
+    try std.testing.expect(result.ok);
+}
+
 test "negative lookahead emits choice, operand, fail_twice" {
     const alloc = std.testing.allocator;
     var result = try compileForTest(alloc, "!\"x\"");

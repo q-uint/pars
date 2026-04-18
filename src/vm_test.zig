@@ -456,6 +456,50 @@ test "capture survives backtracking in choice" {
     try std.testing.expectEqual(.ok, result);
 }
 
+test "choice arms can declare a capture under the same name" {
+    // Each arm has its own scope; the duplicate-binding check stops at
+    // the arm boundary, so both `<x: ...>` are accepted.
+    var machine = VmTest.init(std.testing.allocator);
+    defer machine.deinit();
+    try std.testing.expectEqual(.ok, machine.match("<x: \"a\"> / <x: \"b\">", "a"));
+    try std.testing.expectEqual(.ok, machine.match("<x: \"a\"> / <x: \"b\">", "b"));
+}
+
+test "outer capture is a back-reference even when its body is itself a capture" {
+    // `<a: <b: "xy">>` binds both `a` and `b` to the same span.
+    // The trailing `a` must act as a back-reference to "xy", not as
+    // a call into a rule named `a`. Regression: the outer capture's
+    // initialized-depth was being written onto the inner capture's
+    // slot, leaving the outer binding stuck at depth=-1 and causing
+    // later references to fall through to the global rule table.
+    var machine = VmTest.init(std.testing.allocator);
+    defer machine.deinit();
+    try std.testing.expectEqual(
+        .ok,
+        machine.match("<a: <b: \"xy\">> a", "xyxy"),
+    );
+    try std.testing.expectEqual(
+        .no_match,
+        machine.match("<a: <b: \"xy\">> a", "xyab"),
+    );
+}
+
+test "an inner group binding shadows an outer one for back-references" {
+    // The bare `x` inside the group resolves to the inner capture and
+    // matches "b"; outside the group the outer binding is back in
+    // scope and matches "a" again at the end.
+    var machine = VmTest.init(std.testing.allocator);
+    defer machine.deinit();
+    try std.testing.expectEqual(
+        .ok,
+        machine.match("<x: \"a\"> (<x: \"b\"> x) x", "abba"),
+    );
+    try std.testing.expectEqual(
+        .no_match,
+        machine.match("<x: \"a\"> (<x: \"b\"> x) x", "abab"),
+    );
+}
+
 test "negative lookahead passes when operand does not match" {
     var machine = VmTest.init(std.testing.allocator);
     defer machine.deinit();

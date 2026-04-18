@@ -45,6 +45,8 @@ pub fn disassembleInstruction(c: *Chunk, offset: usize) usize {
         .op_call_wide => indexWideInstruction("OP_CALL_WIDE", c, offset),
         .op_return => simpleInstruction("OP_RETURN", offset),
         .op_choice => jumpInstruction("OP_CHOICE", c, offset),
+        .op_choice_quant => jumpInstruction("OP_CHOICE_QUANT", c, offset),
+        .op_choice_lookahead => jumpInstruction("OP_CHOICE_LOOKAHEAD", c, offset),
         .op_commit => jumpInstruction("OP_COMMIT", c, offset),
         .op_fail => simpleInstruction("OP_FAIL", offset),
         .op_capture_begin => indexInstruction("OP_CAPTURE_BEGIN", c, offset),
@@ -52,6 +54,9 @@ pub fn disassembleInstruction(c: *Chunk, offset: usize) usize {
         .op_match_backref => indexInstruction("OP_MATCH_BACKREF", c, offset),
         .op_fail_twice => simpleInstruction("OP_FAIL_TWICE", offset),
         .op_back_commit => jumpInstruction("OP_BACK_COMMIT", c, offset),
+        .op_cut => simpleInstruction("OP_CUT", offset),
+        .op_cut_label => constantInstruction("OP_CUT_LABEL", c, offset),
+        .op_cut_label_wide => constantWideInstruction("OP_CUT_LABEL_WIDE", c, offset),
         .op_halt => simpleInstruction("OP_HALT", offset),
     };
 }

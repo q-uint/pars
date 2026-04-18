@@ -10,4 +10,6 @@ pub const vm = @import("vm.zig");
 
 test {
     std.testing.refAllDecls(@This());
+    _ = @import("vm_test.zig");
+    _ = @import("compiler_test.zig");
 }

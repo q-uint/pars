@@ -5,6 +5,10 @@ const chunk_mod = @import("chunk.zig");
 const debug = @import("debug.zig");
 const object = @import("object.zig");
 const value_mod = @import("value.zig");
+const rule_table_mod = @import("rule_table.zig");
+const compile_error_mod = @import("compile_error.zig");
+const literal = @import("literal.zig");
+const pratt = @import("pratt.zig");
 const Chunk = chunk_mod.Chunk;
 const OpCode = chunk_mod.OpCode;
 const Value = value_mod.Value;
@@ -12,73 +16,13 @@ const Scanner = scanner_mod.Scanner;
 const Token = scanner_mod.Token;
 const TokenType = scanner_mod.TokenType;
 
-/// Maps rule names to numeric indices and stores compiled chunks in a
-/// flat array for direct-index dispatch. The name map is used at
-/// compile time; at runtime op_call uses the index to jump straight
-/// to the chunk without a hash lookup.
-pub const RuleTable = struct {
-    by_name: std.StringHashMapUnmanaged(u32) = .empty,
-    chunks: std.ArrayListUnmanaged(?Chunk) = .empty,
-    names: std.ArrayListUnmanaged([]const u8) = .empty,
-
-    /// Return the index for `name`, allocating a new slot if this is
-    /// the first reference. Forward references get a null chunk that
-    /// ruleDeclaration fills in later.
-    pub fn getOrCreateIndex(self: *RuleTable, alloc: std.mem.Allocator, name: []const u8) !u32 {
-        const gop = try self.by_name.getOrPut(alloc, name);
-        if (!gop.found_existing) {
-            const idx: u32 = @intCast(self.chunks.items.len);
-            gop.value_ptr.* = idx;
-            try self.chunks.append(alloc, null);
-            try self.names.append(alloc, name);
-        }
-        return gop.value_ptr.*;
-    }
-
-    pub fn setChunk(self: *RuleTable, index: u32, c: Chunk) void {
-        if (self.chunks.items[index]) |*old| old.deinit();
-        self.chunks.items[index] = c;
-    }
-
-    pub fn getChunkPtr(self: *RuleTable, index: u32) ?*Chunk {
-        if (self.chunks.items[index]) |*c| return c;
-        return null;
-    }
-
-    pub fn count(self: *const RuleTable) usize {
-        return self.by_name.count();
-    }
-
-    pub fn get(self: *const RuleTable, name: []const u8) ?u32 {
-        return self.by_name.get(name);
-    }
-
-    pub fn deinit(self: *RuleTable, alloc: std.mem.Allocator) void {
-        for (self.chunks.items) |*slot| {
-            if (slot.*) |*c| c.deinit();
-        }
-        self.chunks.deinit(alloc);
-        self.names.deinit(alloc);
-        self.by_name.deinit(alloc);
-    }
-};
+pub const RuleTable = rule_table_mod.RuleTable;
+pub const CompileError = compile_error_mod.CompileError;
 
 // Comptime toggle: disassemble the chunk after a successful compile.
 // Off by default so the REPL and scripts produce clean output; flip to
 // true when debugging codegen.
 const print_code = false;
-
-/// A structured compile-time diagnostic. Messages are static strings;
-/// the location is a source-byte span plus 1-based line and column so
-/// the renderer can show a snippet with a caret without re-scanning.
-pub const CompileError = struct {
-    line: usize,
-    column: usize,
-    start: usize,
-    len: usize,
-    message: []const u8,
-    at_eof: bool,
-};
 
 const Parser = struct {
     current: Token,
@@ -110,24 +54,6 @@ const Local = struct {
     // endScope, any local still false is reported as unused so a typo
     // like `where k = ident end => kk` surfaces immediately.
     used: bool = false,
-};
-
-// Binding powers from loosest to tightest. A prefix parser compiles the
-// first primary of an expression; an infix parser then loops in
-// parsePrecedence as long as the next token's row in the rules table has
-// precedence >= the caller's. Sequence has no token of its own and is
-// handled specially in parsePrecedence; see ADR 005.
-const Precedence = enum(u8) {
-    none,
-    choice, // '/'
-    sequence, // juxtaposition (no token)
-    lookahead, // '!' '&' — prefix, binds looser than quantifier so `!A*` is `!(A*)`.
-    quantifier, // '*' '+' '?'
-    primary,
-
-    fn next(self: Precedence) Precedence {
-        return @enumFromInt(@intFromEnum(self) + 1);
-    }
 };
 
 /// Single-pass compiler that translates PEG source into bytecode. All
@@ -166,20 +92,18 @@ pub const Compiler = struct {
     // Number of capture slots allocated in the current rule body.
     // Each `let` binding gets the next slot. Reset per rule.
     capture_count: u8 = 0,
-
-    const ParseFn = *const fn (self: *Compiler) void;
-
-    const ParseRule = struct {
-        prefix: ?ParseFn,
-        infix: ?ParseFn,
-        precedence: Precedence,
-    };
+    // Nesting depth of the current lookahead context. A cut (`^`) inside
+    // `!(...)` or `&(...)` is rejected at compile time because a
+    // lookahead promises its body has no effect on the caller's
+    // backtracking state, and a cut would leak a commit out of that
+    // transparent scope (ADR 008).
+    lookahead_depth: u32 = 0,
 
     pub fn init(alloc: std.mem.Allocator) Compiler {
         return .{ .alloc = alloc };
     }
 
-    fn currentChunk(self: *Compiler) *Chunk {
+    pub fn currentChunk(self: *Compiler) *Chunk {
         return self.compiling_chunk;
     }
 
@@ -317,7 +241,7 @@ pub const Compiler = struct {
         self.owned_error_messages = .empty;
     }
 
-    fn advance(self: *Compiler) void {
+    pub fn advance(self: *Compiler) void {
         self.parser.previous = self.parser.current;
 
         while (true) {
@@ -347,7 +271,7 @@ pub const Compiler = struct {
     }
 
     fn expression(self: *Compiler) void {
-        self.parsePrecedence(.choice);
+        pratt.parsePrecedence(self, .choice);
     }
 
     // Return true when the current token is an identifier immediately
@@ -388,7 +312,7 @@ pub const Compiler = struct {
         if (self.parser.had_error) return;
 
         const raw = self.parser.previous.lexeme;
-        const path = stripStringDelimiters(raw, 0);
+        const path = literal.stripStringDelimiters(raw, 0);
 
         const src = resolveStdlib(path) orelse {
             self.errorAtPrevious("Unknown module. Relative imports are not yet supported.");
@@ -610,7 +534,7 @@ pub const Compiler = struct {
         }
     }
 
-    fn namedRule(self: *Compiler) void {
+    pub fn namedRule(self: *Compiler) void {
         const name = self.parser.previous;
         // Check locals first (innermost scope wins).
         var i = self.local_count;
@@ -641,7 +565,7 @@ pub const Compiler = struct {
     // since `>` acts as an unambiguous terminator. After a successful
     // match, the name is available as a back-reference that matches the
     // same text byte-for-byte.
-    fn capture(self: *Compiler) void {
+    pub fn capture(self: *Compiler) void {
         self.consume(.identifier, "Expect binding name after '<'.");
         const name = self.parser.previous;
         self.consume(.colon, "Expect ':' after capture name.");
@@ -676,9 +600,11 @@ pub const Compiler = struct {
     // failure to the surrounding context. If A fails, the choice frame
     // restores the pre-A position and transfers control to L1, where
     // execution continues past the lookahead.
-    fn notLookahead(self: *Compiler) void {
-        const choice_offset = self.emitJump(.op_choice);
-        self.parsePrecedence(Precedence.lookahead.next());
+    pub fn notLookahead(self: *Compiler) void {
+        const choice_offset = self.emitJump(.op_choice_lookahead);
+        self.lookahead_depth += 1;
+        pratt.parsePrecedence(self, pratt.Precedence.lookahead.next());
+        self.lookahead_depth -= 1;
         self.emitByte(@intFromEnum(OpCode.op_fail_twice));
         self.patchJump(choice_offset);
     }
@@ -698,115 +624,39 @@ pub const Compiler = struct {
     // saved position (so A is not consumed), and jumps past the failure
     // tail. If A fails, control lands at L1 and op_fail propagates the
     // failure outward.
-    fn andLookahead(self: *Compiler) void {
-        const choice_offset = self.emitJump(.op_choice);
-        self.parsePrecedence(Precedence.lookahead.next());
+    pub fn andLookahead(self: *Compiler) void {
+        const choice_offset = self.emitJump(.op_choice_lookahead);
+        self.lookahead_depth += 1;
+        pratt.parsePrecedence(self, pratt.Precedence.lookahead.next());
+        self.lookahead_depth -= 1;
         const back_commit_offset = self.emitJump(.op_back_commit);
         self.patchJump(choice_offset);
         self.emitByte(@intFromEnum(OpCode.op_fail));
         self.patchJump(back_commit_offset);
     }
 
-    // Pratt loop. Sequence is the only operator without a token of its own:
-    // two juxtaposed primaries are a sequence with no opcode between them.
-    // The loop handles it as a second case after infix dispatch (see ADR 005):
-    // if the next token can start a primary, recurse one precedence level
-    // tighter so that sequence stays left-associative.
-    fn parsePrecedence(self: *Compiler, precedence: Precedence) void {
-        const saved_expr_start = self.last_expr_start;
-        self.last_expr_start = self.currentChunk().code.items.len;
-
-        self.advance();
-        const prefix_rule = getRule(self.parser.previous.type).prefix orelse {
-            self.errorAtPrevious("Expected an expression: a string, a character literal, '.', '[', '(', or a rule name.");
-            return;
-        };
-        prefix_rule(self);
-
-        while (true) {
-            const rule = getRule(self.parser.current.type);
-            if (rule.infix) |infix_rule| {
-                if (@intFromEnum(precedence) <= @intFromEnum(rule.precedence)) {
-                    self.advance();
-                    infix_rule(self);
-                    continue;
-                }
-            }
-
-            // Sequence continuation: juxtaposed primaries form a sequence.
-            // Only applies when the caller is at or below sequence precedence
-            // and the current token can start a primary (i.e. has a prefix
-            // rule). The right operand parses one level tighter so that
-            // sequence is left-associative.
-            if (@intFromEnum(precedence) <= @intFromEnum(Precedence.sequence) and
-                getRule(self.parser.current.type).prefix != null)
-            {
-                self.parsePrecedence(Precedence.sequence.next());
-                continue;
-            }
-
-            break;
-        }
-
-        self.last_expr_start = saved_expr_start;
-    }
-
-    // Pratt rule table, one row per TokenType. Unassigned rows default to
-    // all-null/.none, so an empty row means "this token is not currently
-    // part of the expression grammar". Listing rows by `@intFromEnum` index
-    // keeps the table robust to enum reorderings.
-    const token_count = @typeInfo(TokenType).@"enum".fields.len;
-
-    const rules: [token_count]ParseRule = blk: {
-        const empty = ParseRule{ .prefix = null, .infix = null, .precedence = .none };
-        var t: [token_count]ParseRule = @splat(empty);
-
-        t[@intFromEnum(TokenType.left_paren)] = .{ .prefix = grouping, .infix = null, .precedence = .none };
-        t[@intFromEnum(TokenType.left_bracket)] = .{ .prefix = charset, .infix = null, .precedence = .none };
-        t[@intFromEnum(TokenType.string)] = .{ .prefix = stringLiteral, .infix = null, .precedence = .none };
-        t[@intFromEnum(TokenType.string_i)] = .{ .prefix = stringLiteralIgnoreCase, .infix = null, .precedence = .none };
-        t[@intFromEnum(TokenType.char)] = .{ .prefix = charLiteral, .infix = null, .precedence = .none };
-        t[@intFromEnum(TokenType.dot)] = .{ .prefix = anyChar, .infix = null, .precedence = .none };
-        t[@intFromEnum(TokenType.identifier)] = .{ .prefix = namedRule, .infix = null, .precedence = .none };
-        t[@intFromEnum(TokenType.left_angle)] = .{ .prefix = capture, .infix = null, .precedence = .none };
-        t[@intFromEnum(TokenType.bang)] = .{ .prefix = notLookahead, .infix = null, .precedence = .none };
-        t[@intFromEnum(TokenType.amp)] = .{ .prefix = andLookahead, .infix = null, .precedence = .none };
-
-        t[@intFromEnum(TokenType.slash)] = .{ .prefix = null, .infix = choiceOp, .precedence = .choice };
-        t[@intFromEnum(TokenType.pipe)] = .{ .prefix = null, .infix = choiceOp, .precedence = .choice };
-        t[@intFromEnum(TokenType.star)] = .{ .prefix = null, .infix = starOp, .precedence = .quantifier };
-        t[@intFromEnum(TokenType.plus)] = .{ .prefix = null, .infix = plusOp, .precedence = .quantifier };
-        t[@intFromEnum(TokenType.question)] = .{ .prefix = null, .infix = questionOp, .precedence = .quantifier };
-
-        break :blk t;
-    };
-
-    fn getRule(token_type: TokenType) ParseRule {
-        return rules[@intFromEnum(token_type)];
-    }
-
-    fn grouping(self: *Compiler) void {
+    pub fn grouping(self: *Compiler) void {
         self.expression();
         self.consume(.right_paren, "Expect ')' after expression.");
     }
 
-    fn anyChar(self: *Compiler) void {
+    pub fn anyChar(self: *Compiler) void {
         self.emitByte(@intFromEnum(OpCode.op_match_any));
     }
 
-    fn charLiteral(self: *Compiler) void {
+    pub fn charLiteral(self: *Compiler) void {
         const b = self.extractCharByte(self.parser.previous.lexeme) orelse return;
         self.emitBytes(@intFromEnum(OpCode.op_match_char), b);
     }
 
-    fn stringLiteral(self: *Compiler) void {
-        const bytes = stripStringDelimiters(self.parser.previous.lexeme, 0);
+    pub fn stringLiteral(self: *Compiler) void {
+        const bytes = literal.stripStringDelimiters(self.parser.previous.lexeme, 0);
         self.emitMatchString(.op_match_string, .op_match_string_wide, bytes);
     }
 
-    fn stringLiteralIgnoreCase(self: *Compiler) void {
+    pub fn stringLiteralIgnoreCase(self: *Compiler) void {
         // The 'i' prefix counts as one extra leading byte before the quotes.
-        const bytes = stripStringDelimiters(self.parser.previous.lexeme, 1);
+        const bytes = literal.stripStringDelimiters(self.parser.previous.lexeme, 1);
         self.emitMatchString(.op_match_string_i, .op_match_string_i_wide, bytes);
     }
 
@@ -814,7 +664,7 @@ pub const Compiler = struct {
     /// The body is a sequence of single characters ('a') and ranges ('a'-'z').
     /// Each element sets bits in a 256-bit membership vector. The result is
     /// emitted as an op_match_charset referencing an ObjCharset constant.
-    fn charset(self: *Compiler) void {
+    pub fn charset(self: *Compiler) void {
         var bits: [32]u8 = .{0} ** 32;
 
         if (self.parser.current.type == .right_bracket) {
@@ -874,53 +724,10 @@ pub const Compiler = struct {
     }
 
     fn extractCharByte(self: *Compiler, lexeme: []const u8) ?u8 {
-        // lexeme includes surrounding single quotes, e.g. 'a', '\n', '\x41'.
-        const inner = lexeme[1 .. lexeme.len - 1];
-
-        if (inner.len == 0) {
-            self.errorAtPrevious("Empty character literal.");
+        return literal.extractCharByte(lexeme) catch |e| {
+            self.errorAtPrevious(literal.errorMessage(e));
             return null;
-        }
-
-        if (inner[0] != '\\') {
-            if (inner.len != 1) {
-                self.errorAtPrevious("Character literal must be a single byte.");
-                return null;
-            }
-            return inner[0];
-        }
-
-        // Escape sequence.
-        if (inner.len < 2) {
-            self.errorAtPrevious("Incomplete escape sequence in character literal.");
-            return null;
-        }
-        switch (inner[1]) {
-            'n' => return '\n',
-            'r' => return '\r',
-            't' => return '\t',
-            '\\' => return '\\',
-            '\'' => return '\'',
-            'x' => {
-                if (inner.len != 4) {
-                    self.errorAtPrevious("Hex escape must be two digits: \\xNN.");
-                    return null;
-                }
-                const hi = std.fmt.charToDigit(inner[2], 16) catch {
-                    self.errorAtPrevious("Invalid hex digit in escape sequence.");
-                    return null;
-                };
-                const lo = std.fmt.charToDigit(inner[3], 16) catch {
-                    self.errorAtPrevious("Invalid hex digit in escape sequence.");
-                    return null;
-                };
-                return (hi << 4) | lo;
-            },
-            else => {
-                self.errorAtPrevious("Unknown escape sequence in character literal.");
-                return null;
-            },
-        }
+        };
     }
 
     fn emitRuleCall(self: *Compiler, index: u32) void {
@@ -988,35 +795,36 @@ pub const Compiler = struct {
         self.emitByte(@intCast(off16 >> 8));
     }
 
-    // Insert an OP_CHOICE placeholder (3 zero bytes) at `offset` in the
-    // chunk, shifting existing code to the right.
-    fn insertChoicePlaceholder(self: *Compiler, offset: usize) void {
+    // Insert a choice-family placeholder (3 zero bytes, one of op_choice,
+    // op_choice_quant, op_choice_lookahead) at `offset` in the chunk,
+    // shifting existing code to the right.
+    fn insertChoicePlaceholder(self: *Compiler, offset: usize, op: OpCode) void {
         self.currentChunk().insertBytesAt(offset, 3) catch {
             self.errorAtPrevious("Out of memory.");
             return;
         };
-        self.currentChunk().code.items[offset] = @intFromEnum(OpCode.op_choice);
+        self.currentChunk().code.items[offset] = @intFromEnum(op);
     }
 
     // Ordered choice infix: A / B. When called, A is already compiled
     // starting at last_expr_start. We retroactively insert OP_CHOICE
     // before A, emit OP_COMMIT after A, then compile B.
-    fn choiceOp(self: *Compiler) void {
+    pub fn choiceOp(self: *Compiler) void {
         const left_start = self.last_expr_start;
-        self.insertChoicePlaceholder(left_start);
+        self.insertChoicePlaceholder(left_start, .op_choice);
         const commit_offset = self.emitJump(.op_commit);
         // Patch OP_CHOICE: on failure, jump to start of alternative.
         self.patchJump(left_start);
         // Compile right operand (right-associative: same precedence).
-        self.parsePrecedence(.choice);
+        pratt.parsePrecedence(self, .choice);
         // Patch OP_COMMIT: on success, jump past alternative.
         self.patchJump(commit_offset);
     }
 
     // A* : zero or more.
-    fn starOp(self: *Compiler) void {
+    pub fn starOp(self: *Compiler) void {
         const operand_start = self.last_expr_start;
-        self.insertChoicePlaceholder(operand_start);
+        self.insertChoicePlaceholder(operand_start, .op_choice_quant);
         // OP_COMMIT loops back to the OP_CHOICE.
         self.emitLoop(operand_start);
         // Patch OP_CHOICE: on failure, exit loop.
@@ -1025,7 +833,7 @@ pub const Compiler = struct {
 
     // A+ : one or more. Compiled as: A (choice-loop of A).
     // The first A must match; subsequent iterations use choice/commit.
-    fn plusOp(self: *Compiler) void {
+    pub fn plusOp(self: *Compiler) void {
         const operand_start = self.last_expr_start;
         const operand_len = self.currentChunk().code.items.len - operand_start;
         if (operand_len > 256) {
@@ -1037,8 +845,8 @@ pub const Compiler = struct {
         var buf: [256]u8 = undefined;
         @memcpy(buf[0..operand_len], self.currentChunk().code.items[operand_start..][0..operand_len]);
 
-        // Emit: OP_CHOICE <exit> [duplicated A] OP_COMMIT <back>
-        const choice_offset = self.emitJump(.op_choice);
+        // Emit: OP_CHOICE_QUANT <exit> [duplicated A] OP_COMMIT <back>
+        const choice_offset = self.emitJump(.op_choice_quant);
         for (buf[0..operand_len]) |byte| {
             self.emitByte(byte);
         }
@@ -1047,9 +855,9 @@ pub const Compiler = struct {
     }
 
     // A? : optional.
-    fn questionOp(self: *Compiler) void {
+    pub fn questionOp(self: *Compiler) void {
         const operand_start = self.last_expr_start;
-        self.insertChoicePlaceholder(operand_start);
+        self.insertChoicePlaceholder(operand_start, .op_choice_quant);
         const commit_offset = self.emitJump(.op_commit);
         // Patch OP_CHOICE: on failure, skip past OP_COMMIT.
         self.patchJump(operand_start);
@@ -1063,6 +871,47 @@ pub const Compiler = struct {
             return;
         };
         self.currentChunk().emitOpConstant(narrow, wide, .{ .obj = lit.asObj() }, self.parser.previous.line) catch {
+            self.errorAtPrevious("Out of memory.");
+        };
+    }
+
+    // `^` (bare) or `^"label"` (labelled): cut. Commits the innermost
+    // enclosing ordered choice in the current rule so later failures
+    // cannot backtrack into another alternative (ADR 008). A labelled
+    // cut also records the label; any failure after the cut propagates
+    // as a runtime error with that label rather than silently backing
+    // out to the caller. Cuts inside a lookahead are rejected here so
+    // the transparency of `!(...)` / `&(...)` is preserved.
+    //
+    // The label, if present, must be written adjacent to the `^` with
+    // no whitespace: `^"msg"`. A string after a space (`^ "B"`) is a
+    // following sequence primary, not a label. Without this rule the
+    // syntax would be ambiguous, since strings are also ordinary
+    // pattern primaries.
+    pub fn cut(self: *Compiler) void {
+        if (self.lookahead_depth > 0) {
+            self.errorAtPrevious("Cut is not allowed inside a lookahead.");
+            return;
+        }
+        const caret = self.parser.previous;
+        const adjacent_label = self.check(.string) and
+            self.parser.current.start == caret.start + caret.len;
+        if (!adjacent_label) {
+            self.emitByte(@intFromEnum(OpCode.op_cut));
+            return;
+        }
+        self.advance();
+        const bytes = literal.stripStringDelimiters(self.parser.previous.lexeme, 0);
+        const lit = self.obj_pool.copyLiteral(bytes) catch {
+            self.errorAtPrevious("Out of memory.");
+            return;
+        };
+        self.currentChunk().emitOpConstant(
+            .op_cut_label,
+            .op_cut_label_wide,
+            .{ .obj = lit.asObj() },
+            self.parser.previous.line,
+        ) catch {
             self.errorAtPrevious("Out of memory.");
         };
     }
@@ -1092,7 +941,7 @@ pub const Compiler = struct {
         self.errorAt(&self.parser.current, message);
     }
 
-    fn errorAtPrevious(self: *Compiler, message: []const u8) void {
+    pub fn errorAtPrevious(self: *Compiler, message: []const u8) void {
         self.errorAt(&self.parser.previous, message);
     }
 
@@ -1144,550 +993,6 @@ pub const Compiler = struct {
     ///
     /// `source` must be the same buffer passed to `compile`.
     pub fn renderErrors(self: *const Compiler, source: []const u8, writer: *std.Io.Writer) !void {
-        for (self.errors.items) |e| {
-            try renderOne(source, writer, e);
-        }
+        try compile_error_mod.renderAll(self.errors.items, source, writer);
     }
 };
-
-// Strips the surrounding quote delimiters, accounting for an optional
-// leading prefix (`i` for case-insensitive) and the triple-quoted form.
-fn stripStringDelimiters(lexeme: []const u8, prefix_len: usize) []const u8 {
-    const body = lexeme[prefix_len..];
-    const delim: usize = if (body.len >= 6 and
-        std.mem.startsWith(u8, body, "\"\"\"") and
-        std.mem.endsWith(u8, body, "\"\"\""))
-        3
-    else
-        1;
-    return body[delim .. body.len - delim];
-}
-
-fn renderOne(source: []const u8, writer: *std.Io.Writer, e: CompileError) !void {
-    try writer.print("error: {s}\n", .{e.message});
-    try writer.print(" --> line {d}, column {d}\n", .{ e.line, e.column });
-
-    const line_range = findLine(source, e.line);
-    const line_text = source[line_range.start..line_range.end];
-
-    // Clamp the caret column into the rendered line so a reported
-    // column past end-of-line (e.g. EOF on an empty file) still
-    // produces a readable pointer rather than running off the edge.
-    const caret_col = if (e.column == 0) 1 else e.column;
-    const caret_pad = caret_col - 1;
-    const caret_len: usize = if (e.at_eof) 1 else @max(e.len, 1);
-
-    try writer.print("{d: >4} | {s}\n", .{ e.line, line_text });
-    try writer.writeAll("     | ");
-    var i: usize = 0;
-    while (i < caret_pad) : (i += 1) try writer.writeByte(' ');
-    i = 0;
-    while (i < caret_len) : (i += 1) try writer.writeByte('^');
-    try writer.print(" {s}\n", .{e.message});
-}
-
-const LineRange = struct { start: usize, end: usize };
-
-fn findLine(source: []const u8, line: usize) LineRange {
-    var current_line: usize = 1;
-    var start: usize = 0;
-    var i: usize = 0;
-    while (i < source.len) : (i += 1) {
-        if (current_line == line and source[i] == '\n') {
-            return .{ .start = start, .end = i };
-        }
-        if (source[i] == '\n') {
-            current_line += 1;
-            start = i + 1;
-        }
-    }
-    if (current_line == line) {
-        return .{ .start = start, .end = source.len };
-    }
-    return .{ .start = source.len, .end = source.len };
-}
-
-const TestCompileResult = struct {
-    chunk: Chunk,
-    rules: RuleTable,
-    ok: bool,
-    alloc: std.mem.Allocator,
-    pool: object.ObjPool,
-    compiler: Compiler,
-
-    fn deinit(self: *TestCompileResult) void {
-        self.chunk.deinit();
-        self.rules.deinit(self.alloc);
-        self.compiler.deinit();
-        self.pool.deinit();
-    }
-};
-
-fn compileForTest(alloc: std.mem.Allocator, source: []const u8) !TestCompileResult {
-    var result: TestCompileResult = .{
-        .chunk = Chunk.init(alloc),
-        .rules = .{},
-        .ok = false,
-        .alloc = alloc,
-        .pool = object.ObjPool.init(alloc),
-        .compiler = Compiler.init(alloc),
-    };
-    result.ok = result.compiler.compile(source, &result.chunk, &result.rules, &result.pool);
-    return result;
-}
-
-test "stray token at start flags Expected-an-expression diagnostic" {
-    const alloc = std.testing.allocator;
-    var result = try compileForTest(alloc, ")");
-    defer result.deinit();
-
-    try std.testing.expect(!result.ok);
-    const errs = result.compiler.getErrors();
-    try std.testing.expectEqual(@as(usize, 1), errs.len);
-    try std.testing.expectEqual(@as(usize, 1), errs[0].line);
-    try std.testing.expectEqual(@as(usize, 1), errs[0].column);
-    try std.testing.expect(!errs[0].at_eof);
-}
-
-test "empty source compiles to just halt" {
-    const alloc = std.testing.allocator;
-    var result = try compileForTest(alloc, "");
-    defer result.deinit();
-
-    // An empty program is valid: no declarations, main chunk is just OP_HALT.
-    try std.testing.expect(result.ok);
-    try std.testing.expectEqual(@as(usize, 1), result.chunk.code.items.len);
-    try std.testing.expectEqual(
-        @intFromEnum(OpCode.op_halt),
-        result.chunk.code.items[0],
-    );
-}
-
-test "renderErrors produces snippet with caret pointing at token" {
-    const alloc = std.testing.allocator;
-    const src = "   )";
-    var result = try compileForTest(alloc, src);
-    defer result.deinit();
-
-    try std.testing.expect(!result.ok);
-
-    var aw = std.Io.Writer.Allocating.init(alloc);
-    defer aw.deinit();
-    try result.compiler.renderErrors(src, &aw.writer);
-
-    const expected =
-        "error: Expected an expression: a string, a character literal, '.', '[', '(', or a rule name.\n" ++
-        " --> line 1, column 4\n" ++
-        "   1 |    )\n" ++
-        "     |    ^ Expected an expression: a string, a character literal, '.', '[', '(', or a rule name.\n";
-    try std.testing.expectEqualStrings(expected, aw.writer.buffered());
-}
-
-test "rule declaration populates rule table" {
-    const alloc = std.testing.allocator;
-    var result = try compileForTest(alloc, "digit = ['0'-'9'];");
-    defer result.deinit();
-
-    try std.testing.expect(result.ok);
-    try std.testing.expectEqual(@as(usize, 1), result.rules.count());
-    try std.testing.expect(result.rules.get("digit") != null);
-}
-
-test "multiple rule declarations populate rule table" {
-    const alloc = std.testing.allocator;
-    var result = try compileForTest(
-        alloc,
-        "digit = ['0'-'9'];\nalpha = ['a'-'z'];",
-    );
-    defer result.deinit();
-
-    try std.testing.expect(result.ok);
-    try std.testing.expectEqual(@as(usize, 2), result.rules.count());
-    try std.testing.expect(result.rules.get("digit") != null);
-    try std.testing.expect(result.rules.get("alpha") != null);
-}
-
-test "auto-call emits op_call for last rule in main chunk" {
-    const alloc = std.testing.allocator;
-    var result = try compileForTest(alloc, "digit = ['0'-'9'];");
-    defer result.deinit();
-
-    try std.testing.expect(result.ok);
-    // Main chunk should have: OP_CALL <index> OP_HALT
-    try std.testing.expect(result.chunk.code.items.len >= 3);
-    try std.testing.expectEqual(
-        @intFromEnum(OpCode.op_call),
-        result.chunk.code.items[0],
-    );
-}
-
-test "error recovery skips to next rule" {
-    const alloc = std.testing.allocator;
-    // First rule has a bad body; second rule is valid.
-    var result = try compileForTest(
-        alloc,
-        "bad = );\ndigit = ['0'-'9'];",
-    );
-    defer result.deinit();
-
-    try std.testing.expect(!result.ok);
-    // Despite the error, the second rule should still be in the table.
-    try std.testing.expect(result.rules.get("digit") != null);
-}
-
-test "repeated rule calls emit the same index operand" {
-    const alloc = std.testing.allocator;
-    // The rule body contains three calls to "digit" via sequence.
-    var result = try compileForTest(
-        alloc,
-        "digit = ['0'-'9'];\ntriple = digit digit digit;",
-    );
-    defer result.deinit();
-
-    try std.testing.expect(result.ok);
-    // The "triple" rule chunk: three op_call + op_return = 7 bytes.
-    const triple = result.rules.getChunkPtr(result.rules.get("triple").?) orelse
-        return error.TestUnexpectedResult;
-    const code = triple.code.items;
-    try std.testing.expectEqual(@as(usize, 7), code.len);
-    const call_op = @intFromEnum(OpCode.op_call);
-    try std.testing.expectEqual(call_op, code[0]);
-    try std.testing.expectEqual(call_op, code[2]);
-    try std.testing.expectEqual(call_op, code[4]);
-    // All three share the same rule index.
-    try std.testing.expectEqual(code[1], code[3]);
-    try std.testing.expectEqual(code[1], code[5]);
-}
-
-test "scanner error surfaces through compile with correct location" {
-    const alloc = std.testing.allocator;
-    var result = try compileForTest(alloc, "\"unterminated");
-    defer result.deinit();
-
-    try std.testing.expect(!result.ok);
-    const errs = result.compiler.getErrors();
-    try std.testing.expectEqual(@as(usize, 1), errs.len);
-    try std.testing.expectEqualStrings("Unterminated string.", errs[0].message);
-    try std.testing.expectEqual(@as(usize, 1), errs[0].column);
-}
-
-test "use std/abnf populates DIGIT in rule table" {
-    const alloc = std.testing.allocator;
-    var result = try compileForTest(alloc, "use \"std/abnf\";");
-    defer result.deinit();
-    try std.testing.expect(result.ok);
-    try std.testing.expect(result.rules.get("DIGIT") != null);
-    try std.testing.expect(result.rules.get("ALPHA") != null);
-}
-
-test "use unknown module is a compile error" {
-    const alloc = std.testing.allocator;
-    var result = try compileForTest(alloc, "use \"std/bogus\";");
-    defer result.deinit();
-    try std.testing.expect(!result.ok);
-}
-
-test "char literal escape \\n compiles successfully" {
-    const alloc = std.testing.allocator;
-    var result = try compileForTest(alloc, "'\\n'");
-    defer result.deinit();
-    try std.testing.expect(result.ok);
-    // Main chunk: OP_MATCH_CHAR 0x0A OP_HALT
-    try std.testing.expectEqual(@as(usize, 3), result.chunk.code.items.len);
-    try std.testing.expectEqual(@intFromEnum(OpCode.op_match_char), result.chunk.code.items[0]);
-    try std.testing.expectEqual(@as(u8, '\n'), result.chunk.code.items[1]);
-}
-
-test "char literal escape \\r compiles successfully" {
-    const alloc = std.testing.allocator;
-    var result = try compileForTest(alloc, "'\\r'");
-    defer result.deinit();
-    try std.testing.expect(result.ok);
-    try std.testing.expectEqual(@as(u8, '\r'), result.chunk.code.items[1]);
-}
-
-test "char literal escape \\t compiles successfully" {
-    const alloc = std.testing.allocator;
-    var result = try compileForTest(alloc, "'\\t'");
-    defer result.deinit();
-    try std.testing.expect(result.ok);
-    try std.testing.expectEqual(@as(u8, '\t'), result.chunk.code.items[1]);
-}
-
-test "char literal hex escape \\x41 compiles to 0x41" {
-    const alloc = std.testing.allocator;
-    var result = try compileForTest(alloc, "'\\x41'");
-    defer result.deinit();
-    try std.testing.expect(result.ok);
-    try std.testing.expectEqual(@as(u8, 0x41), result.chunk.code.items[1]);
-}
-
-test "char literal hex escape \\x00 compiles to 0x00" {
-    const alloc = std.testing.allocator;
-    var result = try compileForTest(alloc, "'\\x00'");
-    defer result.deinit();
-    try std.testing.expect(result.ok);
-    try std.testing.expectEqual(@as(u8, 0x00), result.chunk.code.items[1]);
-}
-
-test "charset with hex escaped range compiles successfully" {
-    const alloc = std.testing.allocator;
-    var result = try compileForTest(alloc, "['\\x00'-'\\x1F']");
-    defer result.deinit();
-    try std.testing.expect(result.ok);
-}
-
-test "char literal unknown escape is a compile error" {
-    const alloc = std.testing.allocator;
-    var result = try compileForTest(alloc, "'\\z'");
-    defer result.deinit();
-    try std.testing.expect(!result.ok);
-}
-
-test "char literal hex escape with bad digit is a compile error" {
-    const alloc = std.testing.allocator;
-    var result = try compileForTest(alloc, "'\\xZZ'");
-    defer result.deinit();
-    try std.testing.expect(!result.ok);
-}
-
-test "unused where-binding is reported" {
-    const alloc = std.testing.allocator;
-    const src =
-        "foo = \"x\"\n" ++
-        "  where\n" ++
-        "    a = \"y\"\n" ++
-        "  end\n";
-    var result = try compileForTest(alloc, src);
-    defer result.deinit();
-
-    try std.testing.expect(!result.ok);
-    const errs = result.compiler.getErrors();
-    try std.testing.expectEqual(@as(usize, 1), errs.len);
-    try std.testing.expectEqualStrings(
-        "Unused where-binding 'a'.",
-        errs[0].message,
-    );
-    try std.testing.expectEqual(@as(usize, 3), errs[0].line);
-    try std.testing.expectEqual(@as(usize, 5), errs[0].column);
-}
-
-test "used where-binding is not reported" {
-    const alloc = std.testing.allocator;
-    const src =
-        "foo = a\n" ++
-        "  where\n" ++
-        "    a = \"y\"\n" ++
-        "  end\n";
-    var result = try compileForTest(alloc, src);
-    defer result.deinit();
-
-    try std.testing.expect(result.ok);
-}
-
-test "where-binding only referenced by a typo is flagged as unused" {
-    const alloc = std.testing.allocator;
-    // 'k' is bound but the body references 'kk', so 'k' goes unused.
-    // 'kk' falls through to the global rule table and is fine at
-    // compile time, exactly like any other forward-declared rule.
-    const src =
-        "foo = kk\n" ++
-        "  where\n" ++
-        "    k = \"x\"\n" ++
-        "  end\n";
-    var result = try compileForTest(alloc, src);
-    defer result.deinit();
-
-    try std.testing.expect(!result.ok);
-    const errs = result.compiler.getErrors();
-    try std.testing.expectEqual(@as(usize, 1), errs.len);
-    try std.testing.expectEqualStrings(
-        "Unused where-binding 'k'.",
-        errs[0].message,
-    );
-}
-
-test "multiple unused where-bindings are all reported" {
-    const alloc = std.testing.allocator;
-    const src =
-        "foo = \"x\"\n" ++
-        "  where\n" ++
-        "    a = \"y\";\n" ++
-        "    b = \"z\"\n" ++
-        "  end\n";
-    var result = try compileForTest(alloc, src);
-    defer result.deinit();
-
-    try std.testing.expect(!result.ok);
-    const errs = result.compiler.getErrors();
-    try std.testing.expectEqual(@as(usize, 2), errs.len);
-}
-
-test "duplicate where-binding reports prior declaration location" {
-    const alloc = std.testing.allocator;
-    const src =
-        "foo = a\n" ++
-        "  where\n" ++
-        "    a = \"x\";\n" ++
-        "    a = \"y\"\n" ++
-        "  end\n";
-    var result = try compileForTest(alloc, src);
-    defer result.deinit();
-
-    try std.testing.expect(!result.ok);
-    const errs = result.compiler.getErrors();
-    try std.testing.expectEqual(@as(usize, 1), errs.len);
-
-    const e = errs[0];
-    try std.testing.expectEqual(@as(usize, 4), e.line);
-    try std.testing.expectEqual(@as(usize, 5), e.column);
-    try std.testing.expectEqualStrings(
-        "Duplicate where-binding 'a'. Previous declaration at line 3, column 5.",
-        e.message,
-    );
-
-    var aw = std.Io.Writer.Allocating.init(alloc);
-    defer aw.deinit();
-    try result.compiler.renderErrors(src, &aw.writer);
-    const expected =
-        "error: Duplicate where-binding 'a'. Previous declaration at line 3, column 5.\n" ++
-        " --> line 4, column 5\n" ++
-        "   4 |     a = \"y\"\n" ++
-        "     |     ^ Duplicate where-binding 'a'. Previous declaration at line 3, column 5.\n";
-    try std.testing.expectEqualStrings(expected, aw.writer.buffered());
-}
-
-test "capture emits capture-begin and capture-end opcodes" {
-    const alloc = std.testing.allocator;
-    var result = try compileForTest(alloc, "<k: \"x\">");
-    defer result.deinit();
-
-    try std.testing.expect(result.ok);
-    const code = result.chunk.code.items;
-    // op_capture_begin 0, op_match_string X, op_capture_end 0, op_halt
-    try std.testing.expectEqual(@intFromEnum(OpCode.op_capture_begin), code[0]);
-    try std.testing.expectEqual(@as(u8, 0), code[1]);
-    const halt_pos = code.len - 1;
-    try std.testing.expectEqual(@intFromEnum(OpCode.op_halt), code[halt_pos]);
-    try std.testing.expectEqual(@intFromEnum(OpCode.op_capture_end), code[halt_pos - 2]);
-    try std.testing.expectEqual(@as(u8, 0), code[halt_pos - 1]);
-}
-
-test "multiple captures get distinct slots" {
-    const alloc = std.testing.allocator;
-    var result = try compileForTest(alloc, "<a: \"x\"> <b: \"y\">");
-    defer result.deinit();
-
-    try std.testing.expect(result.ok);
-    const code = result.chunk.code.items;
-    // First capture uses slot 0.
-    try std.testing.expectEqual(@intFromEnum(OpCode.op_capture_begin), code[0]);
-    try std.testing.expectEqual(@as(u8, 0), code[1]);
-    // Find second capture_begin; its slot should be 1.
-    var found_second = false;
-    for (code[2..], 2..) |byte, i| {
-        if (byte == @intFromEnum(OpCode.op_capture_begin) and i > 1) {
-            try std.testing.expectEqual(@as(u8, 1), code[i + 1]);
-            found_second = true;
-            break;
-        }
-    }
-    try std.testing.expect(found_second);
-}
-
-test "unreferenced capture is not flagged as unused" {
-    const alloc = std.testing.allocator;
-    var result = try compileForTest(alloc, "foo = <k: \"x\">;");
-    defer result.deinit();
-
-    try std.testing.expect(result.ok);
-}
-
-test "back-reference emits op_match_backref" {
-    const alloc = std.testing.allocator;
-    var result = try compileForTest(alloc, "<k: \"x\"> k");
-    defer result.deinit();
-
-    try std.testing.expect(result.ok);
-    const code = result.chunk.code.items;
-    // Find op_match_backref after the capture_end.
-    var found = false;
-    for (code) |byte| {
-        if (byte == @intFromEnum(OpCode.op_match_backref)) {
-            found = true;
-            break;
-        }
-    }
-    try std.testing.expect(found);
-}
-
-test "capture allows choice inside brackets" {
-    const alloc = std.testing.allocator;
-    var result = try compileForTest(alloc, "<s: \"http\" / \"ftp\">");
-    defer result.deinit();
-
-    try std.testing.expect(result.ok);
-}
-
-test "negative lookahead emits choice, operand, fail_twice" {
-    const alloc = std.testing.allocator;
-    var result = try compileForTest(alloc, "!\"x\"");
-    defer result.deinit();
-
-    try std.testing.expect(result.ok);
-    const code = result.chunk.code.items;
-    try std.testing.expectEqual(@intFromEnum(OpCode.op_choice), code[0]);
-    try std.testing.expectEqual(@intFromEnum(OpCode.op_match_string), code[3]);
-    try std.testing.expectEqual(@intFromEnum(OpCode.op_fail_twice), code[5]);
-    try std.testing.expectEqual(@intFromEnum(OpCode.op_halt), code[6]);
-}
-
-test "positive lookahead emits choice, operand, back_commit, fail" {
-    const alloc = std.testing.allocator;
-    var result = try compileForTest(alloc, "&\"x\"");
-    defer result.deinit();
-
-    try std.testing.expect(result.ok);
-    const code = result.chunk.code.items;
-    try std.testing.expectEqual(@intFromEnum(OpCode.op_choice), code[0]);
-    try std.testing.expectEqual(@intFromEnum(OpCode.op_match_string), code[3]);
-    try std.testing.expectEqual(@intFromEnum(OpCode.op_back_commit), code[5]);
-    try std.testing.expectEqual(@intFromEnum(OpCode.op_fail), code[8]);
-    try std.testing.expectEqual(@intFromEnum(OpCode.op_halt), code[9]);
-}
-
-test "lookahead binds looser than quantifier: !A* parses as !(A*)" {
-    // If `*` is inside the lookahead's operand, the emitted bytecode
-    // contains the quantifier loop between the choice and the fail_twice,
-    // not after it.
-    const alloc = std.testing.allocator;
-    var result = try compileForTest(alloc, "!\"x\"*");
-    defer result.deinit();
-
-    try std.testing.expect(result.ok);
-    const code = result.chunk.code.items;
-    // Outer choice for the lookahead, then the star's own choice/commit
-    // pair wrapping the match, then fail_twice, then halt.
-    try std.testing.expectEqual(@intFromEnum(OpCode.op_choice), code[0]);
-    // Scan for fail_twice; everything before it (after the outer choice's
-    // 3-byte header) belongs to the operand.
-    var fail_twice_at: ?usize = null;
-    for (code, 0..) |byte, i| {
-        if (byte == @intFromEnum(OpCode.op_fail_twice)) {
-            fail_twice_at = i;
-            break;
-        }
-    }
-    try std.testing.expect(fail_twice_at != null);
-    // The quantifier must have been compiled inside the operand: a
-    // second op_choice appears between the outer one and fail_twice.
-    var inner_choice_found = false;
-    var i: usize = 3;
-    while (i < fail_twice_at.?) : (i += 1) {
-        if (code[i] == @intFromEnum(OpCode.op_choice)) {
-            inner_choice_found = true;
-            break;
-        }
-    }
-    try std.testing.expect(inner_choice_found);
-}

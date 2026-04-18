@@ -34,7 +34,15 @@ pub const OpCode = enum(u8) {
     // while this frame is on the stack, the VM restores the saved
     // position and jumps to the target (the start of the alternative).
     // 3 bytes: opcode + signed 16-bit offset.
+    //
+    // op_choice tags its frame as kind=choice so op_cut can recognize
+    // it. op_choice_quant and op_choice_lookahead push structurally
+    // identical frames but tagged with their respective kinds so that
+    // a cut walking the backtrack stack skips past them and commits
+    // only to an ordered-choice frame (ADR 008).
     op_choice,
+    op_choice_quant,
+    op_choice_lookahead,
     // Pop the top backtrack frame (the preceding alternative succeeded)
     // and jump by the signed 16-bit offset. Used both for forward jumps
     // (past the alternative in ordered choice) and backward jumps
@@ -69,6 +77,21 @@ pub const OpCode = enum(u8) {
     // the position before A and continue past the lookahead.
     // 3 bytes: opcode + signed 16-bit offset.
     op_back_commit,
+    // Cut: commit the innermost enclosing ordered-choice frame so that
+    // later failures cannot backtrack into another alternative of that
+    // choice (ADR 008). Walks the backtrack stack top-down looking for
+    // a frame with kind=choice; if found, removes it. A bare cut is a
+    // no-op when no such frame is present.
+    // 1 byte.
+    op_cut,
+    // Labelled cut: same as op_cut, and additionally records a label
+    // constant on the current call frame. If execution fails with no
+    // backtrack frame left, the VM walks the call stack for an active
+    // label and raises a runtime error carrying that label's message.
+    // Narrow form: 2 bytes (opcode + 1-byte constant index).
+    // Wide form:   4 bytes (opcode + 3-byte (24-bit) constant index).
+    op_cut_label,
+    op_cut_label_wide,
     op_halt, // 1 byte
 };
 

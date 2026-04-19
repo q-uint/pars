@@ -59,6 +59,9 @@ pub fn disassembleInstruction(c: *Chunk, offset: usize) usize {
         .op_cut => simpleInstruction("OP_CUT", offset),
         .op_cut_label => constantInstruction("OP_CUT_LABEL", c, offset),
         .op_cut_label_wide => constantWideInstruction("OP_CUT_LABEL_WIDE", c, offset),
+        .op_longest_begin => simpleInstruction("OP_LONGEST_BEGIN", offset),
+        .op_longest_step => simpleInstruction("OP_LONGEST_STEP", offset),
+        .op_longest_end => simpleInstruction("OP_LONGEST_END", offset),
         .op_halt => simpleInstruction("OP_HALT", offset),
     };
 }
@@ -166,6 +169,9 @@ pub fn decodeInstruction(c: *const Chunk, offset: usize, buf: []u8) !DecodedInst
         .op_cut => .{ .op = op, .name = "OP_CUT", .size = 1, .detail = "" },
         .op_cut_label => try decodeConstant("OP_CUT_LABEL", c, offset, 2, buf),
         .op_cut_label_wide => try decodeConstant("OP_CUT_LABEL_WIDE", c, offset, 4, buf),
+        .op_longest_begin => .{ .op = op, .name = "OP_LONGEST_BEGIN", .size = 1, .detail = "" },
+        .op_longest_step => .{ .op = op, .name = "OP_LONGEST_STEP", .size = 1, .detail = "" },
+        .op_longest_end => .{ .op = op, .name = "OP_LONGEST_END", .size = 1, .detail = "" },
         .op_halt => .{ .op = op, .name = "OP_HALT", .size = 1, .detail = "" },
     };
 }

@@ -345,6 +345,42 @@ pub fn Vm(comptime stack_size: ?comptime_int) type {
                         self.cutInnermostChoice();
                         self.setCommitLabel(idx);
                     },
+                    .op_longest_begin => {
+                        if (!self.pushLongestFrame()) return .runtime_error;
+                    },
+                    .op_longest_step => {
+                        if (self.bt_top < 2) {
+                            self.runtimeError("op_longest_step without enclosing longest frame", .{});
+                            return .runtime_error;
+                        }
+                        const longest = &self.bt_stack[self.bt_top - 2];
+                        if (longest.kind != .longest) {
+                            self.runtimeError("op_longest_step: expected .longest below arm frame", .{});
+                            return .runtime_error;
+                        }
+                        if (longest.best_pos == no_seed or self.pos > longest.best_pos) {
+                            longest.best_pos = self.pos;
+                        }
+                        self.pos = longest.pos;
+                        self.bt_top -= 1;
+                    },
+                    .op_longest_end => {
+                        if (self.bt_top == 0) {
+                            self.runtimeError("op_longest_end with empty backtrack stack", .{});
+                            return .runtime_error;
+                        }
+                        const longest = self.bt_stack[self.bt_top - 1];
+                        if (longest.kind != .longest) {
+                            self.runtimeError("op_longest_end: expected .longest frame on top", .{});
+                            return .runtime_error;
+                        }
+                        self.bt_top -= 1;
+                        if (longest.best_pos != no_seed) {
+                            self.pos = longest.best_pos;
+                        } else {
+                            if (self.handleFail()) |r| return r;
+                        }
+                    },
                     .op_halt => return .ok,
                 }
             }
@@ -442,6 +478,32 @@ pub fn Vm(comptime stack_size: ?comptime_int) type {
                 .frame_count = self.frame_count,
                 .kind = kind,
                 .committed = false,
+                .best_pos = no_seed,
+            };
+            self.bt_top += 1;
+            return true;
+        }
+
+        // Push the marker frame that anchors a longest-match group. Unlike
+        // the choice-family backtrack frames, this one has no jump offset
+        // in the bytecode and is never a backtrack target: it stores the
+        // starting position for rewinds and a best-endpoint slot that
+        // op_longest_step updates across arms. `committed = true` so a
+        // fail() unwind (e.g. from a cut inside an arm) walks past it
+        // without restoring its state.
+        fn pushLongestFrame(self: *Self) bool {
+            if (self.bt_top >= max_bt) {
+                self.runtimeError("Backtrack stack overflow.", .{});
+                return false;
+            }
+            self.bt_stack[self.bt_top] = .{
+                .ip = 0,
+                .pos = self.pos,
+                .chunk = self.chunk.?,
+                .frame_count = self.frame_count,
+                .kind = .longest,
+                .committed = true,
+                .best_pos = no_seed,
             };
             self.bt_top += 1;
             return true;

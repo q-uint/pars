@@ -51,6 +51,7 @@ const rules: [token_count]ParseRule = blk: {
     t[@intFromEnum(TokenType.bang)] = .{ .prefix = Compiler.notLookahead, .infix = null, .precedence = .none };
     t[@intFromEnum(TokenType.amp)] = .{ .prefix = Compiler.andLookahead, .infix = null, .precedence = .none };
     t[@intFromEnum(TokenType.caret)] = .{ .prefix = Compiler.cut, .infix = null, .precedence = .none };
+    t[@intFromEnum(TokenType.hash)] = .{ .prefix = Compiler.longestPrefix, .infix = null, .precedence = .none };
 
     t[@intFromEnum(TokenType.slash)] = .{ .prefix = null, .infix = Compiler.choiceOp, .precedence = .choice };
     t[@intFromEnum(TokenType.pipe)] = .{ .prefix = null, .infix = Compiler.choiceOp, .precedence = .choice };

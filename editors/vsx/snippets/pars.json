@@ -39,6 +39,11 @@
     "body": ["${1:a} / ${2:b}"],
     "description": "Ordered choice: try the left, fall back to the right."
   },
+  "longest choice": {
+    "prefix": "longest",
+    "body": ["#[longest](${1:a} / ${2:b})"],
+    "description": "Longest-match choice: try all alternatives from the same position and commit to the one that consumes the most input. Ties resolve to the earlier arm."
+  },
   "negative lookahead": {
     "prefix": "neg",
     "body": ["!${1:pattern}"],

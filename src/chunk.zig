@@ -84,6 +84,26 @@ pub const OpCode = enum(u8) {
     // no-op when no such frame is present.
     // 1 byte.
     op_cut,
+    // Open a longest-match choice group. Pushes a marker frame that
+    // records the starting input position and an empty best-endpoint
+    // slot. Each arm is wrapped in an ordinary op_choice so failure
+    // routes to the next arm; on success, op_longest_step records the
+    // endpoint and rewinds to the start. op_longest_end either advances
+    // to the best recorded endpoint or fails if no arm matched.
+    // 1 byte.
+    op_longest_begin,
+    // One arm of a longest-match group succeeded. Peek at the enclosing
+    // longest frame (one below the arm's choice frame on the backtrack
+    // stack); update its best endpoint if the current position is
+    // further along, then restore the input position to the frame's
+    // start and pop the arm's choice frame so the next arm may run.
+    // 1 byte.
+    op_longest_step,
+    // Close a longest-match choice group. Pops the longest frame: if
+    // any arm matched, advance the input position to the best endpoint
+    // recorded; otherwise trigger a match failure.
+    // 1 byte.
+    op_longest_end,
     // Labelled cut: same as op_cut, and additionally records a label
     // constant on the current call frame. If execution fails with no
     // backtrack frame left, the VM walks the call stack for an active

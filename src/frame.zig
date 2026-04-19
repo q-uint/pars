@@ -51,8 +51,11 @@ pub const CallFrame = struct {
 
 /// Kind tag on backtrack frames so op_cut can recognize which frame is
 /// an ordered-choice frame (the only kind a cut may commit) and skip
-/// past frames pushed by quantifiers or lookaheads (ADR 008).
-pub const FrameKind = enum(u8) { choice, quant, lookahead };
+/// past frames pushed by quantifiers or lookaheads (ADR 008). `.longest`
+/// is the marker frame pushed by op_longest_begin; it is never a
+/// backtrack target and is always pushed with `committed = true` so
+/// fail() walks past it without restoring state.
+pub const FrameKind = enum(u8) { choice, quant, lookahead, longest };
 
 pub const BacktrackFrame = struct {
     ip: usize,
@@ -65,4 +68,10 @@ pub const BacktrackFrame = struct {
     // still pops it, but fail() treats it as absent when unwinding,
     // preventing backtracking into a committed alternative.
     committed: bool,
+    // Best endpoint recorded across arms of a longest-match group.
+    // Written by op_longest_step on the enclosing `.longest` frame and
+    // read by op_longest_end. `no_seed` means no arm has matched yet;
+    // any real position is well below maxInt so the sentinel cannot
+    // collide with a genuine endpoint.
+    best_pos: usize,
 };

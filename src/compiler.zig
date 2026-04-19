@@ -303,12 +303,41 @@ pub const Compiler = struct {
         }
     }
 
+    // Return true when the upcoming `#[ident]` is an expression attribute
+    // (currently `#[longest]`) rather than a rule-declaration attribute
+    // like `#[lr]`. Called while the current token is still `#`, so the
+    // scanner is copied to look ahead without disturbing parser state.
+    fn peekIsExpressionAttr(self: *const Compiler) bool {
+        var peek = self.scanner;
+        // Skip the `[`.
+        while (true) {
+            const tok = peek.scanToken();
+            if (tok.type == .err) continue;
+            if (tok.type != .left_bracket) return false;
+            break;
+        }
+        // The attribute name identifier.
+        while (true) {
+            const tok = peek.scanToken();
+            if (tok.type == .err) continue;
+            if (tok.type != .identifier) return false;
+            return std.mem.eql(u8, tok.lexeme, "longest");
+        }
+    }
+
     fn declaration(self: *Compiler) void {
         if (self.check(.kw_use)) {
             self.advance();
             self.useDeclaration();
         } else if (self.check(.hash)) {
-            self.ruleDeclarationWithAttrs();
+            // `#[longest](...)` is an expression form that can appear at
+            // top level (compiled into the main chunk). Everything else
+            // starting with `#[` is a rule-declaration attribute list.
+            if (self.peekIsExpressionAttr()) {
+                self.statement();
+            } else {
+                self.ruleDeclarationWithAttrs();
+            }
         } else if (self.check(.identifier) and self.peekIsEqual()) {
             self.ruleDeclaration(.{});
         } else {
@@ -709,6 +738,71 @@ pub const Compiler = struct {
         self.expression();
         self.endScope();
         self.consume(.right_paren, "Expect ')' after expression.");
+    }
+
+    // `#[longest](A / B / C)` — try every alternative from the same
+    // starting position and commit to the one that consumed the most
+    // input. Ties resolve to the earlier arm (since best is updated
+    // only on a strictly greater endpoint). If no arm matches, the
+    // whole group fails. The `#` token was already consumed by the
+    // Pratt prefix dispatch.
+    //
+    // Layout:
+    //   op_longest_begin
+    //     op_choice  L1          ; arm fails → jump to next arm
+    //       <arm 1>
+    //     op_longest_step        ; arm succeeded → record and rewind
+    //   L1: op_choice L2
+    //       <arm 2>
+    //     op_longest_step
+    //   L2: ...
+    //   op_longest_end           ; advance to best endpoint or fail
+    //
+    // Each arm is its own naming scope, matching ordered choice: a
+    // `<x: ...>` binding in one arm is dropped before the next arm is
+    // compiled so names can be reused without collision. The whole
+    // group is also its own scope, so bindings inside do not leak.
+    pub fn longestPrefix(self: *Compiler) void {
+        self.consume(.left_bracket, "Expect '[' after '#'.");
+        if (self.parser.had_error) return;
+
+        self.consume(.identifier, "Expect attribute name in '#[...]'.");
+        if (self.parser.had_error) return;
+        const name = self.parser.previous;
+        if (!std.mem.eql(u8, name.lexeme, "longest")) {
+            self.errorAtPreviousFmt(
+                "Unknown expression attribute '{s}'. Expected 'longest'.",
+                .{name.lexeme},
+            );
+            return;
+        }
+
+        self.consume(.right_bracket, "Expect ']' to close attribute list.");
+        self.consume(.left_paren, "Expect '(' after '#[longest]'.");
+        if (self.parser.had_error) return;
+
+        self.beginScope();
+        self.emitByte(@intFromEnum(OpCode.op_longest_begin));
+
+        while (true) {
+            const local_count_before_arm = self.local_count;
+            const choice_offset = self.emitJump(.op_choice);
+            // Parse one alternative. `.sequence` keeps the loop body
+            // from swallowing the `/` or `|` that separates arms,
+            // leaving it for the outer loop to dispatch.
+            pratt.parsePrecedence(self, .sequence);
+            if (self.parser.had_error) break;
+            self.emitByte(@intFromEnum(OpCode.op_longest_step));
+            self.patchJump(choice_offset);
+            self.dropLocalsTo(local_count_before_arm);
+
+            if (self.match(.slash) or self.match(.pipe)) continue;
+            break;
+        }
+
+        self.emitByte(@intFromEnum(OpCode.op_longest_end));
+        self.consume(.right_paren, "Expect ')' to close '#[longest](...)'.");
+        self.endScope();
     }
 
     pub fn anyChar(self: *Compiler) void {

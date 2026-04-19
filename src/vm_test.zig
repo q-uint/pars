@@ -842,3 +842,68 @@ test "cut inside quantifier walks past the quant frame to commit an outer choice
         machine.match("(\"x\" ^ \"y\")* \"Z\" / \"x\"", "x"),
     );
 }
+
+// Longest-match choice. The `!.` suffix in these tests forces full
+// consumption of the input so that a shorter match leaves unconsumed
+// input and the suffix fails, distinguishing longest from the default
+// ordered `/`, whose first matching arm commits regardless of length.
+
+test "longest picks the longer arm even when the shorter one matches first" {
+    try expectMatch("#[longest](\"a\" / \"ab\") !.", "ab", .ok);
+}
+
+test "ordered choice commits to the shorter arm when it matches first" {
+    try expectMatch("(\"a\" / \"ab\") !.", "ab", .no_match);
+}
+
+test "longest falls back to a short arm when the long arm does not match" {
+    try expectMatch("#[longest](\"a\" / \"abc\") !.", "a", .ok);
+}
+
+test "longest fails when every arm fails" {
+    try expectMatch("#[longest](\"x\" / \"y\")", "z", .no_match);
+}
+
+test "longest with a single arm behaves like the arm itself" {
+    try expectMatch("#[longest](\"a\") !.", "a", .ok);
+    try expectMatch("#[longest](\"a\") !.", "x", .no_match);
+}
+
+test "longest with tied-length arms succeeds at that length" {
+    try expectMatch("#[longest](\"a\" / \"a\") !.", "a", .ok);
+    try expectMatch("#[longest](\"a\" / \"a\") !.", "aa", .no_match);
+}
+
+test "longest arms may be multi-primary sequences" {
+    try expectMatch("#[longest](\"a\" \"b\" / \"a\" \"bc\") !.", "abc", .ok);
+    try expectMatch("#[longest](\"a\" \"b\" / \"a\" \"bc\") !.", "ab", .ok);
+}
+
+test "longest nested inside an ordered choice keeps longest semantics only in its arms" {
+    // Outer `/` is ordered: if the `#[longest](...)` arm fully consumes
+    // "ab" the second arm "a" is not considered.
+    try expectMatch("#[longest](\"a\" / \"ab\") / \"a\" !.", "ab", .ok);
+}
+
+test "ordered choice nested inside a longest arm stays ordered" {
+    // The inner `/` is still first-wins: "ab" is tried before "abcd"
+    // and commits, so the arm consumes 2 bytes. The other outer arm
+    // "abcd" consumes 4, and longest picks it.
+    try expectMatch("#[longest]((\"ab\" / \"abcd\") / \"abcd\") !.", "abcd", .ok);
+}
+
+test "longest arm cut commits the whole group when the arm then fails" {
+    // After the cut, the arm's choice frame is committed. When "x"
+    // fails, backtracking unwinds past the committed arm and past the
+    // longest frame (also committed) without trying the other arm.
+    try expectMatch("#[longest](\"a\" ^ \"x\" / \"ab\")", "ab", .no_match);
+}
+
+test "longest arm without cut falls through to the next arm on failure" {
+    try expectMatch("#[longest](\"a\" \"x\" / \"ab\") !.", "ab", .ok);
+}
+
+test "longest group is a no-op when only one byte is consumed and input ends there" {
+    try expectMatch("#[longest](\"a\" / \"b\")", "a", .ok);
+    try expectMatch("#[longest](\"a\" / \"b\")", "b", .ok);
+}

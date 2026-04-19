@@ -712,3 +712,65 @@ test "attribute list without following rule is a compile error" {
 
     try std.testing.expect(!result.ok);
 }
+
+test "longest group emits begin/choice/arm/step per alternative and end" {
+    const alloc = std.testing.allocator;
+    var result = try compileForTest(alloc, "#[longest](\"a\" / \"ab\")");
+    defer result.deinit();
+
+    try std.testing.expect(result.ok);
+    const code = result.chunk.code.items;
+    // op_longest_begin, op_choice L1, match "a", op_longest_step,
+    // op_choice L2, match "ab", op_longest_step, op_longest_end, halt.
+    try std.testing.expectEqual(@intFromEnum(OpCode.op_longest_begin), code[0]);
+    try std.testing.expectEqual(@intFromEnum(OpCode.op_choice), code[1]);
+    try std.testing.expectEqual(@intFromEnum(OpCode.op_match_string), code[4]);
+    try std.testing.expectEqual(@intFromEnum(OpCode.op_longest_step), code[6]);
+    try std.testing.expectEqual(@intFromEnum(OpCode.op_choice), code[7]);
+    try std.testing.expectEqual(@intFromEnum(OpCode.op_match_string), code[10]);
+    try std.testing.expectEqual(@intFromEnum(OpCode.op_longest_step), code[12]);
+    try std.testing.expectEqual(@intFromEnum(OpCode.op_longest_end), code[13]);
+    try std.testing.expectEqual(@intFromEnum(OpCode.op_halt), code[14]);
+}
+
+test "longest group with a single arm compiles" {
+    const alloc = std.testing.allocator;
+    var result = try compileForTest(alloc, "#[longest](\"a\")");
+    defer result.deinit();
+
+    try std.testing.expect(result.ok);
+}
+
+test "longest group accepts '|' and '/' as arm separators interchangeably" {
+    const alloc = std.testing.allocator;
+    var result = try compileForTest(alloc, "#[longest](\"a\" | \"ab\" / \"abc\")");
+    defer result.deinit();
+
+    try std.testing.expect(result.ok);
+}
+
+test "unknown expression attribute is a compile error" {
+    const alloc = std.testing.allocator;
+    var result = try compileForTest(alloc, "#[notathing](\"a\")");
+    defer result.deinit();
+
+    try std.testing.expect(!result.ok);
+}
+
+test "longest prefix without group is a compile error" {
+    const alloc = std.testing.allocator;
+    var result = try compileForTest(alloc, "#[longest] \"a\"");
+    defer result.deinit();
+
+    try std.testing.expect(!result.ok);
+}
+
+test "each arm of a longest group is its own naming scope" {
+    // Both arms can declare `<x: ...>` because the first arm's binding
+    // is dropped before the next arm is compiled.
+    const alloc = std.testing.allocator;
+    var result = try compileForTest(alloc, "#[longest](<x: \"a\"> / <x: \"b\">)");
+    defer result.deinit();
+
+    try std.testing.expect(result.ok);
+}

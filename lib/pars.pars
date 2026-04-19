@@ -75,12 +75,22 @@ any_byte = '.';
 capture = '<' sp name sp ':' sp expr sp '>';
 group   = '(' sp expr sp ')';
 
+-- `#[longest](A / B / ...)` runs every alternative from the same
+-- starting position and commits to the one that consumed the most
+-- input. Ties resolve to the earlier arm; if every arm fails, the
+-- whole group fails. Unlike ordered `/`, a shorter arm cannot commit
+-- and starve a longer one.
+
+longest_group = '#' sp '[' sp "longest" word_end sp ']' sp
+                '(' sp expr (sp ('/' / '|') sp expr)* sp ')';
+
 primary = istring
         / string
         / char_lit
         / charset
         / any_byte
         / capture
+        / longest_group
         / group
         / name;
 

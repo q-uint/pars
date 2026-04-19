@@ -1702,6 +1702,9 @@ fn instructionSize(op: OpCode) usize {
         .op_fail,
         .op_fail_twice,
         .op_cut,
+        .op_longest_begin,
+        .op_longest_step,
+        .op_longest_end,
         .op_halt,
         => 1,
         .op_match_char,
@@ -1986,6 +1989,18 @@ fn formatHoverAttribute(alloc: std.mem.Allocator, a: symbols.Attribute) ![]u8 {
                 "\"Left recursion detected\" safeguard.",
         );
     }
+    if (std.mem.eql(u8, a.name, "longest")) {
+        return try alloc.dupe(
+            u8,
+            "```pars\n#[longest](A / B / ...)\n```\n\n" ++
+                "Prefixes a parenthesised group so the alternatives " ++
+                "inside are tried from the same starting position " ++
+                "and the **longest** successful match wins. Ties " ++
+                "resolve to the earlier arm; if no arm matches, the " ++
+                "whole group fails. Unlike ordered `/`, a shorter " ++
+                "arm cannot commit and starve a longer one.",
+        );
+    }
     return try std.fmt.allocPrint(
         alloc,
         "```pars\n#[{s}]\n```\n\n_no description available_",
@@ -2209,6 +2224,32 @@ test "server: hover on #[lr] shows the attribute explanation" {
     try std.testing.expect(std.mem.indexOf(u8, out, "\"id\":9") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "#[lr]") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "left recursion") != null);
+}
+
+test "server: hover on #[longest] shows the attribute explanation" {
+    const alloc = std.testing.allocator;
+
+    var aw = std.Io.Writer.Allocating.init(alloc);
+    defer aw.deinit();
+
+    var server = Server.init(alloc, &aw.writer);
+    defer server.deinit();
+
+    // Source: a rule whose body uses `#[longest](...)`. Cursor lands on
+    // the `l` of `longest` (line 0, col 9 inside `foo = #[longest]...`).
+    try server.handleMessage(
+        \\{"jsonrpc":"2.0","method":"textDocument/didOpen","params":{"textDocument":{"uri":"file:///x.pars","languageId":"pars","version":1,"text":"foo = #[longest]('a' / 'ab');"}}}
+    );
+    aw.writer.end = 0;
+
+    try server.handleMessage(
+        \\{"jsonrpc":"2.0","id":9,"method":"textDocument/hover","params":{"textDocument":{"uri":"file:///x.pars"},"position":{"line":0,"character":9}}}
+    );
+
+    const out = aw.writer.buffered();
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"id\":9") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "#[longest]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "longest") != null);
 }
 
 test "semantic tokens: #[lr] tags the whole list as decorator" {

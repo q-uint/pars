@@ -1,0 +1,10 @@
+-- `#[longest]` picks the alternative that consumes the most input,
+-- regardless of source order. Ties resolve to the earlier arm.
+-- Compare with ordered `/`, which commits to the first matching arm
+-- even if a later arm would have matched a longer prefix.
+--
+-- Usage:
+--   echo -n "<=" | pars examples/longest-match.pars   -- matches "<="
+--   echo -n "<"  | pars examples/longest-match.pars   -- matches "<"
+
+op = #[longest]("<" / "<=" / ">" / ">=" / "==" / "!=");

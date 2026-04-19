@@ -96,17 +96,35 @@ pub const UseDecl = struct {
     span: Span,
 };
 
+/// An attribute occurrence inside a `#[...]` list prefixing a rule
+/// declaration. `name` is the attribute identifier (e.g. `lr`); the
+/// span covers the full `#[...]` bracket range so hover and semantic
+/// highlighting can react to any byte of the attribute syntax.
+pub const Attribute = struct {
+    name: []const u8,
+    /// Span of the attribute name identifier itself.
+    name_span: Span,
+    name_end: End,
+    /// Span of the full `#[...]` list (from `#` through `]`). Used by
+    /// hover to respond anywhere in the attribute syntax, not only on
+    /// the identifier.
+    list_span: Span,
+    list_end: End,
+};
+
 pub const Index = struct {
     defs: []RuleDef,
     captures: []Capture,
     refs: []RuleRef,
     uses: []UseDecl,
+    attrs: []Attribute,
 
     pub fn deinit(self: *Index, alloc: Allocator) void {
         alloc.free(self.defs);
         alloc.free(self.captures);
         alloc.free(self.refs);
         alloc.free(self.uses);
+        alloc.free(self.attrs);
     }
 
     /// Find the definition whose name span contains the cursor, or null.
@@ -129,6 +147,17 @@ pub const Index = struct {
     pub fn captureAt(self: *const Index, line: u32, col: u32) ?usize {
         for (self.captures, 0..) |c, idx| {
             if (spanContains(c.name_span, c.name_end, line, col)) return idx;
+        }
+        return null;
+    }
+
+    /// Find the attribute whose `#[...]` list span contains the cursor,
+    /// or null. Hover matches on the full bracketed range (including
+    /// `#` and the brackets themselves) so the tooltip shows up no
+    /// matter which byte of the attribute the cursor sits on.
+    pub fn attrAt(self: *const Index, line: u32, col: u32) ?usize {
+        for (self.attrs, 0..) |a, idx| {
+            if (spanContains(a.list_span, a.list_end, line, col)) return idx;
         }
         return null;
     }
@@ -177,6 +206,7 @@ const Builder = struct {
     captures: std.ArrayList(Capture),
     refs: std.ArrayList(RuleRef),
     uses: std.ArrayList(UseDecl),
+    attrs: std.ArrayList(Attribute),
 
     /// Rule-scope stack. Each entry is an index into `defs`; the top
     /// is the most recently opened rule whose body we are currently
@@ -233,6 +263,7 @@ pub fn buildIndex(alloc: Allocator, source: []const u8) !Index {
         .captures = .empty,
         .refs = .empty,
         .uses = .empty,
+        .attrs = .empty,
         .rule_stack = .empty,
     };
     defer b.rule_stack.deinit(alloc);
@@ -241,6 +272,7 @@ pub fn buildIndex(alloc: Allocator, source: []const u8) !Index {
         b.captures.deinit(alloc);
         b.refs.deinit(alloc);
         b.uses.deinit(alloc);
+        b.attrs.deinit(alloc);
     }
 
     var paren_depth: usize = 0;
@@ -261,6 +293,62 @@ pub fn buildIndex(alloc: Allocator, source: []const u8) !Index {
                 bracket_depth -= 1;
             },
             .left_angle => expect_capture_name = true,
+            .hash => {
+                // `#[name (, name)*]` attribute list prefixing a rule
+                // declaration. We record each attribute identifier with
+                // its own span and the whole bracketed range, then
+                // advance the loop past the closing `]` so the enclosed
+                // identifiers are not re-interpreted as rule references.
+                // Malformed inputs (missing `[` or `]`) fall through
+                // without recording anything, matching how the compiler
+                // surfaces its own diagnostic at the same location.
+                if (i + 1 >= b.tokens.len) continue;
+                if (b.tokens[i + 1].type != .left_bracket) continue;
+                const list_start_tok = t;
+                var j = i + 2; // first token inside the brackets
+                while (j < b.tokens.len and b.tokens[j].type != .right_bracket and
+                    b.tokens[j].type != .eof)
+                {
+                    if (b.tokens[j].type == .identifier) {
+                        const name_tok = b.tokens[j];
+                        const name_span: Span = .{
+                            .start = name_tok.start,
+                            .len = name_tok.len,
+                            .line = @intCast(name_tok.line - 1),
+                            .col = @intCast(name_tok.column - 1),
+                        };
+                        try b.attrs.append(b.alloc, .{
+                            .name = name_tok.lexeme,
+                            .name_span = name_span,
+                            .name_end = endOfSpan(b.source, name_span),
+                            // list_span is patched below once `]` is seen.
+                            .list_span = undefined,
+                            .list_end = undefined,
+                        });
+                    }
+                    j += 1;
+                }
+                if (j < b.tokens.len and b.tokens[j].type == .right_bracket) {
+                    const close_tok = b.tokens[j];
+                    const list_span: Span = .{
+                        .start = list_start_tok.start,
+                        .len = (close_tok.start + close_tok.len) - list_start_tok.start,
+                        .line = @intCast(list_start_tok.line - 1),
+                        .col = @intCast(list_start_tok.column - 1),
+                    };
+                    const list_end = endOfOffset(b.source, close_tok.start + close_tok.len);
+                    // Back-fill every attribute that belongs to this list.
+                    var a_idx = b.attrs.items.len;
+                    while (a_idx > 0) {
+                        a_idx -= 1;
+                        const a = &b.attrs.items[a_idx];
+                        if (a.name_span.start < list_start_tok.start) break;
+                        a.list_span = list_span;
+                        a.list_end = list_end;
+                    }
+                    i = j; // skip past `]`
+                }
+            },
             .kw_use => {
                 // `use "path";` — only valid at the top level. The next
                 // token is the module path string. We record the path
@@ -418,6 +506,7 @@ pub fn buildIndex(alloc: Allocator, source: []const u8) !Index {
         .captures = try b.captures.toOwnedSlice(alloc),
         .refs = try b.refs.toOwnedSlice(alloc),
         .uses = try b.uses.toOwnedSlice(alloc),
+        .attrs = try b.attrs.toOwnedSlice(alloc),
     };
 }
 
@@ -534,6 +623,27 @@ test "buildIndex: use declaration is recorded" {
 
     try std.testing.expectEqual(@as(usize, 1), idx.uses.len);
     try std.testing.expectEqualStrings("std/abnf", idx.uses[0].path);
+}
+
+test "buildIndex: #[lr] attribute does not leak into refs or defs" {
+    const alloc = std.testing.allocator;
+    const src =
+        \\term = 'x';
+        \\#[lr] expr = expr term / term;
+    ;
+    var idx = try buildIndex(alloc, src);
+    defer idx.deinit(alloc);
+
+    try std.testing.expectEqual(@as(usize, 2), idx.defs.len);
+    try std.testing.expectEqualStrings("term", idx.defs[0].name);
+    try std.testing.expectEqualStrings("expr", idx.defs[1].name);
+
+    // Refs inside the expr body: `expr`, `term`, `term`. The attribute
+    // identifier `lr` must not appear here.
+    try std.testing.expectEqual(@as(usize, 3), idx.refs.len);
+    for (idx.refs) |r| {
+        try std.testing.expect(!std.mem.eql(u8, r.name, "lr"));
+    }
 }
 
 test "Index.findDef prefers sub-rule in same scope" {

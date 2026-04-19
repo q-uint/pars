@@ -1,8 +1,9 @@
 -- The grammar of pars, written in pars. Recognizes the subset the
 -- current compiler accepts: top-level `use` imports, rule
--- declarations, optional where-blocks, the PEG operator hierarchy,
--- captures with back-references, and the literal forms (plain,
--- triple-quoted, case-insensitive, char, charset).
+-- declarations (optionally prefixed with a `#[...]` attribute list),
+-- optional where-blocks, the PEG operator hierarchy, captures with
+-- back-references, and the literal forms (plain, triple-quoted,
+-- case-insensitive, char, charset).
 --
 -- Not covered, because these are not yet wired up in the compiler:
 -- parameterized rules, grammar modules (`grammar`/`extends`/`super`),
@@ -99,8 +100,12 @@ expr = sequence (sp ('/' / '|') sp sequence)*;
 -- Declarations. A rule without a where-block requires a trailing
 -- semicolon; a rule with a where-block accepts one but does not
 -- require it, since `end` already terminates the declaration.
+-- Optional `#[...]` attribute lists (currently just `#[lr]`, which
+-- opts a rule into direct left recursion) may prefix the rule name.
 
-rule_decl = name sp '=' sp expr (sp where_blk (sp ';')? / sp ';')
+attr_list = '#' sp '[' sp name (sp ',' sp name)* sp ']';
+
+rule_decl = (attr_list sp)? name sp '=' sp expr (sp where_blk (sp ';')? / sp ';')
   where
     sub_rule  = name sp '=' sp expr;
     where_blk = "where" word_end sp (sub_rule (sp ';')? sp)* "end" word_end

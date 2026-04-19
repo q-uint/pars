@@ -29,6 +29,8 @@ pub const TokenType = enum {
     percent,
     /// '^' - cut marker; with a following string, attaches a failure label.
     caret,
+    /// '#' - opens a declaration attribute list, e.g. '#[lr]'.
+    hash,
 
     /// '/' - ordered choice: try the left alternative, then the right on failure.
     slash,
@@ -163,6 +165,7 @@ pub const Scanner = struct {
             '.' => return self.makeToken(.dot),
             '%' => return self.makeToken(.percent),
             '^' => return self.makeToken(.caret),
+            '#' => return self.makeToken(.hash),
             '-' => return self.makeToken(.minus),
             '/' => return self.makeToken(.slash),
             '|' => return self.makeToken(.pipe),
@@ -379,7 +382,7 @@ test "line comment is skipped" {
 }
 
 test "single-character punctuation" {
-    try expectTokens("()[]{}<>,:.%^/|*+?!&", &.{
+    try expectTokens("()[]{}<>,:.%^#/|*+?!&", &.{
         .{ .type = .left_paren, .lexeme = "(" },
         .{ .type = .right_paren, .lexeme = ")" },
         .{ .type = .left_bracket, .lexeme = "[" },
@@ -393,6 +396,7 @@ test "single-character punctuation" {
         .{ .type = .dot, .lexeme = "." },
         .{ .type = .percent, .lexeme = "%" },
         .{ .type = .caret, .lexeme = "^" },
+        .{ .type = .hash, .lexeme = "#" },
         .{ .type = .slash, .lexeme = "/" },
         .{ .type = .pipe, .lexeme = "|" },
         .{ .type = .star, .lexeme = "*" },
@@ -400,6 +404,15 @@ test "single-character punctuation" {
         .{ .type = .question, .lexeme = "?" },
         .{ .type = .bang, .lexeme = "!" },
         .{ .type = .amp, .lexeme = "&" },
+    });
+}
+
+test "attribute-list tokens" {
+    try expectTokens("#[lr]", &.{
+        .{ .type = .hash, .lexeme = "#" },
+        .{ .type = .left_bracket, .lexeme = "[" },
+        .{ .type = .identifier, .lexeme = "lr" },
+        .{ .type = .right_bracket, .lexeme = "]" },
     });
 }
 

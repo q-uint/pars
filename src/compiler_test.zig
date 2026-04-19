@@ -647,3 +647,68 @@ test "bounded quantifier rejects operand too large" {
 
     try std.testing.expect(!result.ok);
 }
+
+test "#[lr] attribute sets the rule's lr flag" {
+    const alloc = std.testing.allocator;
+    var result = try compileForTest(
+        alloc,
+        "term = ['0'-'9']+;\n#[lr] expr = expr \"+\" term / term;",
+    );
+    defer result.deinit();
+
+    try std.testing.expect(result.ok);
+    const expr_idx = result.rules.get("expr") orelse return error.TestUnexpectedResult;
+    const term_idx = result.rules.get("term") orelse return error.TestUnexpectedResult;
+    try std.testing.expect(result.rules.getAttrs(expr_idx).lr);
+    try std.testing.expect(!result.rules.getAttrs(term_idx).lr);
+}
+
+test "#[lr] accepts newline between attribute list and rule name" {
+    const alloc = std.testing.allocator;
+    var result = try compileForTest(
+        alloc,
+        "term = ['0'-'9']+;\n#[lr]\nexpr = expr \"+\" term / term;",
+    );
+    defer result.deinit();
+
+    try std.testing.expect(result.ok);
+    const idx = result.rules.get("expr") orelse return error.TestUnexpectedResult;
+    try std.testing.expect(result.rules.getAttrs(idx).lr);
+}
+
+test "rule without attributes leaves lr flag false" {
+    const alloc = std.testing.allocator;
+    var result = try compileForTest(alloc, "digit = ['0'-'9'];");
+    defer result.deinit();
+
+    try std.testing.expect(result.ok);
+    const idx = result.rules.get("digit") orelse return error.TestUnexpectedResult;
+    try std.testing.expect(!result.rules.getAttrs(idx).lr);
+}
+
+test "unknown attribute is a compile error" {
+    const alloc = std.testing.allocator;
+    var result = try compileForTest(alloc, "#[bogus] digit = ['0'-'9'];");
+    defer result.deinit();
+
+    try std.testing.expect(!result.ok);
+    const errs = result.compiler.getErrors();
+    try std.testing.expect(errs.len >= 1);
+    try std.testing.expect(std.mem.indexOf(u8, errs[0].message, "bogus") != null);
+}
+
+test "missing bracket after # is a compile error" {
+    const alloc = std.testing.allocator;
+    var result = try compileForTest(alloc, "#lr digit = ['0'-'9'];");
+    defer result.deinit();
+
+    try std.testing.expect(!result.ok);
+}
+
+test "attribute list without following rule is a compile error" {
+    const alloc = std.testing.allocator;
+    var result = try compileForTest(alloc, "#[lr] ;");
+    defer result.deinit();
+
+    try std.testing.expect(!result.ok);
+}

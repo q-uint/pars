@@ -288,3 +288,108 @@ lone commas (`A{,}`), zero upper bounds (`A{0}`), inverted bounds
 rejected at compile time with a diagnostic. The checks run in `boundedOp`
 and use the same error-reporting machinery as the rest of the compiler,
 so diagnostics land at the right source location without special handling.
+
+## 010 — Direct left recursion is opt-in, via per-rule annotation and seed-growing
+
+_Decision._
+
+A *left-recursive* rule has a body that, on a first-position path, calls
+itself before consuming input. The canonical example is
+`rule expr = expr "+" term / term`. A naive PEG VM loops forever on this
+because the recursive call enters at the same input position and re-enters
+again. ADR 004 already addresses the loop defensively: `callRule` records
+each frame's entry position and refuses a duplicate `(rule, position)`
+pair with `Left recursion detected in rule '…'`. That keeps the VM safe
+but rules out a class of grammars that authors actually want to write.
+
+This ADR adds support for direct left recursion as a per-rule opt-in, by
+implementing Warth, Douglass, and Millstein's seed-growing algorithm
+(*Packrat Parsers Can Support Left Recursion*, 2008) for rules that
+explicitly request it. Four sub-decisions define the scope.
+
+_Bracketed attribute on the declaration, not a CLI flag or grammar-wide
+mode._ The opt-in is attached to the individual rule that recurses,
+spelled as a bracketed attribute prefixing the declaration: `#[lr] expr
+= expr "+" term / term;`. The alternatives at the deployment level — a
+CLI flag (`pars --lr`), a grammar header, or auto-detection — were
+rejected on a single shared ground: left recursion's cost is rule-local,
+so the opt-in should be too. A grammar with one left-recursive `expr`
+rule and fifty non-recursive lexer rules should not pay seed-table
+allocation on every rule call. The annotation also makes the intent
+visible at the call site that matters: a reader who sees `#[lr] expr =
+…` knows immediately that this rule deliberately recurses, without
+having to know what flags the file was compiled with.
+
+The syntactic spelling is itself a sub-decision. Three per-rule forms
+were considered: a contextual keyword in front of the name (`lr expr =
+…`, per ADR 003), a sigil prefix (`@lr expr = …`), and the bracketed
+attribute (`#[lr] expr = …`). The bracket form costs a new `#` sigil
+token and a new bracket context but earns the most room: future
+annotations like `#[memo]`, `#[trace]`, or parameterized forms like
+`#[memo("aggressive")]` slot in without re-litigating the syntax each
+time. Charsets keep `[...]` exclusively in expression position; the
+attribute form keeps `#[...]` exclusively in declaration-prefix
+position, so the two uses of square brackets do not overlap. Multiple
+attributes on a single rule comma-separate inside one bracket pair:
+`#[lr, memo] expr = …`. Scope is restricted to top-level rule
+declarations for now; whether `where`-block sub-rules may also carry
+attributes is left open, since the use case is thinner there and the
+parser changes are independent of this decision.
+
+_Direct recursion only; indirect recursion stays a runtime error._ Direct
+left recursion (`R = R … / …`) can be detected by a peephole check on the
+rule body during compilation: walk the leftmost path and look for a call
+back to the rule being defined. Indirect recursion (`A = B …`, `B = A …`)
+requires the same whole-grammar call-graph analysis that ADR 004 defers
+until grammar modules land, and Warth's full treatment of indirect cases
+adds *heads* and *involved-rule sets* on top of the seed table — several
+times the implementation surface for a feature whose users are mostly
+covered by the direct case. So an `lr`-marked rule must left-recurse on
+itself directly, verified at compile time; a non-`lr`-marked rule that
+left-recurses (directly or indirectly) still hits the existing runtime
+error from `callRule`. Indirect support can be layered on later without
+changing the per-rule annotation surface.
+
+_Per-call seed table, not general packrat memoization._ Warth's algorithm
+needs a place to plant a seed match result keyed by `(rule, position)`
+and replace it across re-evaluations of the body. The obvious home is the
+global memo table that ADR 004 plans for full packrat parsing — but that
+table is still deferred, and tying LR support to it would couple two
+independent decisions. Instead, each invocation of an `lr`-marked rule
+allocates a small per-call seed entry on entry and discards it on
+return. The entry holds the current best match (initially FAIL, then
+each successive longer match) and is consulted only by recursive calls
+to the same rule at the same position from inside this call's dynamic
+extent. When the global memo table eventually lands, the seed entry
+becomes a special case of a memo entry; until then, LR rules pay only a
+single allocation per outermost invocation, and non-LR rules are
+unaffected. This keeps ADR 004's deferral intact: this ADR adds LR
+support without committing to a memoization policy.
+
+_Failure-path interaction is unchanged; cuts and lookaheads scope per
+iteration._ Each seed-growing iteration is a fresh evaluation of the rule
+body with a fresh backtrack stack rooted at the call site. A cut fired
+during one iteration commits that iteration's innermost choice and does
+not leak into the next iteration, because the next iteration starts from
+the call site with no backtrack frames in flight. Lookaheads inside an
+`lr`-marked rule's body can call back into the same rule; per Warth, the
+recursive call consults the seed and returns the current best, which is
+the right behavior. Cuts inside lookaheads remain a compile error per
+ADR 008. The runtime cost of seed growing is one re-execution of the
+rule body per left-associative chain element — `n` re-runs to parse an
+`n`-element `expr "+" term "+" term … ` chain — which is the standard
+Warth cost and acceptable for the expression grammars that motivate
+the feature.
+
+The cost is a new `#[…]` attribute syntax (one new `#` sigil token,
+plus declaration-prefix parsing of a comma-separated identifier list),
+a compile-time leftmost-call check on `#[lr]`-marked rules, a per-call
+seed entry on the heap, and a small change to `callRule` to dispatch
+into the seed-growing path when the called rule is `#[lr]`-marked and
+a duplicate `(rule, position)` frame is detected. The benefit is that grammars with conventional
+left-associative operators stop being a PEG-shaped puzzle for authors,
+without forcing every grammar to pay packrat overhead. Revisit when
+grammar modules land and the global memo table arrives: at that point
+the seed-table machinery should fold into the memo table, and the
+indirect-LR extension becomes cheap enough to justify on top of the
+call-graph analysis ADR 004 anticipates.

@@ -716,6 +716,105 @@ test "cut inside quantifier commits the inner choice" {
     try std.testing.expectEqual(.no_match, machine.match("(\"X\" ^ \"a\" / \"Xb\")+", "Xb"));
 }
 
+test "left recursion without #[lr] is still a runtime error" {
+    try expectMatch(
+        "term = ['0'-'9']+;\nexpr = expr \"+\" term / term;",
+        "1+2",
+        .runtime_error,
+    );
+}
+
+test "#[lr] enables direct left recursion" {
+    try expectMatch(
+        "term = ['0'-'9']+;\n#[lr] expr = expr \"+\" term / term;",
+        "1+2",
+        .ok,
+    );
+}
+
+test "#[lr] grows seed across many chain elements" {
+    try expectMatch(
+        "term = ['0'-'9']+;\n#[lr] expr = expr \"+\" term / expr \"-\" term / term;",
+        "1+2-3+4-5+6",
+        .ok,
+    );
+}
+
+test "#[lr] falls back to base case when no operators match" {
+    try expectMatch(
+        "term = ['0'-'9']+;\n#[lr] expr = expr \"+\" term / term;",
+        "42",
+        .ok,
+    );
+}
+
+test "#[lr] fails when input matches no alternative" {
+    try expectMatch(
+        "term = ['0'-'9']+;\n#[lr] expr = expr \"+\" term / term;",
+        "hello",
+        .no_match,
+    );
+}
+
+test "#[lr] rule callable from a non-lr parent rule" {
+    // The outer rule `main` wraps `expr` in parentheses. Verifies that
+    // the seed-growing path composes correctly inside a surrounding
+    // call that itself has no LR behavior.
+    try expectMatch(
+        "term = ['0'-'9']+;\n#[lr] expr = expr \"+\" term / term;\nmain = \"(\" expr \")\";",
+        "(1+2+3)",
+        .ok,
+    );
+}
+
+// Every `.pars` grammar shipped with the project (stdlib + examples)
+// must be parseable by the self-hosted grammar in `lib/pars.pars`.
+// This integration check keeps pars.pars in sync with the syntax the
+// compiler actually accepts: adding an example grammar that uses new
+// syntax and forgetting to teach pars.pars about it would surface
+// here immediately.
+//
+// Files are read from disk relative to the project root, which is the
+// CWD for `zig build test`. A test that runs from a different CWD is
+// acceptable to fail — this harness is explicitly for the project's
+// build-time invocation.
+fn parsesWithStdPars(alloc: std.mem.Allocator, dir: []const u8, name: []const u8) !InterpretResult {
+    var path_buf: [256]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_buf, "{s}/{s}", .{ dir, name });
+    const source = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, path, alloc, .unlimited);
+    defer alloc.free(source);
+
+    var machine = VmTest.init(alloc);
+    defer machine.deinit();
+    return machine.match("use \"std/pars\";\nprogram", source);
+}
+
+test "std/pars parses every shipped grammar" {
+    const alloc = std.testing.allocator;
+    const io = std.testing.io;
+    var failed: usize = 0;
+
+    inline for (.{ "lib", "examples" }) |dir| {
+        var d = try std.Io.Dir.cwd().openDir(io, dir, .{ .iterate = true });
+        defer d.close(io);
+        var it = d.iterate();
+        while (try it.next(io)) |entry| {
+            if (entry.kind != .file) continue;
+            if (!std.mem.endsWith(u8, entry.name, ".pars")) continue;
+            const result = try parsesWithStdPars(alloc, dir, entry.name);
+            if (result != .ok) {
+                std.debug.print(
+                    "std/pars failed to parse {s}/{s}: {s}\n",
+                    .{ dir, entry.name, @tagName(result) },
+                );
+                failed += 1;
+            }
+        }
+    }
+
+    try std.testing.expectEqual(@as(usize, 0), failed);
+}
+
 test "cut inside quantifier walks past the quant frame to commit an outer choice" {
     // The inner * body has no / of its own, so the cut must walk past
     // the quantifier's backtrack frame to reach the outer / frame. The

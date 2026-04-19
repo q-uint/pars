@@ -87,6 +87,20 @@ kv = k "=" v
   end
 ```
 
+A declaration may carry bracketed attributes. Today only `lr` is
+recognized: it opts a rule into direct left recursion via seed-growing,
+so `expr` below matches left-associative chains like `1+2-3` that a
+plain PEG would reject:
+
+```
+#[lr]
+expr = expr "+" term
+     / expr "-" term
+     / term;
+```
+
+See [`examples/left-recursive-expr.pars`](examples/left-recursive-expr.pars).
+
 ### Imports
 
 ```

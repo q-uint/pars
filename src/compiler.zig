@@ -17,6 +17,7 @@ const Token = scanner_mod.Token;
 const TokenType = scanner_mod.TokenType;
 
 pub const RuleTable = rule_table_mod.RuleTable;
+pub const RuleAttrs = rule_table_mod.RuleAttrs;
 pub const CompileError = compile_error_mod.CompileError;
 
 // Comptime toggle: disassemble the chunk after a successful compile.
@@ -306,12 +307,54 @@ pub const Compiler = struct {
         if (self.check(.kw_use)) {
             self.advance();
             self.useDeclaration();
+        } else if (self.check(.hash)) {
+            self.ruleDeclarationWithAttrs();
         } else if (self.check(.identifier) and self.peekIsEqual()) {
-            self.ruleDeclaration();
+            self.ruleDeclaration(.{});
         } else {
             self.statement();
         }
         if (self.parser.panic_mode) self.synchronize();
+    }
+
+    // Parse a bracketed attribute list (`#[name (, name)*]`) that
+    // prefixes a rule declaration, then dispatch into ruleDeclaration
+    // with the flags it set. Today only `lr` is recognized (ADR 010);
+    // unknown attribute names are compile errors, reserving the syntax
+    // for future annotations without silently accepting typos.
+    fn ruleDeclarationWithAttrs(self: *Compiler) void {
+        self.advance(); // consume '#'
+        self.consume(.left_bracket, "Expect '[' after '#' to open attribute list.");
+        if (self.parser.had_error) return;
+
+        var attrs: RuleAttrs = .{};
+
+        while (true) {
+            self.consume(.identifier, "Expect attribute name in '#[...]'.");
+            if (self.parser.had_error) return;
+            const name = self.parser.previous;
+
+            if (std.mem.eql(u8, name.lexeme, "lr")) {
+                attrs.lr = true;
+            } else {
+                self.errorAtPreviousFmt(
+                    "Unknown attribute '{s}'.",
+                    .{name.lexeme},
+                );
+                return;
+            }
+
+            if (!self.match(.comma)) break;
+        }
+
+        self.consume(.right_bracket, "Expect ']' to close attribute list.");
+        if (self.parser.had_error) return;
+
+        if (!self.check(.identifier) or !self.peekIsEqual()) {
+            self.errorAtCurrent("Expect rule declaration after attribute list.");
+            return;
+        }
+        self.ruleDeclaration(attrs);
     }
 
     // Resolve a "std/..." module path to its embedded source. Returns null
@@ -493,7 +536,7 @@ pub const Compiler = struct {
         self.consume(.kw_end, "Expect 'end' to close 'where' block.");
     }
 
-    fn ruleDeclaration(self: *Compiler) void {
+    fn ruleDeclaration(self: *Compiler, attrs: RuleAttrs) void {
         self.consume(.identifier, "Expect rule name.");
         const name_token = self.parser.previous;
         self.consume(.equal, "Expect '=' after rule name.");
@@ -502,6 +545,7 @@ pub const Compiler = struct {
             self.errorAtPrevious("Out of memory.");
             return;
         };
+        self.compiling_rules.?.setAttrs(index, attrs);
 
         // Compile the rule body into its own chunk. Each rule is an
         // independent scope, so local state starts fresh for every rule.

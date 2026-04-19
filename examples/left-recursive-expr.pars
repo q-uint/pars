@@ -1,0 +1,14 @@
+-- Left-associative arithmetic expression, parsed via direct left
+-- recursion. The `#[lr]` attribute switches the VM onto Warth's
+-- seed-growing path (ADR 010); without it, `expr` would trigger the
+-- runtime "Left recursion detected" safeguard instead of matching.
+--
+-- Usage:
+--   echo -n "1+2-3+4" | pars examples/left-recursive-expr.pars
+
+term = ['0'-'9']+;
+
+#[lr]
+expr = expr "+" term
+     / expr "-" term
+     / term;

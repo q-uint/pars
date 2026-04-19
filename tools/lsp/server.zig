@@ -39,7 +39,10 @@ pub const token_type_legend = [_][]const u8{
     "comment", // 3
     "operator", // 4
     "keyword", // 5
+    "decorator", // 6 — identifiers inside `#[...]` attribute lists
 };
+
+const semantic_decorator: u32 = 6;
 
 /// No modifiers in use yet; the legend is empty but declared so the
 /// client can advertise a complete `SemanticTokensLegend`.
@@ -73,7 +76,8 @@ fn mapTokenType(t: TokenType) ?u32 {
         .right_angle,
         .arrow,
         => 4, // operator
-        .identifier => 0, // type
+        .hash => semantic_decorator,
+        .identifier => 0, // type; may be retagged as decorator inside `#[...]`
         .string, .string_i, .char => 1, // string
         .number => 2, // number
         .kw_let,
@@ -115,6 +119,13 @@ pub fn computeSemanticTokens(alloc: Allocator, source: []const u8) ![]u32 {
     var prev_end: usize = 0;
     var line: usize = 1;
     var line_start: usize = 0;
+    // State for retagging identifiers inside `#[...]` as decorators.
+    // `saw_hash` flips on when a `.hash` token is emitted; if the very
+    // next token is `.left_bracket`, we enter `in_attr_list` until the
+    // matching `.right_bracket`. An attribute identifier would
+    // otherwise get the default "type" highlight from mapTokenType.
+    var saw_hash: bool = false;
+    var in_attr_list: bool = false;
 
     while (true) {
         const tok = scanner.scanToken();
@@ -142,7 +153,32 @@ pub fn computeSemanticTokens(alloc: Allocator, source: []const u8) ![]u32 {
 
         if (tok.type == .eof) break;
 
-        if (mapTokenType(tok.type)) |ty| {
+        var final_ty: ?u32 = mapTokenType(tok.type);
+
+        // Track `#[...]` attribute-list context so the whole bracketed
+        // range — `#`, `[`, the identifiers inside, commas, and `]` —
+        // renders as a single cohesive decorator span rather than a
+        // mix of decorator (`#`), operator (nothing), and type
+        // (identifier) classes.
+        if (tok.type == .hash) {
+            saw_hash = true;
+        } else if (saw_hash and tok.type == .left_bracket) {
+            in_attr_list = true;
+            saw_hash = false;
+            final_ty = semantic_decorator;
+        } else {
+            saw_hash = false;
+            if (in_attr_list) switch (tok.type) {
+                .right_bracket => {
+                    in_attr_list = false;
+                    final_ty = semantic_decorator;
+                },
+                .identifier, .comma => final_ty = semantic_decorator,
+                else => {},
+            };
+        }
+
+        if (final_ty) |ty| {
             try toks.append(alloc, .{
                 .line = @intCast(tok.line - 1),
                 .col = @intCast(tok.column - 1),
@@ -732,6 +768,9 @@ pub const Server = struct {
                     "```pars\n<{s}: …> capture binding\n```",
                     .{idx.captures[ci].name},
                 );
+            }
+            if (idx.attrAt(pos.line, pos.col)) |ai| {
+                break :blk try formatHoverAttribute(self.alloc, idx.attrs[ai]);
             }
             break :blk null;
         };
@@ -1931,6 +1970,29 @@ fn writeDocumentSymbol(s: *std.json.Stringify, d: symbols.RuleDef) !void {
     try s.endObject();
 }
 
+/// Render a markdown hover for an attribute occurrence inside a
+/// `#[...]` list. The first line shows the attribute as it is spelled;
+/// the body explains what turning it on means. Unknown attributes get
+/// a generic "no description" tooltip — the compiler already errors on
+/// them, so the hover only serves as a reminder of the syntax.
+fn formatHoverAttribute(alloc: std.mem.Allocator, a: symbols.Attribute) ![]u8 {
+    if (std.mem.eql(u8, a.name, "lr")) {
+        return try alloc.dupe(
+            u8,
+            "```pars\n#[lr]\n```\n\n" ++
+                "Opts this rule into **direct left recursion** via " ++
+                "Warth's seed-growing algorithm. Without this " ++
+                "attribute the rule would trigger the runtime " ++
+                "\"Left recursion detected\" safeguard.",
+        );
+    }
+    return try std.fmt.allocPrint(
+        alloc,
+        "```pars\n#[{s}]\n```\n\n_no description available_",
+        .{a.name},
+    );
+}
+
 /// Render a rule definition as a markdown hover. The body is shown as
 /// a fenced `pars` block so the client can re-highlight it, and the
 /// kind line (top-level vs sub-rule) gives the reader orientation.
@@ -2121,6 +2183,53 @@ test "server: hover shows rule body" {
     try std.testing.expect(std.mem.indexOf(u8, out, "\"id\":3") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "bar = 'x'") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "\"kind\":\"markdown\"") != null);
+}
+
+test "server: hover on #[lr] shows the attribute explanation" {
+    const alloc = std.testing.allocator;
+
+    var aw = std.Io.Writer.Allocating.init(alloc);
+    defer aw.deinit();
+
+    var server = Server.init(alloc, &aw.writer);
+    defer server.deinit();
+
+    // Source: a single attribute-annotated rule. Cursor lands on the
+    // `l` of `lr` (line 0, col 2 inside `#[lr]`).
+    try server.handleMessage(
+        \\{"jsonrpc":"2.0","method":"textDocument/didOpen","params":{"textDocument":{"uri":"file:///x.pars","languageId":"pars","version":1,"text":"#[lr] expr = expr / 'x';"}}}
+    );
+    aw.writer.end = 0;
+
+    try server.handleMessage(
+        \\{"jsonrpc":"2.0","id":9,"method":"textDocument/hover","params":{"textDocument":{"uri":"file:///x.pars"},"position":{"line":0,"character":2}}}
+    );
+
+    const out = aw.writer.buffered();
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"id\":9") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "#[lr]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "left recursion") != null);
+}
+
+test "semantic tokens: #[lr] tags the whole list as decorator" {
+    const alloc = std.testing.allocator;
+    const data = try computeSemanticTokens(alloc, "#[lr] foo");
+    defer alloc.free(data);
+
+    // Expected tokens, all on line 0, all delta-encoded from origin:
+    //   `#`  at col 0, len 1, decorator (6)
+    //   `[`  at col 1, len 1, decorator (6)
+    //   `lr` at col 2, len 2, decorator (6)
+    //   `]`  at col 4, len 1, decorator (6)
+    //   `foo` at col 6, len 3, type (0)
+    const expected = [_]u32{
+        0, 0, 1, 6, 0, // #
+        0, 1, 1, 6, 0, // [
+        0, 1, 2, 6, 0, // lr
+        0, 2, 1, 6, 0, // ]
+        0, 2, 3, 0, 0, // foo
+    };
+    try std.testing.expectEqualSlices(u32, &expected, data);
 }
 
 test "server: definition falls back to std/abnf module source" {

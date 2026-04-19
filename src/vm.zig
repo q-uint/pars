@@ -22,6 +22,7 @@ const max_bt = frame_mod.max_bt;
 
 pub const FrameKind = frame_mod.FrameKind;
 pub const no_label = frame_mod.no_label;
+pub const no_seed = frame_mod.no_seed;
 
 // Comptime toggle: per-instruction disassembly during run(). Off by
 // default so the REPL and scripts produce clean output; flip to true
@@ -231,20 +232,48 @@ pub fn Vm(comptime stack_size: ?comptime_int) type {
                         }
                     },
                     .op_call => {
-                        if (!self.callRule(self.readByte())) return .runtime_error;
+                        switch (self.callRule(self.readByte())) {
+                            .pushed, .seed_advanced => {},
+                            .seed_fail => if (self.handleFail()) |r| return r,
+                            .err => return .runtime_error,
+                        }
                     },
                     .op_call_wide => {
-                        if (!self.callRule(self.readWideIndex())) return .runtime_error;
+                        switch (self.callRule(self.readWideIndex())) {
+                            .pushed, .seed_advanced => {},
+                            .seed_fail => if (self.handleFail()) |r| return r,
+                            .err => return .runtime_error,
+                        }
                     },
                     .op_return => {
                         if (self.frame_count == 0) {
                             self.runtimeError("op_return with empty call stack", .{});
                             return .runtime_error;
                         }
-                        self.frame_count -= 1;
-                        const frame = self.frames[self.frame_count];
-                        self.chunk = frame.chunk;
-                        self.ip = frame.ip;
+                        const frame = &self.frames[self.frame_count - 1];
+                        if (frame.is_lr and
+                            (frame.seed_pos == no_seed or self.pos > frame.seed_pos))
+                        {
+                            // Grow the seed and re-run the rule body at
+                            // the original entry position. The frame
+                            // itself stays on the call stack; only the
+                            // body re-enters from the top.
+                            frame.seed_pos = self.pos;
+                            self.pos = frame.entry_pos;
+                            self.chunk = frame.callee;
+                            self.ip = 0;
+                        } else if (frame.is_lr) {
+                            // No growth this iteration: finalize with
+                            // the best seed we found and return.
+                            self.pos = frame.seed_pos;
+                            self.chunk = frame.chunk;
+                            self.ip = frame.ip;
+                            self.frame_count -= 1;
+                        } else {
+                            self.chunk = frame.chunk;
+                            self.ip = frame.ip;
+                            self.frame_count -= 1;
+                        }
                     },
                     .op_choice => {
                         if (!self.pushBacktrack(.choice)) return .runtime_error;
@@ -337,8 +366,16 @@ pub fn Vm(comptime stack_size: ?comptime_int) type {
         fn fail(self: *Self) FailResult {
             // Unwind committed frames silently: they are ghosts left
             // behind by a cut so that op_commit still pops them, but
-            // they must not catch a backtracking failure.
+            // they must not catch a backtracking failure. Before each
+            // pop, check whether the failure is about to unwind past a
+            // `#[lr]` frame whose seed already grew to a successful
+            // match — in that case finalize the rule with the seed
+            // (Warth seed-growing, ADR 010) instead of propagating the
+            // failure outward.
             while (self.bt_top > 0) {
+                if (self.finalizeSeedOnFail(self.bt_stack[self.bt_top - 1].frame_count)) {
+                    return .backtracked;
+                }
                 self.bt_top -= 1;
                 const frame = self.bt_stack[self.bt_top];
                 if (frame.committed) continue;
@@ -348,9 +385,13 @@ pub fn Vm(comptime stack_size: ?comptime_int) type {
                 self.frame_count = frame.frame_count;
                 return .backtracked;
             }
-            // No backtrack frame left. If a labelled cut fired in any
-            // active rule, the innermost such label becomes a runtime
-            // error rather than a silent no_match.
+            // Backtrack stack exhausted: the failure has walked all
+            // the way out. Still let an LR seed finalize before
+            // deciding between no_match and label_error.
+            if (self.finalizeSeedOnFail(0)) return .backtracked;
+            // If a labelled cut fired in any active rule, the innermost
+            // such label becomes a runtime error rather than a silent
+            // no_match.
             var i = self.frame_count;
             while (i > 0) {
                 i -= 1;
@@ -363,6 +404,29 @@ pub fn Vm(comptime stack_size: ?comptime_int) type {
                 }
             }
             return .no_match;
+        }
+
+        // If the failure is about to rewind the call stack below an LR
+        // frame that already has a non-FAIL seed, "return" that frame
+        // with the seed's match result instead of unwinding past it.
+        // `restore_frame_count` is the call depth the next unwind would
+        // install; any LR frame at or above that index is about to be
+        // discarded. Returns true when a frame was finalized — the
+        // caller skips its normal bt-pop on that iteration.
+        fn finalizeSeedOnFail(self: *Self, restore_frame_count: usize) bool {
+            var i = self.frame_count;
+            while (i > restore_frame_count) {
+                i -= 1;
+                const f = self.frames[i];
+                if (f.is_lr and f.seed_pos != no_seed) {
+                    self.pos = f.seed_pos;
+                    self.chunk = f.chunk;
+                    self.ip = f.ip;
+                    self.frame_count = i;
+                    return true;
+                }
+            }
+            return false;
         }
 
         fn pushBacktrack(self: *Self, kind: FrameKind) bool {
@@ -417,22 +481,44 @@ pub fn Vm(comptime stack_size: ?comptime_int) type {
             return @bitCast(@as(u16, lo) | (@as(u16, hi) << 8));
         }
 
-        fn callRule(self: *Self, index: u32) bool {
+        const CallOutcome = enum {
+            // Pushed a new call frame; the body is about to run.
+            pushed,
+            // Recursive call into a `#[lr]` rule whose current seed is
+            // a success value: `pos` has been advanced to the seed end
+            // and execution continues in the caller (no frame pushed).
+            seed_advanced,
+            // Recursive call into a `#[lr]` rule whose seed is still
+            // FAIL: the caller should trigger a match failure so the
+            // body's ordered-choice moves on to the next alternative.
+            seed_fail,
+            // Runtime error: undefined rule, call-stack overflow, or
+            // left recursion on a non-`#[lr]` rule.
+            err,
+        };
+
+        fn callRule(self: *Self, index: u32) CallOutcome {
             const rule_chunk = self.rules.getChunkPtr(index) orelse {
                 const name = if (index < self.rules.names.items.len)
                     self.rules.names.items[index]
                 else
                     "(unknown)";
                 self.runtimeError("Undefined rule '{s}'.", .{name});
-                return false;
+                return .err;
             };
-            // Detect left recursion: if the target rule is already
-            // active at the same input position, no input can ever
-            // be consumed and the parse would loop forever. Compare
-            // against each frame's callee (the rule it is executing),
-            // not its caller chunk.
+            // If the target rule is already active at the same input
+            // position, no byte can be consumed along this path. For a
+            // `#[lr]`-marked rule this triggers the seed-growing path
+            // (ADR 010); for any other rule it is a runtime error that
+            // would otherwise loop forever. Compare against each frame's
+            // callee (the rule it is executing), not its caller chunk.
             for (self.frames[0..self.frame_count]) |f| {
                 if (f.callee == rule_chunk and f.entry_pos == self.pos) {
+                    if (f.is_lr) {
+                        if (f.seed_pos == no_seed) return .seed_fail;
+                        self.pos = f.seed_pos;
+                        return .seed_advanced;
+                    }
                     const name = if (index < self.rules.names.items.len)
                         self.rules.names.items[index]
                     else
@@ -441,24 +527,27 @@ pub fn Vm(comptime stack_size: ?comptime_int) type {
                         "Left recursion detected in rule '{s}'.",
                         .{name},
                     );
-                    return false;
+                    return .err;
                 }
             }
             if (self.frame_count >= max_frames) {
                 self.runtimeError("Call stack overflow.", .{});
-                return false;
+                return .err;
             }
+            const attrs = self.rules.getAttrs(index);
             self.frames[self.frame_count] = .{
                 .chunk = self.chunk.?,
                 .callee = rule_chunk,
                 .ip = self.ip,
                 .entry_pos = self.pos,
                 .commit_label = no_label,
+                .is_lr = attrs.lr,
+                .seed_pos = no_seed,
             };
             self.frame_count += 1;
             self.chunk = rule_chunk;
             self.ip = 0;
-            return true;
+            return .pushed;
         }
 
         fn readWideIndex(self: *Self) u32 {

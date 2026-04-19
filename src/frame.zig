@@ -7,6 +7,12 @@ pub const max_bt = 256;
 
 pub const no_label: u32 = std.math.maxInt(u32);
 
+/// Sentinel value for `CallFrame.seed_pos` meaning "no seed yet"
+/// (equivalent to Warth's initial FAIL seed). A real seed can never
+/// take this value because it is always a valid input position, which
+/// is bounded by the input length and therefore well below maxInt.
+pub const no_seed: usize = std.math.maxInt(usize);
+
 pub const CallFrame = struct {
     // Caller's chunk and ip, restored on OP_RETURN so execution
     // resumes at the instruction after the OP_CALL.
@@ -30,6 +36,17 @@ pub const CallFrame = struct {
     // propagates past every remaining backtrack frame: the innermost
     // active label becomes the runtime-error message.
     commit_label: u32,
+    // True when the callee was declared `#[lr]` (ADR 010). Switches
+    // the VM onto the seed-growing path: a recursive call at the same
+    // position reads `seed_pos` instead of erroring, and op_return
+    // iterates the body until growth stops.
+    is_lr: bool,
+    // Best match endpoint recorded for an `is_lr` frame across
+    // seed-growing iterations. `no_seed` on entry and while the body's
+    // first iteration is still running; set to the current `pos` when
+    // the body reaches op_return, which advances subsequent recursive
+    // calls by jumping `pos` to this value.
+    seed_pos: usize,
 };
 
 /// Kind tag on backtrack frames so op_cut can recognize which frame is

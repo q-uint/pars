@@ -4,6 +4,7 @@ const Chunk = chunk_mod.Chunk;
 const OpCode = chunk_mod.OpCode;
 const object = @import("object.zig");
 const compiler_mod = @import("compiler.zig");
+const peephole = @import("peephole.zig");
 const Compiler = compiler_mod.Compiler;
 const RuleTable = compiler_mod.RuleTable;
 
@@ -24,13 +25,21 @@ const TestCompileResult = struct {
 };
 
 fn compileForTest(alloc: std.mem.Allocator, source: []const u8) !TestCompileResult {
+    return compileForTestWithPeephole(alloc, source, .{});
+}
+
+fn compileForTestWithPeephole(
+    alloc: std.mem.Allocator,
+    source: []const u8,
+    cfg: peephole.Config,
+) !TestCompileResult {
     var result: TestCompileResult = .{
         .chunk = Chunk.init(alloc),
         .rules = .{},
         .ok = false,
         .alloc = alloc,
         .pool = object.ObjPool.init(alloc),
-        .compiler = Compiler.init(alloc),
+        .compiler = Compiler.initWithPeephole(alloc, cfg),
     };
     result.ok = result.compiler.compile(source, &result.chunk, &result.rules, &result.pool);
     return result;
@@ -528,7 +537,14 @@ test "lookahead binds looser than quantifier: !A* parses as !(A*)" {
 
 test "bounded A{3} emits three copies of the operand" {
     const alloc = std.testing.allocator;
-    var result = try compileForTest(alloc, "'a'{3}");
+    // Disable mergeAdjacentLiterals so we can assert the duplicated
+    // operand bytes verbatim. With merging on, the three op_match_char
+    // copies collapse into one op_match_string "aaa".
+    var result = try compileForTestWithPeephole(
+        alloc,
+        "'a'{3}",
+        .{ .merge_adjacent_literals = false },
+    );
     defer result.deinit();
 
     try std.testing.expect(result.ok);

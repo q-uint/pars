@@ -242,6 +242,65 @@ pub const Chunk = struct {
         }
     }
 
+    // Replace the byte range [start, end) with `new_bytes`, attributing
+    // every new byte to `new_span`. Bytes after `end` keep their original
+    // per-byte spans (re-registered one at a time; chunk.write coalesces
+    // adjacent equal spans back into a single RLE run). Used by the
+    // post-pass peephole to splice one merged instruction in place of a
+    // run of adjacent literals. Caller is responsible for adjusting any
+    // relative jump offsets that straddle the merged region before
+    // calling — otherwise their targets shift out from under them.
+    pub fn replaceRange(
+        self: *Chunk,
+        start: usize,
+        end: usize,
+        new_bytes: []const u8,
+        new_span: SourceSpan,
+    ) !void {
+        std.debug.assert(start <= end);
+        std.debug.assert(end <= self.code.items.len);
+
+        const tail_len = self.code.items.len - end;
+        const tail_bytes = try self.allocator.alloc(u8, tail_len);
+        defer self.allocator.free(tail_bytes);
+        @memcpy(tail_bytes, self.code.items[end..]);
+
+        const tail_spans = try self.allocator.alloc(SourceSpan, tail_len);
+        defer self.allocator.free(tail_spans);
+        for (0..tail_len) |i| tail_spans[i] = self.getSpan(end + i);
+
+        self.truncate(start);
+        for (new_bytes) |b| try self.write(b, new_span);
+        for (tail_bytes, tail_spans) |b, s| try self.write(b, s);
+    }
+
+    // Shrink the chunk to `new_len` bytes, adjusting the RLE span runs
+    // so their total count still matches the code length. Runs entirely
+    // past the cut are dropped; the run straddling the cut is trimmed.
+    // Constants are left untouched — they dedupe on the next addConstant
+    // and unused entries cost a few bytes of pool. Used by the emit-time
+    // peephole to discard a just-emitted region and replace it with a
+    // smaller one.
+    pub fn truncate(self: *Chunk, new_len: usize) void {
+        std.debug.assert(new_len <= self.code.items.len);
+        self.code.items.len = new_len;
+        var pos: usize = 0;
+        var i: usize = 0;
+        while (i < self.spans.items.len) : (i += 1) {
+            const run = self.spans.items[i];
+            if (pos + run.count <= new_len) {
+                pos += run.count;
+                continue;
+            }
+            if (pos >= new_len) break;
+            self.spans.items[i].count = new_len - pos;
+            pos = new_len;
+            i += 1;
+            break;
+        }
+        self.spans.items.len = i;
+    }
+
     pub fn deinit(self: *Chunk) void {
         self.code.deinit(self.allocator);
         self.spans.deinit(self.allocator);
@@ -315,6 +374,66 @@ test "emitOpConstant switches to wide form after 256 constants" {
     try std.testing.expectEqual(0x00, c.code.items[code_len_before + 1]);
     try std.testing.expectEqual(0x01, c.code.items[code_len_before + 2]);
     try std.testing.expectEqual(0x00, c.code.items[code_len_before + 3]);
+}
+
+test "replaceRange splices in a shorter region and preserves tail spans" {
+    var c = Chunk.init(std.testing.allocator);
+    defer c.deinit();
+
+    const a = testSpan(0, 3, 1);
+    const b = testSpan(10, 4, 2);
+    const d = testSpan(20, 2, 3);
+    // [0..3) from span A, [3..6) from span B, [6..8) from span D.
+    for (0..3) |_| try c.write(0xAA, a);
+    for (0..3) |_| try c.write(0xBB, b);
+    for (0..2) |_| try c.write(0xDD, d);
+
+    // Replace [0..6) with two bytes under span A. Tail [6..8) must
+    // keep span D and move to [2..4).
+    const new_bytes: [2]u8 = .{ 0xEE, 0xEE };
+    try c.replaceRange(0, 6, &new_bytes, a);
+
+    try std.testing.expectEqual(@as(usize, 4), c.code.items.len);
+    try std.testing.expectEqual(@as(u8, 0xEE), c.code.items[0]);
+    try std.testing.expectEqual(@as(u8, 0xEE), c.code.items[1]);
+    try std.testing.expectEqual(@as(u8, 0xDD), c.code.items[2]);
+    try std.testing.expectEqual(@as(u8, 0xDD), c.code.items[3]);
+    try std.testing.expectEqual(a, c.getSpan(0));
+    try std.testing.expectEqual(a, c.getSpan(1));
+    try std.testing.expectEqual(d, c.getSpan(2));
+    try std.testing.expectEqual(d, c.getSpan(3));
+}
+
+test "truncate drops and trims RLE span runs" {
+    var c = Chunk.init(std.testing.allocator);
+    defer c.deinit();
+
+    const a = testSpan(0, 3, 1);
+    const b = testSpan(10, 4, 2);
+    const d = testSpan(20, 2, 3);
+    // Layout: 3 bytes span A, 4 bytes span B, 1 byte span D  (8 bytes total).
+    try c.write(0, a);
+    try c.write(0, a);
+    try c.write(0, a);
+    try c.write(0, b);
+    try c.write(0, b);
+    try c.write(0, b);
+    try c.write(0, b);
+    try c.write(0, d);
+    try std.testing.expectEqual(@as(usize, 8), c.code.items.len);
+    try std.testing.expectEqual(@as(usize, 3), c.spans.items.len);
+
+    // Truncate mid-run: keep 5 bytes = span A (3) + 2 of span B.
+    c.truncate(5);
+    try std.testing.expectEqual(@as(usize, 5), c.code.items.len);
+    try std.testing.expectEqual(@as(usize, 2), c.spans.items.len);
+    try std.testing.expectEqual(@as(usize, 3), c.spans.items[0].count);
+    try std.testing.expectEqual(@as(usize, 2), c.spans.items[1].count);
+
+    // Truncate to zero drops all runs.
+    c.truncate(0);
+    try std.testing.expectEqual(@as(usize, 0), c.code.items.len);
+    try std.testing.expectEqual(@as(usize, 0), c.spans.items.len);
 }
 
 test "addConstant deduplicates identical values" {

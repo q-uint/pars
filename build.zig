@@ -101,4 +101,22 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_mod_tests.step);
     test_step.dependOn(&run_exe_tests.step);
     test_step.dependOn(&run_lsp_tests.step);
+
+    // Bench harness: compiles and runs a fixed set of fixtures,
+    // printing instruction counts and code sizes. Deterministic
+    // output is meant to be diffed across commits.
+    const bench_exe = b.addExecutable(.{
+        .name = "pars-bench",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tools/bench/main.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "pars", .module = mod },
+            },
+        }),
+    });
+    const bench_run = b.addRunArtifact(bench_exe);
+    const bench_step = b.step("bench", "Run the bench harness");
+    bench_step.dependOn(&bench_run.step);
 }

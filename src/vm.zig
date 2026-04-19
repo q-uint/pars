@@ -76,6 +76,15 @@ pub fn Vm(comptime stack_size: ?comptime_int) type {
         allocator: std.mem.Allocator,
         obj_pool: object.ObjPool,
         compiler: Compiler,
+        // Number of opcodes dispatched by the last run() invocation.
+        // Reset at the start of match(); read by the bench harness to
+        // compare work across grammars/optimizations.
+        instructions: u64,
+        // Total bytes of bytecode compiled for the last program: the
+        // top-level chunk plus every rule chunk. Captured at the end
+        // of match() so callers can read it after the chunk goes out
+        // of scope.
+        last_code_bytes: usize,
 
         pub fn init(allocator: std.mem.Allocator) Self {
             return .{
@@ -94,6 +103,8 @@ pub fn Vm(comptime stack_size: ?comptime_int) type {
                 .allocator = allocator,
                 .obj_pool = object.ObjPool.init(allocator),
                 .compiler = Compiler.init(allocator),
+                .instructions = 0,
+                .last_code_bytes = 0,
             };
         }
 
@@ -151,6 +162,12 @@ pub fn Vm(comptime stack_size: ?comptime_int) type {
             self.pos = 0;
             self.frame_count = 0;
             self.bt_top = 0;
+            self.instructions = 0;
+            var total: usize = c.code.items.len;
+            for (self.rules.chunks.items) |maybe_chunk| {
+                if (maybe_chunk) |rc| total += rc.code.items.len;
+            }
+            self.last_code_bytes = total;
             return self.run();
         }
 
@@ -179,6 +196,7 @@ pub fn Vm(comptime stack_size: ?comptime_int) type {
                     self.runtimeError("unknown opcode {d}", .{instruction});
                     return .runtime_error;
                 };
+                self.instructions += 1;
                 switch (op) {
                     .op_match_char => {
                         const byte = self.readByte();

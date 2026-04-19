@@ -9,6 +9,7 @@ const rule_table_mod = @import("rule_table.zig");
 const compile_error_mod = @import("compile_error.zig");
 const literal = @import("literal.zig");
 const pratt = @import("pratt.zig");
+const peephole = @import("peephole.zig");
 const Chunk = chunk_mod.Chunk;
 const OpCode = chunk_mod.OpCode;
 const Value = value_mod.Value;
@@ -105,9 +106,17 @@ pub const Compiler = struct {
     // backtracking state, and a cut would leak a commit out of that
     // transparent scope (ADR 008).
     lookahead_depth: u32 = 0,
+    // Per-pass peephole switches. Default is "all on"; tests that
+    // assert raw bytecode shape construct a Compiler with the
+    // relevant pass turned off via `initWithPeephole`.
+    peephole_config: peephole.Config = .{},
 
     pub fn init(alloc: std.mem.Allocator) Compiler {
         return .{ .alloc = alloc };
+    }
+
+    pub fn initWithPeephole(alloc: std.mem.Allocator, cfg: peephole.Config) Compiler {
+        return .{ .alloc = alloc, .peephole_config = cfg };
     }
 
     pub fn currentChunk(self: *Compiler) *Chunk {
@@ -247,9 +256,30 @@ pub const Compiler = struct {
         }
 
         self.endCompiler();
+
+        // Post-emit peephole passes run once the chunk and every rule
+        // body are finalized. Skipped when compilation already errored
+        // so we don't rewrite half-emitted bytecode.
+        if (!self.parser.had_error) {
+            self.runPostEmitPeephole(chunk, rule_table) catch {
+                self.errorAtPrevious("Out of memory.");
+            };
+        }
+
         self.compiling_rules = null;
 
         return !self.parser.had_error;
+    }
+
+    fn runPostEmitPeephole(self: *Compiler, chunk: *Chunk, rule_table: *RuleTable) !void {
+        if (self.peephole_config.merge_adjacent_literals) {
+            try peephole.post_emit.mergeAdjacentLiterals(chunk, self.obj_pool);
+            for (rule_table.chunks.items) |*maybe_chunk| {
+                if (maybe_chunk.*) |*rc| {
+                    try peephole.post_emit.mergeAdjacentLiterals(rc, self.obj_pool);
+                }
+            }
+        }
     }
 
     pub fn deinit(self: *Compiler) void {
@@ -1005,6 +1035,22 @@ pub const Compiler = struct {
         self.dropLocalsTo(local_count_before_right);
         // Patch OP_COMMIT: on success, jump past alternative.
         self.patchJump(commit_offset);
+
+        // Emit-time peephole: collapse `A / B` into a single charset
+        // when both arms are single-byte matchers. Composes across
+        // chained alternatives (A / B / C) because the left-associative
+        // parse means each pair fuses before the next pair is built.
+        if (self.peephole_config.fuse_charset_choice) {
+            _ = peephole.emit_time.fuseCharsetChoice(
+                self.currentChunk(),
+                self.obj_pool,
+                left_start,
+                commit_offset,
+                self.previousSpan(),
+            ) catch {
+                self.errorAtPrevious("Out of memory.");
+            };
+        }
     }
 
     // A* : zero or more.

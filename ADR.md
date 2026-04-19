@@ -393,3 +393,90 @@ grammar modules land and the global memo table arrives: at that point
 the seed-table machinery should fold into the memo table, and the
 indirect-LR extension becomes cheap enough to justify on top of the
 call-graph analysis ADR 004 anticipates.
+
+## 011 — Longest-match choice is a distinct operator, spelled as an expression attribute
+
+_Decision._
+
+Ordered choice (`A / B`, ADR 005) commits to the first alternative that
+matches, even when a later alternative would have consumed more input. That
+is the right default for PEGs — it is deterministic, cheap, and matches the
+way most grammars are written — but it is the wrong default for a specific,
+recurring case: tokenizing operators that share a prefix. `"<" / "<="` on the
+input `<=` matches `"<"` and leaves `=` behind, because ordered choice commits
+as soon as `"<"` succeeds. Authors work around this today by hand-ordering
+longer alternatives first (`"<=" / "<"`), which is brittle: adding a new
+operator forces the author to re-sort the whole alternation, and the ordering
+constraint is invisible at the call site.
+
+`#[longest](A / B / …)` is a second choice operator that runs every
+alternative from the same starting position and commits to the one that
+consumed the most input. Ties resolve to the earlier arm; if every arm fails,
+the group fails. Ordered choice is unchanged — `#[longest]` is strictly
+additive.
+
+Three sub-decisions shape the feature.
+
+_An expression-position form, not a rule-wide declaration attribute._ ADR 010
+introduced `#[...]` as a rule-declaration attribute syntax (`#[lr] expr = …`),
+and the obvious extension is a rule-level flag like `#[longest] expr = …` that
+changes every `/` inside the body to a longest match. That form was rejected.
+Longest-match is a property of a specific alternation, not a whole rule: an
+expression grammar typically has one alternation that needs it (the operator
+tokens) and several that do not (the statement forms, the primaries). A
+rule-wide flag forces the author to either split the rule or accept worse
+semantics for alternations that were fine with ordered choice. Spelled at the
+alternation, `#[longest](A / B)` is local to the specific site that needs it
+and composes with ordinary `/` everywhere else. The cost is that `#[...]` now
+has two parsing contexts — declaration-prefix and expression-position —
+disambiguated by a small peephole lookahead on the attribute name.
+
+_Reuse the `#[...]` syntax rather than inventing a new sigil._ Alternatives
+considered: a bare contextual keyword (`longest(A / B)`, per ADR 003), a
+sigil (`@longest(A / B)`), and a new operator token (`A // B`). Per ADR 003
+the bare-keyword form costs nothing at the scanner — `longest` stays a
+plain identifier and a rule named `longest` keeps working — but it picks a
+single spelling for a single mode, so every future mode (`commit`,
+`ratchet`, parameterized forms like `longest(strict)`) re-opens the
+question of how to spell it. A sigil re-litigates the syntax the same
+way. A new operator token reads poorly at an `n`-way alternation
+because the mode has to be repeated between every pair. `#[longest]` is
+verbose at a two-arm site but scales cleanly: the mode appears once, the
+arms read the same as ordered choice, and the `#[...]` wrapper is the same
+one ADR 010 already uses for declaration attributes. The attribute name
+itself stays contextual — `longest` inside `#[...]` is just a lexeme
+comparison, so rule names and bindings called `longest` are unaffected.
+This keeps `#[...]` as the single extension point for non-default modes,
+at declaration or expression position, with zero reserved words added.
+
+_Three opcodes wrapping ordered-choice machinery, not one wide instruction._
+The shape on the table was a single `op_longest` with an embedded arm count
+and per-arm offsets, versus three opcodes (`op_longest_begin`,
+`op_longest_step`, `op_longest_end`) wrapping the existing
+`op_choice`/`op_commit` pair. The three-opcode form won for two reasons.
+First, each arm needs the same backtrack semantics ordered choice uses —
+push a frame, run the arm, jump on failure — so reusing `op_choice` avoids
+duplicating that machinery. Second, `op_longest_step` gives each successful
+arm a uniform hook to record its endpoint and rewind the input cursor,
+independent of the arm's internal structure. `op_longest_end` then advances
+to the best recorded endpoint or fails if none was recorded. The cost is
+three opcodes instead of one; the benefit is that arms compile through the
+same Pratt path as ordered choice, with the only per-arm emission being the
+trailing `op_longest_step`.
+
+_Scope and capture semantics mirror ordered choice._ Each arm is its own
+naming scope, so a `<x: …>` binding in one arm does not collide with the same
+name in another; the whole group is also its own scope, so bindings inside do
+not leak outward. This matches the scoping rule ordered-choice arms already
+follow, keeping the two operators substitutable at the source level —
+replacing `/` with `#[longest]` never changes what names are visible, only
+which arm commits.
+
+The cost is a new expression-position parsing context for `#[...]`
+(disambiguated by attribute name), three new opcodes, and per-group state
+tracking the in-progress best endpoint. The benefit is that prefix-sharing
+tokenizer alternations stop being order-sensitive, without forcing every `/`
+in the language to pay n-arm evaluation. Revisit if a third choice mode lands
+(e.g. a backtracking/ratcheting variant): at that point the
+`op_longest_{begin,step,end}` trio is the template, and the cost of
+generalizing it is linear in the number of modes.

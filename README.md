@@ -36,17 +36,18 @@ entry point.
 
 ### Primaries
 
-| syntax          | meaning                                      |
-| --------------- | -------------------------------------------- |
-| `"literal"`     | match an exact byte sequence                 |
-| `"""literal"""` | triple-quoted, allows embedded newlines      |
-| `i"literal"`    | case-insensitive (ASCII letters)             |
-| `'c'`           | match a single byte                          |
-| `.`             | match any one byte                           |
-| `['a'-'z']`     | charset: match one byte in the set           |
-| `(A B)`         | grouping                                     |
-| `name`          | call a named rule                            |
-| `<x: A>`        | capture the span matched by `A` as `x`       |
+| syntax                 | meaning                                            |
+| ---------------------- | -------------------------------------------------- |
+| `"literal"`            | match an exact byte sequence                       |
+| `"""literal"""`        | triple-quoted, allows embedded newlines            |
+| `i"literal"`           | case-insensitive (ASCII letters)                   |
+| `'c'`                  | match a single byte                                |
+| `.`                    | match any one byte                                 |
+| `['a'-'z']`            | charset: match one byte in the set                 |
+| `(A B)`                | grouping                                           |
+| `#[longest](A / B)`    | longest-match choice: commit to the longest arm    |
+| `name`                 | call a named rule                                  |
+| `<x: A>`               | capture the span matched by `A` as `x`             |
 
 Within the same rule, referencing a captured name matches the exact
 bytes it captured earlier (back-reference).
@@ -87,10 +88,10 @@ kv = k "=" v
   end
 ```
 
-A declaration may carry bracketed attributes. Today only `lr` is
-recognized: it opts a rule into direct left recursion via seed-growing,
-so `expr` below matches left-associative chains like `1+2-3` that a
-plain PEG would reject:
+A declaration may carry bracketed attributes. Today `lr` is the only
+declaration attribute: it opts a rule into direct left recursion via
+seed-growing, so `expr` below matches left-associative chains like
+`1+2-3` that a plain PEG would reject:
 
 ```
 #[lr]
@@ -100,6 +101,22 @@ expr = expr "+" term
 ```
 
 See [`examples/left-recursive-expr.pars`](examples/left-recursive-expr.pars).
+
+The `#[longest](...)` form reuses the same bracketed-attribute syntax
+in expression position. It runs every alternative from the same
+starting position and commits to the one that consumed the most input,
+so a shorter prefix cannot starve a longer one:
+
+```
+op = #[longest]("<" / "<=" / ">" / ">=" / "==" / "!=");
+```
+
+Ties resolve to the earlier arm; if every arm fails, the group fails.
+See [`examples/longest-match.pars`](examples/longest-match.pars).
+
+Attribute names are not reserved words: `lr` and `longest` are only
+recognized inside `#[...]`, so rules or bindings named `lr` or
+`longest` keep working unchanged.
 
 ### Imports
 
@@ -163,7 +180,7 @@ provides:
 - **inlay hints** flagging identifiers that resolve to capture
   back-references rather than rule calls
 - snippets for common declarations (`rule`, `rulew`, `where`, `cap`,
-  `alt`, `neg`, `pos`, `cut`, `bq`, `use`, `cs`)
+  `alt`, `longest`, `neg`, `pos`, `cut`, `bq`, `use`, `cs`)
 
 ### Install
 

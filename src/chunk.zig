@@ -95,52 +95,70 @@ pub const OpCode = enum(u8) {
     op_halt, // 1 byte
 };
 
-// Run-length encoded (RLE) line number entry. Each entry covers
-// `count` consecutive bytecode bytes, all from the same source `line`.
-pub const LineRun = struct {
+// A source-level location attached to emitted bytecode: the byte
+// offset into the source, the length of the span in source bytes, and
+// the 1-based source line. Line is stored (not computed from start)
+// because the VM surfaces it in runtime error messages without access
+// to the original source buffer.
+pub const SourceSpan = struct {
+    start: usize,
+    len: usize,
     line: usize,
+};
+
+// Run-length encoded (RLE) source-span entry. Each entry covers
+// `count` consecutive bytecode bytes produced from the same source
+// span. Bytes emitted for the same token share identical spans and so
+// collapse into a single run.
+pub const SpanRun = struct {
+    span: SourceSpan,
     count: usize,
 };
 
 pub const Chunk = struct {
     code: std.ArrayList(u8),
-    // Run-length encoded line info. Instead of one entry per bytecode
-    // byte, consecutive bytes from the same source line share a single
-    // LineRun. getLine() walks the runs to resolve a bytecode offset
-    // to a source line -- acceptable because it only runs on errors.
-    lines: std.ArrayList(LineRun),
+    // Run-length encoded source-span info. Instead of one entry per
+    // bytecode byte, consecutive bytes from the same source span share
+    // a single SpanRun. getLine()/getSpan() walk the runs to resolve a
+    // bytecode offset -- acceptable because they only run on errors or
+    // on demand from the disassembler.
+    spans: std.ArrayList(SpanRun),
     constants: std.ArrayList(Value),
     allocator: std.mem.Allocator,
 
     pub fn init(allocator: std.mem.Allocator) Chunk {
         return .{
             .code = .empty,
-            .lines = .empty,
+            .spans = .empty,
             .constants = .empty,
             .allocator = allocator,
         };
     }
 
-    pub fn write(self: *Chunk, byte: u8, line: usize) !void {
+    pub fn write(self: *Chunk, byte: u8, span: SourceSpan) !void {
         try self.code.append(self.allocator, byte);
-        if (self.lines.items.len > 0 and
-            self.lines.items[self.lines.items.len - 1].line == line)
+        if (self.spans.items.len > 0 and
+            std.meta.eql(self.spans.items[self.spans.items.len - 1].span, span))
         {
-            // Same line as previous byte, extend the current run.
-            self.lines.items[self.lines.items.len - 1].count += 1;
+            // Same span as previous byte, extend the current run.
+            self.spans.items[self.spans.items.len - 1].count += 1;
         } else {
-            // New source line, start a new run.
-            try self.lines.append(self.allocator, .{ .line = line, .count = 1 });
+            // New source span, start a new run.
+            try self.spans.append(self.allocator, .{ .span = span, .count = 1 });
         }
     }
 
-    pub fn getLine(self: *const Chunk, offset: usize) usize {
+    pub fn getSpan(self: *const Chunk, offset: usize) SourceSpan {
         var remaining = offset;
-        for (self.lines.items) |run| {
-            if (remaining < run.count) return run.line;
+        for (self.spans.items) |run| {
+            if (remaining < run.count) return run.span;
             remaining -= run.count;
         }
         unreachable;
+    }
+
+    pub fn getLine(self: *const Chunk, offset: usize) usize {
+        return self.getSpan(offset).line;
     }
 
     pub fn addConstant(self: *Chunk, val: Value) !usize {
@@ -161,23 +179,23 @@ pub const Chunk = struct {
         op_narrow: OpCode,
         op_wide: OpCode,
         val: Value,
-        line: usize,
+        span: SourceSpan,
     ) !void {
         const index = try self.addConstant(val);
         if (index <= std.math.maxInt(u8)) {
-            try self.write(@intFromEnum(op_narrow), line);
-            try self.write(@intCast(index), line);
+            try self.write(@intFromEnum(op_narrow), span);
+            try self.write(@intCast(index), span);
         } else {
-            try self.write(@intFromEnum(op_wide), line);
-            try self.write(@intCast(index & 0xff), line);
-            try self.write(@intCast((index >> 8) & 0xff), line);
-            try self.write(@intCast((index >> 16) & 0xff), line);
+            try self.write(@intFromEnum(op_wide), span);
+            try self.write(@intCast(index & 0xff), span);
+            try self.write(@intCast((index >> 8) & 0xff), span);
+            try self.write(@intCast((index >> 16) & 0xff), span);
         }
     }
 
     // Insert `count` zero bytes at `offset`, shifting existing code
-    // to the right. The line-info run covering `offset` is extended
-    // so that the new bytes inherit the same source line.
+    // to the right. The span-info run covering `offset` is extended
+    // so that the new bytes inherit the same source span.
     pub fn insertBytesAt(self: *Chunk, offset: usize, count: usize) !void {
         const old_len = self.code.items.len;
         // Grow code array by `count` bytes.
@@ -190,38 +208,45 @@ pub const Chunk = struct {
         );
         // Zero the inserted gap.
         @memset(self.code.items[offset..][0..count], 0);
-        // Extend the line-info run that covers the insertion point.
+        // Extend the span-info run that covers the insertion point.
         var pos: usize = 0;
-        for (self.lines.items) |*run| {
+        for (self.spans.items) |*run| {
             if (pos + run.count > offset) {
                 run.count += count;
                 return;
             }
             pos += run.count;
         }
-        if (self.lines.items.len > 0) {
-            self.lines.items[self.lines.items.len - 1].count += count;
+        if (self.spans.items.len > 0) {
+            self.spans.items[self.spans.items.len - 1].count += count;
         }
     }
 
     pub fn deinit(self: *Chunk) void {
         self.code.deinit(self.allocator);
-        self.lines.deinit(self.allocator);
+        self.spans.deinit(self.allocator);
         self.constants.deinit(self.allocator);
     }
 };
+
+fn testSpan(start: usize, len: usize, line: usize) SourceSpan {
+    return .{ .start = start, .len = len, .line = line };
+}
 
 test "getLine resolves offsets across multiple runs" {
     var c = Chunk.init(std.testing.allocator);
     defer c.deinit();
 
-    // 3 bytes on line 1, 2 bytes on line 2, 1 byte on line 3
-    try c.write(0, 1);
-    try c.write(0, 1);
-    try c.write(0, 1);
-    try c.write(0, 2);
-    try c.write(0, 2);
-    try c.write(0, 3);
+    // 3 bytes from span A (line 1), 2 from span B (line 2), 1 from C (line 3).
+    const a = testSpan(0, 3, 1);
+    const b = testSpan(10, 4, 2);
+    const d = testSpan(20, 2, 3);
+    try c.write(0, a);
+    try c.write(0, a);
+    try c.write(0, a);
+    try c.write(0, b);
+    try c.write(0, b);
+    try c.write(0, d);
 
     try std.testing.expectEqual(1, c.getLine(0));
     try std.testing.expectEqual(1, c.getLine(2));
@@ -229,8 +254,12 @@ test "getLine resolves offsets across multiple runs" {
     try std.testing.expectEqual(2, c.getLine(4));
     try std.testing.expectEqual(3, c.getLine(5));
 
+    try std.testing.expectEqual(a, c.getSpan(0));
+    try std.testing.expectEqual(b, c.getSpan(4));
+    try std.testing.expectEqual(d, c.getSpan(5));
+
     // Only 3 runs stored, not 6 entries.
-    try std.testing.expectEqual(3, c.lines.items.len);
+    try std.testing.expectEqual(3, c.spans.items.len);
 }
 
 test "emitOpConstant switches to wide form after 256 constants" {
@@ -245,14 +274,15 @@ test "emitOpConstant switches to wide form after 256 constants" {
     // Fill up the first 256 constant slots with distinct values.
     // Use span values with unique start positions so deduplication
     // does not collapse them.
+    const s1 = testSpan(0, 0, 1);
     for (0..256) |i| {
-        try c.emitOpConstant(.op_match_string, .op_match_string_wide, .{ .span = .{ .start = i, .len = 0 } }, 1);
+        try c.emitOpConstant(.op_match_string, .op_match_string_wide, .{ .span = .{ .start = i, .len = 0 } }, s1);
     }
 
     // The 257th should use the wide form.
     const code_len_before = c.code.items.len;
     const lit = try pool.copyLiteral("wide");
-    try c.emitOpConstant(.op_match_string, .op_match_string_wide, .{ .obj = lit.asObj() }, 2);
+    try c.emitOpConstant(.op_match_string, .op_match_string_wide, .{ .obj = lit.asObj() }, testSpan(0, 0, 2));
 
     // Wide form is 4 bytes: opcode + 3-byte index.
     try std.testing.expectEqual(code_len_before + 4, c.code.items.len);

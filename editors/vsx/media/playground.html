@@ -1,0 +1,160 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta http-equiv="Content-Security-Policy"
+    content="default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline';">
+  <link rel="stylesheet" href="webview.css">
+</head>
+
+<body class="playground">
+  <div class="row">
+    <label for="rule">Rule</label>
+    <select id="rule"></select>
+  </div>
+  <div class="row">
+    <label for="input">Input</label>
+    <textarea id="input" spellcheck="false" placeholder="Type or paste input to match…"></textarea>
+  </div>
+  <div id="result">
+    <p class="empty">Pick a rule and type some input to test it.</p>
+  </div>
+
+  <script>
+    const vscode = acquireVsCodeApi();
+    const ruleSelect = document.getElementById("rule");
+    const inputBox = document.getElementById("input");
+    const resultEl = document.getElementById("result");
+
+    let lastInput = "";
+
+    window.addEventListener("message", (ev) => {
+      const msg = ev.data;
+      if (msg.kind === "init") {
+        renderRules(msg.rules, msg.selectedRule);
+        // Only overwrite the textarea if the host is seeding fresh
+        // state — otherwise we'd clobber the user's in-progress typing
+        // every time the document refreshes.
+        if (typeof msg.input === "string" && msg.input !== lastInput) {
+          inputBox.value = msg.input;
+          lastInput = msg.input;
+        }
+      } else if (msg.kind === "result") {
+        renderResult(msg.response);
+      } else if (msg.kind === "error") {
+        renderError(msg.message);
+      }
+    });
+
+    ruleSelect.addEventListener("change", () => {
+      vscode.postMessage({ kind: "select", ruleName: ruleSelect.value });
+    });
+
+    // Debounce so we don't flood the server with requests on every
+    // keystroke; 200 ms feels responsive without thrashing.
+    let inputTimer;
+    inputBox.addEventListener("input", () => {
+      lastInput = inputBox.value;
+      clearTimeout(inputTimer);
+      inputTimer = setTimeout(() => {
+        vscode.postMessage({ kind: "input", input: inputBox.value });
+      }, 200);
+    });
+
+    function renderRules(rules, selected) {
+      ruleSelect.innerHTML = "";
+      if (!rules || rules.length === 0) {
+        const opt = document.createElement("option");
+        opt.textContent = "(no rules defined)";
+        opt.disabled = true;
+        ruleSelect.appendChild(opt);
+        ruleSelect.disabled = true;
+        return;
+      }
+      ruleSelect.disabled = false;
+      for (const name of rules) {
+        const opt = document.createElement("option");
+        opt.value = name;
+        opt.textContent = name;
+        if (name === selected) opt.selected = true;
+        ruleSelect.appendChild(opt);
+      }
+    }
+
+    function renderResult(r) {
+      if (!r) {
+        resultEl.innerHTML = "";
+        return;
+      }
+      let html = "";
+      if (r.kind === "match") {
+        const consumedAll = r.end >= inputBox.value.length;
+        const klass = consumedAll ? "match" : "partial";
+        const summary = consumedAll
+          ? "Matched (consumed entire input)"
+          : `Matched ${r.end} of ${inputBox.value.length} bytes`;
+        html += `<div class="status ${klass}">${escapeHtml(summary)}</div>`;
+        html += `<h2>Input</h2>` + renderInputPreview(inputBox.value, r.end);
+        html += renderCaptures(r.captures);
+      } else if (r.kind === "no_match") {
+        html += `<div class="status no-match">No match</div>`;
+      } else if (r.kind === "compile_error") {
+        html += `<div class="status error">Grammar has compile errors</div>`;
+        html += `<ul class="errors">`;
+        for (const e of r.errors) {
+          html += `<li>line ${e.line + 1}, col ${e.column + 1}: ${escapeHtml(e.message)}</li>`;
+        }
+        html += `</ul>`;
+      } else if (r.kind === "no_such_rule") {
+        html += `<div class="status error">Rule "${escapeHtml(r.name)}" is not defined</div>`;
+      } else if (r.kind === "runtime_error") {
+        html += `<div class="status error">Runtime error during match</div>`;
+      }
+      resultEl.innerHTML = html;
+    }
+
+    function renderInputPreview(input, end) {
+      // Highlight the matched prefix; render the unconsumed remainder
+      // in normal text so the user sees exactly what wasn't eaten.
+      const matched = escapeHtml(input.slice(0, end));
+      const rest = escapeHtml(input.slice(end));
+      return `<div class="input-preview"><span class="matched">${matched}</span>${rest}</div>`;
+    }
+
+    function renderCaptures(captures) {
+      if (!captures || captures.length === 0) {
+        return `<h2>Captures</h2><p class="empty">(none)</p>`;
+      }
+      let html = `<h2>Captures</h2><table><tr>
+        <th class="slot">slot</th>
+        <th class="name">name</th>
+        <th class="range">range</th>
+        <th class="text">text</th>
+      </tr>`;
+      for (const c of captures) {
+        html += `<tr>
+          <td class="slot">${c.slot}</td>
+          <td class="name">${escapeHtml(c.name ?? "")}</td>
+          <td class="range">${c.start}\u2026${c.start + c.len}</td>
+          <td class="text">${escapeHtml(c.text)}</td>
+        </tr>`;
+      }
+      html += `</table>`;
+      return html;
+    }
+
+    function renderError(m) {
+      resultEl.innerHTML = `<div class="status error">${escapeHtml(m)}</div>`;
+    }
+
+    function escapeHtml(s) {
+      return String(s)
+        .replace(/&/g, "&amp;")
+        .replace(/</g, "&lt;")
+        .replace(/>/g, "&gt;")
+        .replace(/'/g, "&#39;")
+        .replace(/"/g, "&quot;");
+    }
+  </script>
+</body>
+</html>

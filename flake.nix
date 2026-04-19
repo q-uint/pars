@@ -27,7 +27,12 @@
     in
     {
       devShells.${system}.default = pkgs.mkShell {
-        buildInputs = [ zig ];
+        buildInputs = [
+          zig
+          # VSCode extension build: installs deps from editors/vsx/package.json
+          # and compiles TypeScript via `bunx tsc`.
+          pkgs.bun
+        ];
       };
     };
 }

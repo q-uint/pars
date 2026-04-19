@@ -1,0 +1,224 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+  <meta charset="UTF-8">
+  <meta http-equiv="Content-Security-Policy"
+    content="default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline';">
+  <link rel="stylesheet" href="webview.css">
+</head>
+
+<body class="bytecode">
+  <div id="toolbar">
+    <input id="filter" type="search" placeholder="Filter rules…" autocomplete="off">
+    <button id="expand-all" title="Expand every rule">Expand all</button>
+    <button id="collapse-all" title="Collapse every rule">Collapse all</button>
+  </div>
+  <div id="root">
+    <p class="empty">Waiting for disassembly…</p>
+  </div>
+  <script>
+    const vscode = acquireVsCodeApi();
+    const root = document.getElementById("root");
+    const filterInput = document.getElementById("filter");
+
+    let pendingCursor;
+
+    window.addEventListener("message", (ev) => {
+      const msg = ev.data;
+      if (msg.kind === "update") {
+        render(msg.response);
+        // The extension re-emits the cursor right after an update; this
+        // keeps the highlight consistent if messages ever arrive out of
+        // order.
+        if (pendingCursor !== undefined) highlightCursor(pendingCursor);
+      } else if (msg.kind === "error") {
+        renderError(msg.message);
+      } else if (msg.kind === "cursor") {
+        pendingCursor = msg.offset;
+        highlightCursor(msg.offset);
+      }
+    });
+
+    filterInput.addEventListener("input", () => applyFilter());
+    document.getElementById("expand-all").addEventListener("click", () =>
+      setAllOpen(true));
+    document.getElementById("collapse-all").addEventListener("click", () =>
+      setAllOpen(false));
+
+    function render(r) {
+      if (!r.ok) {
+        root.innerHTML = "<h2>Compile errors</h2><ul class=errors>" +
+          r.errors.map(e =>
+            "<li>line " + (e.line + 1) + ", col " + (e.column + 1) + ": " +
+            escapeHtml(e.message) + "</li>"
+          ).join("") + "</ul>";
+        return;
+      }
+      const ruleNames = r.rules.map(rule => rule.name);
+      let html =
+        `<details open data-rule="entry"><summary class=rule-header>entry</summary>` +
+        renderChunk(r.main, ruleNames) + `</details>`;
+      for (const rule of r.rules) {
+        html +=
+          `<details data-rule="${escapeHtml(rule.name)}">` +
+          `<summary class=rule-header>${escapeHtml(rule.name)} ` +
+          `<span class=index>#${rule.index}</span></summary>` +
+          (rule.disassembly
+            ? renderChunk(rule.disassembly, ruleNames)
+            : `<p class=empty>(undefined)</p>`) +
+          `</details>`;
+      }
+      root.innerHTML = html;
+
+      for (const row of root.querySelectorAll("tr.instr")) {
+        row.addEventListener("click", () => {
+          const span = JSON.parse(row.dataset.span);
+          vscode.postMessage({ kind: "reveal", span });
+        });
+      }
+      for (const anchor of root.querySelectorAll("a.jump")) {
+        anchor.addEventListener("click", (ev) => {
+          ev.preventDefault();
+          // Otherwise the enclosing row's reveal handler fires too.
+          ev.stopPropagation();
+          jumpTo(anchor);
+        });
+      }
+      applyFilter();
+    }
+
+    function renderChunk(d, ruleNames) {
+      const instrs = d.instructions.map(i => {
+        const span = JSON.stringify(i.span);
+        return `<tr class=instr data-span='${span}' data-offset='${i.offset}'>
+        <td class=offset>${hex(i.offset)}</td>
+        <td class=line>${i.span.line}</td>
+        <td class=op>${escapeHtml(i.op)}</td>
+        <td class=detail>${renderDetail(i, ruleNames)}</td>
+      </tr>`;
+      }).join("");
+      let html = "<table class=instrs>" + instrs + "</table>";
+      if (d.constants.length > 0) {
+        html += "<table class=consts>" + d.constants.map(c =>
+          `<tr>
+          <td class=offset>${c.index}</td>
+          <td class=kind>${escapeHtml(c.kind)}</td>
+          <td class=detail>${escapeHtml(c.display)}</td>
+        </tr>`
+        ).join("") + "</table>";
+      }
+      return html;
+    }
+
+    // Rewrite the raw operand string into something self-contained:
+    // OP_CALL gains the target rule name; jump ops get a clickable
+    // absolute target anchor in addition to the signed relative delta.
+    function renderDetail(i, ruleNames) {
+      if (i.op === "OP_CALL" || i.op === "OP_CALL_WIDE") {
+        const idx = parseInt(i.detail, 10);
+        const name = ruleNames[idx];
+        return escapeHtml(name ? idx + " " + name : i.detail);
+      }
+      if (isJumpOp(i.op)) {
+        const m = i.detail.match(/^(-?\d+)\s*->\s*(\d+)$/);
+        if (m) {
+          const rel = parseInt(m[1], 10);
+          const abs = parseInt(m[2], 10);
+          const sign = rel >= 0 ? "+" : "";
+          return `${sign}${rel} &rarr; <a class=jump href="#" data-target="${abs}">${hex(abs)}</a>`;
+        }
+      }
+      return escapeHtml(i.detail);
+    }
+
+    function isJumpOp(op) {
+      return op === "OP_CHOICE" || op === "OP_CHOICE_QUANT"
+        || op === "OP_CHOICE_LOOKAHEAD" || op === "OP_COMMIT"
+        || op === "OP_BACK_COMMIT";
+    }
+
+    // Highlight rows whose source span contains the given byte offset —
+    // i.e. every instruction emitted from the token the user's cursor is
+    // sitting on. Matches in collapsed rules force the <details> open so
+    // the highlight is actually visible; the first match scrolls into
+    // view only if it isn't already.
+    function highlightCursor(offset) {
+      const rows = root.querySelectorAll("tr.instr");
+      let first;
+      for (const row of rows) {
+        const span = JSON.parse(row.dataset.span);
+        const hit = span.len > 0
+          ? offset >= span.start && offset < span.start + span.len
+          : offset === span.start;
+        row.classList.toggle("current", hit);
+        if (hit && !first) first = row;
+      }
+      if (!first) return;
+      const details = first.closest("details");
+      if (details && !details.open) details.open = true;
+      const rect = first.getBoundingClientRect();
+      const inView = rect.top >= 0 && rect.bottom <= window.innerHeight;
+      if (!inView) first.scrollIntoView({ behavior: "smooth", block: "nearest" });
+    }
+
+    function jumpTo(anchor) {
+      // Stay within the enclosing chunk's instruction table so a jump in
+      // rule A cannot accidentally resolve to an offset in rule B.
+      const table = anchor.closest("table.instrs");
+      if (!table) return;
+      const row = table.querySelector(
+        `tr.instr[data-offset="${anchor.dataset.target}"]`
+      );
+      if (!row) return;
+      row.scrollIntoView({ behavior: "smooth", block: "center" });
+      row.classList.remove("flash");
+      // Force a reflow so the class re-add restarts the CSS transition.
+      void row.offsetWidth;
+      row.classList.add("flash");
+      setTimeout(() => row.classList.remove("flash"), 900);
+    }
+
+    // Hide rules whose name doesn't substring-match the filter. The entry
+    // chunk is always visible — it's the starting point for reading the
+    // disassembly. When the filter is non-empty, matching rules are also
+    // auto-expanded so the user doesn't have to click each one open.
+    function applyFilter() {
+      const q = filterInput.value.trim().toLowerCase();
+      for (const det of root.querySelectorAll("details")) {
+        const name = det.dataset.rule || "";
+        if (name === "entry") {
+          det.classList.remove("hidden");
+          continue;
+        }
+        const match = q === "" || name.toLowerCase().includes(q);
+        det.classList.toggle("hidden", !match);
+        if (match && q !== "") det.open = true;
+      }
+    }
+
+    function setAllOpen(open) {
+      for (const det of root.querySelectorAll("details")) {
+        if (det.classList.contains("hidden")) continue;
+        det.open = open;
+      }
+    }
+
+    function renderError(m) {
+      root.innerHTML = "<h2>Disassembly failed</h2><p class=errors>" + escapeHtml(m) + "</p>";
+    }
+
+    function hex(n) { return n.toString(16).padStart(4, "0"); }
+
+    function escapeHtml(s) {
+      return String(s)
+        .replace(/&/g, "&amp;")
+        .replace(/</g, "&lt;")
+        .replace(/>/g, "&gt;")
+        .replace(/'/g, "&#39;")
+        .replace(/"/g, "&quot;");
+    }
+  </script>
+</body>
+
+</html>

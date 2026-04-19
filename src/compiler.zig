@@ -744,7 +744,7 @@ pub const Compiler = struct {
             .op_match_charset,
             .op_match_charset_wide,
             .{ .obj = cs.asObj() },
-            self.parser.previous.line,
+            self.previousSpan(),
         ) catch {
             self.errorAtPrevious("Out of memory.");
         };
@@ -768,8 +768,17 @@ pub const Compiler = struct {
         }
     }
 
+    // The source span of the most recently consumed token. Every byte
+    // emitted while this token is `previous` inherits this span, which
+    // gives the disassembler and the VM's error reporter a precise
+    // click-target back into the source.
+    fn previousSpan(self: *Compiler) chunk_mod.SourceSpan {
+        const t = self.parser.previous;
+        return .{ .start = t.start, .len = t.len, .line = t.line };
+    }
+
     fn emitByte(self: *Compiler, byte: u8) void {
-        self.currentChunk().write(byte, self.parser.previous.line) catch {
+        self.currentChunk().write(byte, self.previousSpan()) catch {
             self.errorAtPrevious("Out of memory.");
         };
     }
@@ -1029,7 +1038,7 @@ pub const Compiler = struct {
             self.errorAtPrevious("Out of memory.");
             return;
         };
-        self.currentChunk().emitOpConstant(narrow, wide, .{ .obj = lit.asObj() }, self.parser.previous.line) catch {
+        self.currentChunk().emitOpConstant(narrow, wide, .{ .obj = lit.asObj() }, self.previousSpan()) catch {
             self.errorAtPrevious("Out of memory.");
         };
     }
@@ -1069,7 +1078,7 @@ pub const Compiler = struct {
             .op_cut_label,
             .op_cut_label_wide,
             .{ .obj = lit.asObj() },
-            self.parser.previous.line,
+            self.previousSpan(),
         ) catch {
             self.errorAtPrevious("Out of memory.");
         };

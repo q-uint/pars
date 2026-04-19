@@ -1,0 +1,62 @@
+{
+  "rule": {
+    "prefix": "rule",
+    "body": ["${1:name} = ${2:pattern};"],
+    "description": "Top-level rule declaration."
+  },
+  "rule with where block": {
+    "prefix": "rulew",
+    "body": [
+      "${1:name} = ${2:body}",
+      "  where",
+      "    ${3:sub} = ${4:pattern}",
+      "  end"
+    ],
+    "description": "Rule with a where-block for locally-scoped sub-rules."
+  },
+  "where block": {
+    "prefix": "where",
+    "body": ["where", "  ${1:sub} = ${2:pattern}", "end"],
+    "description": "Where-block: locally-scoped sub-rule bindings."
+  },
+  "capture": {
+    "prefix": "cap",
+    "body": ["<${1:name}: ${2:pattern}>"],
+    "description": "Named capture; the bound name can be used later in the same rule as a back-reference."
+  },
+  "use import": {
+    "prefix": "use",
+    "body": ["use \"${1:path}\";"],
+    "description": "Import rules from another module."
+  },
+  "charset": {
+    "prefix": "cs",
+    "body": ["['${1:a}'-'${2:z}']"],
+    "description": "Character-range charset."
+  },
+  "choice": {
+    "prefix": "alt",
+    "body": ["${1:a} / ${2:b}"],
+    "description": "Ordered choice: try the left, fall back to the right."
+  },
+  "negative lookahead": {
+    "prefix": "neg",
+    "body": ["!${1:pattern}"],
+    "description": "Negative lookahead: succeeds when pattern fails, consumes nothing."
+  },
+  "positive lookahead": {
+    "prefix": "pos",
+    "body": ["&${1:pattern}"],
+    "description": "Positive lookahead: succeeds when pattern succeeds, consumes nothing."
+  },
+  "cut label": {
+    "prefix": "cut",
+    "body": ["^\"${1:expected something}\""],
+    "description": "Cut marker with a labelled failure message."
+  },
+  "bounded quantifier": {
+    "prefix": "bq",
+    "body": ["${1:pattern}{${2:3},${3:5}}"],
+    "description": "Bounded repetition: between min and max occurrences."
+  }
+}

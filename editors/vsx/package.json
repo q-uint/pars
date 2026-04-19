@@ -1,0 +1,107 @@
+{
+  "name": "pars",
+  "displayName": "pars",
+  "description": "Language support for pars grammar files",
+  "version": "0.0.1",
+  "publisher": "q-uint",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/q-uint/pars"
+  },
+  "engines": {
+    "vscode": "^1.85.0"
+  },
+  "categories": [
+    "Programming Languages"
+  ],
+  "main": "./out/extension.js",
+  "contributes": {
+    "languages": [
+      {
+        "id": "pars",
+        "aliases": [
+          "pars",
+          "Pars"
+        ],
+        "extensions": [
+          ".pars"
+        ],
+        "configuration": "./languages/pars.json",
+        "icon": {
+          "light": "./icons/pars.svg",
+          "dark": "./icons/pars.svg"
+        }
+      }
+    ],
+    "snippets": [
+      {
+        "language": "pars",
+        "path": "./snippets/pars.json"
+      }
+    ],
+    "commands": [
+      {
+        "command": "pars.showBytecode",
+        "title": "pars: Show Bytecode",
+        "icon": "$(file-binary)"
+      },
+      {
+        "command": "pars.runRule",
+        "title": "pars: Run Rule",
+        "icon": "$(play)"
+      }
+    ],
+    "menus": {
+      "editor/title": [
+        {
+          "command": "pars.showBytecode",
+          "when": "resourceLangId == pars",
+          "group": "navigation"
+        },
+        {
+          "command": "pars.runRule",
+          "when": "resourceLangId == pars",
+          "group": "navigation"
+        }
+      ],
+      "commandPalette": [
+        {
+          "command": "pars.showBytecode",
+          "when": "resourceLangId == pars"
+        },
+        {
+          "command": "pars.runRule",
+          "when": "resourceLangId == pars"
+        }
+      ]
+    },
+    "configuration": {
+      "title": "pars",
+      "properties": {
+        "pars.serverPath": {
+          "type": "string",
+          "default": "",
+          "description": "Absolute path to the pars-lsp binary. If empty, the extension looks for 'pars-lsp' on PATH."
+        },
+        "pars.trace.server": {
+          "type": "string",
+          "enum": ["off", "messages", "verbose"],
+          "default": "off",
+          "description": "Trace JSON-RPC traffic between the client and pars-lsp."
+        }
+      }
+    }
+  },
+  "scripts": {
+    "compile": "bun build src/extension.ts --outfile=out/extension.js --target=node --format=cjs --external=vscode",
+    "watch": "bun build src/extension.ts --outfile=out/extension.js --target=node --format=cjs --external=vscode --watch"
+  },
+  "dependencies": {
+    "vscode-languageclient": "^9.0.1"
+  },
+  "devDependencies": {
+    "@types/node": "^20.0.0",
+    "@types/vscode": "^1.85.0",
+    "typescript": "^5.3.0"
+  }
+}

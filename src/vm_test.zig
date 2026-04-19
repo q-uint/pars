@@ -8,7 +8,7 @@ const InterpretResult = vm_mod.InterpretResult;
 
 fn haltChunk(alloc: std.mem.Allocator) !Chunk {
     var c = Chunk.init(alloc);
-    try c.write(@intFromEnum(OpCode.op_halt), 1);
+    try c.write(@intFromEnum(OpCode.op_halt), .{ .start = 0, .len = 0, .line = 1 });
     return c;
 }
 

@@ -1,3 +1,5 @@
+<img src="assets/logo.svg" width="64" height="64" align="right" alt="" />
+
 # pars
 
 A bytecode virtual machine for PEG grammars. Grammars compile to a
@@ -132,6 +134,36 @@ Rules defined in the REPL persist across lines.
 | `:clear`        | clear the input                 |
 | `:help`         | list commands                   |
 | `:exit`/`:quit` | exit                            |
+
+## Editor support
+
+A VSCode extension lives in [`editors/vsx/`](editors/vsx/). It bundles
+the `pars-lsp` language server, which talks JSON-RPC over stdio and
+provides:
+
+- syntax-aware diagnostics (scanner and compiler errors)
+- semantic token highlighting
+- **go-to-definition** on rule references and capture back-references
+- **hover** showing a rule's body (or a note for captures)
+- **document outline** of top-level rules
+- **inlay hints** flagging identifiers that resolve to capture
+  back-references rather than rule calls
+- snippets for common declarations (`rule`, `rulew`, `where`, `cap`,
+  `alt`, `neg`, `pos`, `cut`, `bq`, `use`, `cs`)
+
+### Install
+
+```
+./editors/vsx/install.sh
+```
+
+Builds `pars-lsp` in ReleaseSafe, bundles it into the extension, packs
+a `.vsix`, and installs it into VSCode via the `code` CLI. Pass
+`--no-install` to build only, or `--no-build` to reuse an existing
+`zig-out/bin/pars-lsp`.
+
+To use a custom server path instead of the bundled one, set
+`pars.serverPath` in VSCode settings.
 
 ## Building
 

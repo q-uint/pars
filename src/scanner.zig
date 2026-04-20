@@ -250,7 +250,7 @@ pub const Scanner = struct {
         if (self.peek() == '"' and self.peekNext() == '"') {
             _ = self.advance();
             _ = self.advance();
-            return self.tripleString();
+            return self.tripleQuotedBody(.string, "Unterminated triple-quoted string.");
         }
 
         while (self.peek() != '"' and !self.isAtEnd()) {
@@ -267,12 +267,18 @@ pub const Scanner = struct {
         return self.makeToken(.string);
     }
 
-    fn tripleString(self: *Scanner) Token {
+    fn peekTripleQuote(self: *const Scanner) bool {
+        return self.peek() == '"' and self.peekNext() == '"' and
+            self.current + 2 < self.source.len and
+            self.source[self.current + 2] == '"';
+    }
+
+    /// Scans the body of a triple-quoted string, starting just past the
+    /// opening `"""`. On close, returns a token of `success_type`; on EOF
+    /// before close, returns an error token with `unterminated_msg`.
+    fn tripleQuotedBody(self: *Scanner, success_type: TokenType, unterminated_msg: []const u8) Token {
         while (!self.isAtEnd()) {
-            if (self.peek() == '"' and self.peekNext() == '"' and
-                self.current + 2 < self.source.len and
-                self.source[self.current + 2] == '"')
-            {
+            if (self.peekTripleQuote()) {
                 // A run of four or more `"` means the leading quotes
                 // belong to the body: only the final three close the
                 // string. This lets a body end in trailing quotes
@@ -287,7 +293,7 @@ pub const Scanner = struct {
                 _ = self.advance();
                 _ = self.advance();
                 _ = self.advance();
-                return self.makeToken(.string);
+                return self.makeToken(success_type);
             }
             if (self.peek() == '\n') {
                 self.line += 1;
@@ -295,7 +301,7 @@ pub const Scanner = struct {
             }
             _ = self.advance();
         }
-        return self.errorToken("Unterminated triple-quoted string.");
+        return self.errorToken(unterminated_msg);
     }
 
     fn number(self: *Scanner) Token {
@@ -307,42 +313,14 @@ pub const Scanner = struct {
         if (!isAlpha(self.peek())) return self.errorToken("Expected tag name after '@'.");
         while (isAlpha(self.peek()) or isDigit(self.peek())) _ = self.advance();
 
-        if (!(self.peek() == '"' and self.peekNext() == '"' and
-            self.current + 2 < self.source.len and
-            self.source[self.current + 2] == '"'))
-        {
+        if (!self.peekTripleQuote()) {
             return self.errorToken("Expected '\"\"\"' after tag name.");
         }
         _ = self.advance();
         _ = self.advance();
         _ = self.advance();
 
-        while (!self.isAtEnd()) {
-            if (self.peek() == '"' and self.peekNext() == '"' and
-                self.current + 2 < self.source.len and
-                self.source[self.current + 2] == '"')
-            {
-                // Same trailing-quote rule as plain triple strings:
-                // only close when the next byte isn't another `"`, so
-                // a body can end in one or more quote characters.
-                if (self.current + 3 < self.source.len and
-                    self.source[self.current + 3] == '"')
-                {
-                    _ = self.advance();
-                    continue;
-                }
-                _ = self.advance();
-                _ = self.advance();
-                _ = self.advance();
-                return self.makeToken(.tagged_string);
-            }
-            if (self.peek() == '\n') {
-                self.line += 1;
-                self.line_start = self.current + 1;
-            }
-            _ = self.advance();
-        }
-        return self.errorToken("Unterminated tagged string.");
+        return self.tripleQuotedBody(.tagged_string, "Unterminated tagged string.");
     }
 
     fn charLiteral(self: *Scanner) Token {

@@ -786,10 +786,88 @@ fn parsesWithStdPars(alloc: std.mem.Allocator, dir: []const u8, name: []const u8
 
     var machine = VmTest.init(alloc);
     defer machine.deinit();
-    return machine.match("use \"std/pars\";\nprogram", source);
+    return machine.match("use \"std/pars_grammar\";\nprogram", source);
 }
 
-test "std/pars parses every shipped grammar" {
+test "abnf block matches input end-to-end" {
+    try expectMatch(
+        "use \"std/abnf\";\n" ++
+            "@abnf\"\"\"" ++
+            "greeting = \"hello\" SP name\n" ++
+            "name     = 1*ALPHA\n" ++
+            "\"\"\"\n" ++
+            "entry = greeting;",
+        "hello world",
+        .ok,
+    );
+}
+
+test "abnf block: case-insensitive string matches mixed case" {
+    try expectMatch(
+        "@abnf\"\"\"foo = \"hello\"\n\"\"\"\n" ++
+            "entry = foo;",
+        "HELLO",
+        .ok,
+    );
+}
+
+test "abnf block: case-sensitive string rejects mixed case" {
+    try expectMatch(
+        "@abnf\"\"\"foo = %s\"hello\"\n\"\"\"\n" ++
+            "entry = foo;",
+        "HELLO",
+        .no_match,
+    );
+}
+
+test "abnf block: numeric range matches" {
+    try expectMatch(
+        "@abnf\"\"\"digit = %x30-39\n\"\"\"\n" ++
+            "entry = digit digit digit;",
+        "123",
+        .ok,
+    );
+}
+
+test "abnf block: longest-match wins for prefix-sharing operators" {
+    // With ordered choice, "<" would win on input "<=", leaving "=" unmatched.
+    // With auto-#[longest], "<=" wins.
+    try expectMatch(
+        "@abnf\"\"\"op = \"<\" / \"<=\"\n\"\"\"\n" ++
+            "entry = op;",
+        "<=",
+        .ok,
+    );
+}
+
+test "std/abnf_grammar parses the URI ABNF example" {
+    const uri_abnf =
+        "URI         = scheme \":\" hier-part [ \"?\" query ] [ \"#\" fragment ]\n" ++
+        "scheme      = ALPHA *( ALPHA / DIGIT / \"+\" / \"-\" / \".\" )\n" ++
+        "hier-part   = \"//\" authority path-abempty\n" ++
+        "            / path-absolute\n" ++
+        "            / path-rootless\n" ++
+        "            / path-empty\n";
+    try expectMatch("use \"std/abnf_grammar\";\nrulelist", uri_abnf, .ok);
+}
+
+test "std/abnf_grammar parses core-rule forms" {
+    try expectMatch(
+        "use \"std/abnf_grammar\";\nrulelist",
+        "a = %x41\nb = %x30-39\nc = %x41.42.43\nd = %d65\ne = %b1000001\nf = %s\"ok\"\n",
+        .ok,
+    );
+}
+
+test "std/abnf_grammar rejects malformed input" {
+    try expectMatch(
+        "use \"std/abnf_grammar\";\nrulelist",
+        "bogus junk without equal sign\n",
+        .no_match,
+    );
+}
+
+test "std/pars_grammar parses every shipped grammar" {
     const alloc = std.testing.allocator;
     const io = std.testing.io;
     var failed: usize = 0;
@@ -804,7 +882,7 @@ test "std/pars parses every shipped grammar" {
             const result = try parsesWithStdPars(alloc, dir, entry.name);
             if (result != .ok) {
                 std.debug.print(
-                    "std/pars failed to parse {s}/{s}: {s}\n",
+                    "std/pars_grammar failed to parse {s}/{s}: {s}\n",
                     .{ dir, entry.name, @tagName(result) },
                 );
                 failed += 1;

@@ -123,7 +123,18 @@ rule_decl = (attr_list sp)? name sp '=' sp expr (sp where_blk (sp ';')? / sp ';'
 
 use_decl = "use" word_end sp string (sp ';')?;
 
+-- Tagged-string declaration: `@<tag>"""..."""`. The body is captured
+-- verbatim between the opening and closing triple-quotes; the tag
+-- identifies which sub-language parses the body (currently only
+-- `@abnf`).
+
+tagged_decl = '@' ident triple_body
+  where
+    tq          = '"' '"' '"';
+    triple_body = tq (!tq .)* tq
+  end
+
 -- Top level. `!.` anchors the match at end of input so trailing
 -- garbage is rejected rather than silently accepted.
 
-program = sp ((use_decl / rule_decl) sp)* !.;
+program = sp ((use_decl / tagged_decl / rule_decl) sp)* !.;

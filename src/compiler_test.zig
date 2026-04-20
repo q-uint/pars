@@ -189,6 +189,147 @@ test "use std/abnf populates DIGIT in rule table" {
     try std.testing.expect(result.rules.get("ALPHA") != null);
 }
 
+test "use std/abnf_grammar compiles and registers its rules" {
+    const alloc = std.testing.allocator;
+    var result = try compileForTest(alloc, "use \"std/abnf_grammar\";");
+    defer result.deinit();
+    try std.testing.expect(result.ok);
+    try std.testing.expect(result.rules.get("rulelist") != null);
+    try std.testing.expect(result.rules.get("rule") != null);
+    try std.testing.expect(result.rules.get("alternation") != null);
+}
+
+test "use std/pars_grammar compiles and registers its rules" {
+    const alloc = std.testing.allocator;
+    var result = try compileForTest(alloc, "use \"std/pars_grammar\";");
+    defer result.deinit();
+    try std.testing.expect(result.ok);
+    try std.testing.expect(result.rules.get("program") != null);
+    try std.testing.expect(result.rules.get("rule_decl") != null);
+}
+
+test "abnf block: simple rule is registered" {
+    const alloc = std.testing.allocator;
+    var result = try compileForTest(alloc, "@abnf\"\"\"foo = \"bar\"\n\"\"\"");
+    defer result.deinit();
+    try std.testing.expect(result.ok);
+    try std.testing.expect(result.rules.get("foo") != null);
+}
+
+test "abnf block: host-file rule can reference a block-defined rule" {
+    const alloc = std.testing.allocator;
+    const src =
+        "@abnf\"\"\"foo = \"bar\"\n\"\"\"\n" ++
+        "entry = foo;";
+    var result = try compileForTest(alloc, src);
+    defer result.deinit();
+    try std.testing.expect(result.ok);
+    try std.testing.expect(result.rules.get("foo") != null);
+    try std.testing.expect(result.rules.get("entry") != null);
+}
+
+test "abnf block: hyphenated rule name is mangled and callable" {
+    const alloc = std.testing.allocator;
+    const src =
+        "@abnf\"\"\"hier-part = \"//\"\n\"\"\"\n" ++
+        "entry = hier_part;";
+    var result = try compileForTest(alloc, src);
+    defer result.deinit();
+    try std.testing.expect(result.ok);
+    try std.testing.expect(result.rules.get("hier_part") != null);
+}
+
+test "abnf block: unknown tag is rejected" {
+    const alloc = std.testing.allocator;
+    var result = try compileForTest(alloc, "@regex\"\"\"whatever\"\"\"");
+    defer result.deinit();
+    try std.testing.expect(!result.ok);
+    const errs = result.compiler.getErrors();
+    try std.testing.expect(errs.len >= 1);
+}
+
+test "abnf block: prose-val is rejected" {
+    const alloc = std.testing.allocator;
+    var result = try compileForTest(alloc, "@abnf\"\"\"foo = <prose>\n\"\"\"");
+    defer result.deinit();
+    try std.testing.expect(!result.ok);
+}
+
+test "abnf block: out-of-range num-val is rejected" {
+    const alloc = std.testing.allocator;
+    var result = try compileForTest(alloc, "@abnf\"\"\"foo = %x100\n\"\"\"");
+    defer result.deinit();
+    try std.testing.expect(!result.ok);
+}
+
+test "abnf block: case-collision is rejected" {
+    const alloc = std.testing.allocator;
+    const src =
+        "@abnf\"\"\"" ++
+        "URI = \"a\"\n" ++
+        "uri = \"b\"\n" ++
+        "\"\"\"";
+    var result = try compileForTest(alloc, src);
+    defer result.deinit();
+    try std.testing.expect(!result.ok);
+}
+
+test "abnf block: incremental =/ merges rules" {
+    const alloc = std.testing.allocator;
+    const src =
+        "@abnf\"\"\"" ++
+        "x = \"a\"\n" ++
+        "x =/ \"b\"\n" ++
+        "\"\"\"";
+    var result = try compileForTest(alloc, src);
+    defer result.deinit();
+    try std.testing.expect(result.ok);
+    try std.testing.expect(result.rules.get("x") != null);
+}
+
+test "abnf block: direct left recursion auto-attaches #[lr]" {
+    const alloc = std.testing.allocator;
+    const src =
+        "@abnf\"\"\"" ++
+        "expr = expr \"+\" term / term\n" ++
+        "term = \"1\"\n" ++
+        "\"\"\"";
+    var result = try compileForTest(alloc, src);
+    defer result.deinit();
+    try std.testing.expect(result.ok);
+    try std.testing.expect(result.rules.get("expr") != null);
+}
+
+test "abnf block: core rules reachable when host has explicit use std/abnf" {
+    const alloc = std.testing.allocator;
+    const src =
+        "use \"std/abnf\";\n" ++
+        "@abnf\"\"\"foo = 3DIGIT\n\"\"\"\n" ++
+        "entry = foo;";
+    var result = try compileForTest(alloc, src);
+    defer result.deinit();
+    try std.testing.expect(result.ok);
+    try std.testing.expect(result.rules.get("foo") != null);
+    try std.testing.expect(result.rules.get("DIGIT") != null);
+}
+
+test "abnf block: error span points inside the block, not at the block header" {
+    const alloc = std.testing.allocator;
+    // `%x100` is on line 2 of the host file, inside the block body.
+    const src =
+        "@abnf\"\"\"\n" ++
+        "foo = %x100\n" ++
+        "\"\"\"";
+    var result = try compileForTest(alloc, src);
+    defer result.deinit();
+    try std.testing.expect(!result.ok);
+    const errs = result.compiler.getErrors();
+    try std.testing.expect(errs.len >= 1);
+    // The error should report line 2 (the `foo = %x100` line in the
+    // host file), not line 1 (the @abnf header).
+    try std.testing.expectEqual(@as(usize, 2), errs[0].line);
+}
+
 test "use unknown module is a compile error" {
     const alloc = std.testing.allocator;
     var result = try compileForTest(alloc, "use \"std/bogus\";");

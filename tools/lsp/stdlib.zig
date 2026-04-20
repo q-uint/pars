@@ -70,7 +70,8 @@ pub fn resolveModulePath(alloc: Allocator, io: Io, module: []const u8) !?[]u8 {
 
 fn moduleFilename(module: []const u8) ?[]const u8 {
     if (std.mem.eql(u8, module, "std/abnf")) return "abnf.pars";
-    if (std.mem.eql(u8, module, "std/pars")) return "pars.pars";
+    if (std.mem.eql(u8, module, "std/abnf_grammar")) return "abnf_grammar.pars";
+    if (std.mem.eql(u8, module, "std/pars_grammar")) return "pars_grammar.pars";
     return null;
 }
 
@@ -136,9 +137,10 @@ test "pathToFileUri: spaces are percent-encoded" {
     try std.testing.expectEqualStrings("file:///a%20b/c.pars", uri);
 }
 
-test "moduleFilename recognizes std/abnf and std/pars" {
+test "moduleFilename recognizes shipped modules" {
     try std.testing.expectEqualStrings("abnf.pars", moduleFilename("std/abnf").?);
-    try std.testing.expectEqualStrings("pars.pars", moduleFilename("std/pars").?);
+    try std.testing.expectEqualStrings("abnf_grammar.pars", moduleFilename("std/abnf_grammar").?);
+    try std.testing.expectEqualStrings("pars_grammar.pars", moduleFilename("std/pars_grammar").?);
     try std.testing.expect(moduleFilename("std/unknown") == null);
     try std.testing.expect(moduleFilename("relative/thing") == null);
 }

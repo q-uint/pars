@@ -6,6 +6,6 @@
 --   pars examples/grammar.pars examples/ipv4.pars
 --   pars examples/grammar.pars examples/grammar.pars
 
-use "std/pars";
+use "std/pars_grammar";
 
 valid = program;

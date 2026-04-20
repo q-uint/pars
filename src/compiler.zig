@@ -10,6 +10,8 @@ const compile_error_mod = @import("compile_error.zig");
 const literal = @import("literal.zig");
 const pratt = @import("pratt.zig");
 const peephole = @import("peephole.zig");
+const abnf = @import("abnf.zig");
+const abnf_lower = @import("abnf_lower.zig");
 const Chunk = chunk_mod.Chunk;
 const OpCode = chunk_mod.OpCode;
 const Value = value_mod.Value;
@@ -70,6 +72,11 @@ pub const Compiler = struct {
     // runtime. Freed at the start of each compile and in deinit; errors
     // whose messages are string literals are not tracked here.
     owned_error_messages: std.ArrayList([]u8) = .empty,
+    // Backing buffers for `@abnf"""..."""` blocks: the lowered pars
+    // source is fed to a sub-compiler, which inserts rule names that
+    // slice into this source. The source must outlive the rule table,
+    // so we keep the buffers until the outer compiler deinits.
+    owned_abnf_sources: std.ArrayList([]u8) = .empty,
     alloc: std.mem.Allocator,
     compiling_source: []const u8 = &.{},
     compiling_rules: ?*RuleTable = null,
@@ -242,6 +249,8 @@ pub const Compiler = struct {
         self.errors.clearRetainingCapacity();
         for (self.owned_error_messages.items) |buf| self.alloc.free(buf);
         self.owned_error_messages.clearRetainingCapacity();
+        for (self.owned_abnf_sources.items) |buf| self.alloc.free(buf);
+        self.owned_abnf_sources.clearRetainingCapacity();
 
         self.parser.had_error = false;
         self.parser.panic_mode = false;
@@ -288,6 +297,9 @@ pub const Compiler = struct {
         for (self.owned_error_messages.items) |buf| self.alloc.free(buf);
         self.owned_error_messages.deinit(self.alloc);
         self.owned_error_messages = .empty;
+        for (self.owned_abnf_sources.items) |buf| self.alloc.free(buf);
+        self.owned_abnf_sources.deinit(self.alloc);
+        self.owned_abnf_sources = .empty;
     }
 
     pub fn advance(self: *Compiler) void {
@@ -359,6 +371,9 @@ pub const Compiler = struct {
         if (self.check(.kw_use)) {
             self.advance();
             self.useDeclaration();
+        } else if (self.check(.tagged_string)) {
+            self.advance();
+            self.taggedStringDeclaration();
         } else if (self.check(.hash)) {
             // `#[longest](...)` is an expression form that can appear at
             // top level (compiled into the main chunk). Everything else
@@ -420,8 +435,231 @@ pub const Compiler = struct {
     // if the name is not a known stdlib module.
     fn resolveStdlib(path: []const u8) ?[]const u8 {
         if (std.mem.eql(u8, path, "std/abnf")) return pars_stdlib.abnf;
-        if (std.mem.eql(u8, path, "std/pars")) return pars_stdlib.pars;
+        if (std.mem.eql(u8, path, "std/abnf_grammar")) return pars_stdlib.abnf_grammar;
+        if (std.mem.eql(u8, path, "std/pars_grammar")) return pars_stdlib.pars_grammar;
         return null;
+    }
+
+    // Handle on a sub-compilation that merges its rules into the current
+    // rule table. Discards the sub's main chunk. Caller inspects `.ok`
+    // and `.sub.getErrors()` before calling `deinit`.
+    const SubCompile = struct {
+        sub: Compiler,
+        chunk: Chunk,
+        ok: bool,
+
+        fn deinit(self: *SubCompile) void {
+            self.sub.deinit();
+            self.chunk.deinit();
+        }
+    };
+
+    fn subCompileIntoSharedRules(self: *Compiler, src: []const u8) SubCompile {
+        var sub = Compiler.init(self.alloc);
+        var dummy = Chunk.init(self.alloc);
+        const ok = sub.compile(src, &dummy, self.compiling_rules.?, self.obj_pool);
+        return .{ .sub = sub, .chunk = dummy, .ok = ok };
+    }
+
+    // Extract the tag name and body from a `@<tag>"""..."""` lexeme.
+    // Caller guarantees the lexeme has this shape (enforced by the
+    // scanner). `tag` is a slice into the lexeme; `body` ditto.
+    const TaggedStringParts = struct {
+        tag: []const u8,
+        body: []const u8,
+        body_offset_in_token: usize,
+    };
+
+    fn splitTaggedString(lex: []const u8) TaggedStringParts {
+        // Scanner guarantees: leading '@', identifier, opening `"""`,
+        // closing `"""`.
+        std.debug.assert(lex.len >= 1 + 3 + 3 and lex[0] == '@');
+        std.debug.assert(std.mem.endsWith(u8, lex, "\"\"\""));
+        var i: usize = 1;
+        while (i < lex.len and lex[i] != '"') : (i += 1) {}
+        const tag = lex[1..i];
+        std.debug.assert(i + 3 <= lex.len - 3);
+        std.debug.assert(std.mem.eql(u8, lex[i .. i + 3], "\"\"\""));
+        const body_start = i + 3;
+        const body_end = lex.len - 3;
+        return .{
+            .tag = tag,
+            .body = lex[body_start..body_end],
+            .body_offset_in_token = body_start,
+        };
+    }
+
+    // Compile an `@abnf"""..."""` block. The token lives in
+    // self.parser.previous; the body is parsed as ABNF, lowered to
+    // pars source, and sub-compiled into the shared rule table.
+    fn taggedStringDeclaration(self: *Compiler) void {
+        // Only reachable from declaration() under compile(), which sets
+        // compiling_rules before the parse loop.
+        std.debug.assert(self.compiling_rules != null);
+        const token = self.parser.previous;
+        const parts = splitTaggedString(token.lexeme);
+        const body_host_offset: u32 = @intCast(token.start + parts.body_offset_in_token);
+
+        if (!std.mem.eql(u8, parts.tag, "abnf")) {
+            self.errorAtPreviousFmt("Unknown tagged-string prefix '@{s}'.", .{parts.tag});
+            return;
+        }
+
+        // Parse ABNF.
+        var parser = abnf.Parser.init(self.alloc, parts.body);
+        defer parser.deinit();
+        const parsed = parser.parse() catch {
+            self.errorAtPrevious("Out of memory parsing ABNF block.");
+            return;
+        };
+
+        if (!parsed.ok()) {
+            for (parsed.errors) |e| {
+                self.reportAbnfErrorAtAbnfSpan(body_host_offset, e.span, e.message, "ABNF parse error");
+            }
+            return;
+        }
+
+        // Lower.
+        var lowered = abnf_lower.lower(self.alloc, parsed.rulelist) catch {
+            self.errorAtPrevious("Out of memory lowering ABNF block.");
+            return;
+        };
+        defer lowered.deinit();
+
+        if (!lowered.ok()) {
+            for (lowered.errors) |e| {
+                self.reportAbnfErrorAtAbnfSpan(body_host_offset, e.span, e.message, "ABNF lowering error");
+            }
+            return;
+        }
+
+        // Take ownership of the generated source: rule names inserted
+        // into the shared rule table by the sub-compiler slice into
+        // this buffer, so it must outlive `lowered` (which the arena
+        // would otherwise free on scope exit).
+        const owned_source = self.alloc.dupe(u8, lowered.source) catch {
+            self.errorAtPrevious("Out of memory.");
+            return;
+        };
+        self.owned_abnf_sources.append(self.alloc, owned_source) catch {
+            self.alloc.free(owned_source);
+            self.errorAtPrevious("Out of memory.");
+            return;
+        };
+
+        // Sub-compile the generated pars source into the shared rule
+        // table. Errors from the sub-compiler use positions in the
+        // generated source; the span map translates them back to ABNF
+        // spans, and those in turn translate to host-file offsets.
+        var sc = self.subCompileIntoSharedRules(owned_source);
+        defer sc.deinit();
+        if (!sc.ok) {
+            for (sc.sub.getErrors()) |e| {
+                const abnf_span = lookupAbnfSpan(lowered.spans, @intCast(e.start));
+                if (abnf_span) |sp| {
+                    self.reportAbnfErrorAtAbnfSpan(body_host_offset, sp, e.message, "ABNF block");
+                } else {
+                    self.reportAbnfErrorAtToken(token, e.message, "ABNF block");
+                }
+            }
+        }
+    }
+
+    // Report an ABNF-block error whose position in the ABNF body is
+    // known. Translates the ABNF offset into a host-source offset and
+    // computes line/column, so the diagnostic points at the exact byte
+    // inside the `@abnf"""..."""` body.
+    fn reportAbnfErrorAtAbnfSpan(
+        self: *Compiler,
+        body_host_offset: u32,
+        span: abnf.Span,
+        message: []const u8,
+        kind: []const u8,
+    ) void {
+        const host_start = body_host_offset + span.start;
+        const lc = computeLineCol(self.compiling_source, host_start);
+        self.appendAbnfError(.{
+            .line = lc.line,
+            .column = lc.column,
+            .start = host_start,
+            .len = @max(span.len, 1),
+            .at_eof = false,
+        }, message, kind);
+    }
+
+    // Fallback: report at the whole `@abnf` token position.
+    fn reportAbnfErrorAtToken(self: *Compiler, token: Token, message: []const u8, kind: []const u8) void {
+        self.appendAbnfError(.{
+            .line = token.line,
+            .column = token.column,
+            .start = token.start,
+            .len = token.len,
+            .at_eof = false,
+        }, message, kind);
+    }
+
+    const ErrorLocation = struct {
+        line: usize,
+        column: usize,
+        start: usize,
+        len: usize,
+        at_eof: bool,
+    };
+
+    // Append a diagnostic for an `@abnf` block phase directly, without
+    // going through errorAt's panic-mode guard. Block-phase errors
+    // come from a sub-phase and are semantically independent, so they
+    // should all surface rather than be suppressed after the first.
+    fn appendAbnfError(self: *Compiler, loc: ErrorLocation, message: []const u8, kind: []const u8) void {
+        const buf = std.fmt.allocPrint(self.alloc, "{s}: {s}", .{ kind, message }) catch {
+            self.parser.had_error = true;
+            return;
+        };
+        self.owned_error_messages.append(self.alloc, buf) catch {
+            self.alloc.free(buf);
+            self.parser.had_error = true;
+            return;
+        };
+        self.errors.append(self.alloc, .{
+            .line = loc.line,
+            .column = loc.column,
+            .start = loc.start,
+            .len = loc.len,
+            .message = buf,
+            .at_eof = loc.at_eof,
+        }) catch {};
+        self.parser.had_error = true;
+    }
+
+    // Binary-search the span map for the entry whose generated-source
+    // range contains `gen_offset`, and return its ABNF span. Returns
+    // null if `gen_offset` precedes the first mapped byte (e.g. in the
+    // injected `use "std/abnf";` preamble).
+    fn lookupAbnfSpan(spans: []const abnf_lower.SpanMapping, gen_offset: u32) ?abnf.Span {
+        var lo: usize = 0;
+        var hi: usize = spans.len;
+        while (lo < hi) {
+            const mid = (lo + hi) / 2;
+            if (spans[mid].gen_offset <= gen_offset) lo = mid + 1 else hi = mid;
+        }
+        if (lo == 0) return null;
+        return spans[lo - 1].abnf_span;
+    }
+
+    // Walk `source` up to `offset` and compute 1-based line and column.
+    fn computeLineCol(source: []const u8, offset: usize) struct { line: usize, column: usize } {
+        var line: usize = 1;
+        var line_start: usize = 0;
+        var i: usize = 0;
+        const clamped = @min(offset, source.len);
+        while (i < clamped) : (i += 1) {
+            if (source[i] == '\n') {
+                line += 1;
+                line_start = i + 1;
+            }
+        }
+        return .{ .line = line, .column = clamped - line_start + 1 };
     }
 
     // Compile and merge a module's rules into the current rule table.
@@ -439,13 +677,9 @@ pub const Compiler = struct {
             return;
         };
 
-        var sub = Compiler.init(self.alloc);
-        defer sub.deinit();
-        var dummy = Chunk.init(self.alloc);
-        defer dummy.deinit();
-        if (!sub.compile(src, &dummy, self.compiling_rules.?, self.obj_pool)) {
-            self.errorAtPrevious("Module failed to compile.");
-        }
+        var sc = self.subCompileIntoSharedRules(src);
+        defer sc.deinit();
+        if (!sc.ok) self.errorAtPrevious("Module failed to compile.");
 
         _ = self.match(.semicolon);
     }

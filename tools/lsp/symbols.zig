@@ -33,6 +33,7 @@ const Scanner = pars.scanner.Scanner;
 const Token = pars.scanner.Token;
 const TokenType = pars.scanner.TokenType;
 const stripStringDelimiters = pars.literal.stripStringDelimiters;
+const abnf = pars.abnf;
 
 /// A span of source bytes plus the 0-based line/column of the first byte.
 pub const Span = struct {
@@ -94,6 +95,9 @@ pub const UseDecl = struct {
     path: []const u8,
     /// Span of the path string literal (including its quotes).
     span: Span,
+    /// End of `span` as 0-based line/col, so goto-definition on the
+    /// path string can check containment without re-walking the source.
+    end: End,
 };
 
 /// An attribute occurrence inside a `#[...]` list prefixing a rule
@@ -118,6 +122,11 @@ pub const Index = struct {
     refs: []RuleRef,
     uses: []UseDecl,
     attrs: []Attribute,
+    /// Strings owned by the index (e.g. mangled ABNF rule names where
+    /// the hyphens are rewritten to underscores). Most names slice
+    /// directly into the source buffer; this pool holds the exceptions
+    /// so `Index.deinit` can free them uniformly.
+    owned_strings: [][]u8,
 
     pub fn deinit(self: *Index, alloc: Allocator) void {
         alloc.free(self.defs);
@@ -125,6 +134,8 @@ pub const Index = struct {
         alloc.free(self.refs);
         alloc.free(self.uses);
         alloc.free(self.attrs);
+        for (self.owned_strings) |s| alloc.free(s);
+        alloc.free(self.owned_strings);
     }
 
     /// Find the definition whose name span contains the cursor, or null.
@@ -158,6 +169,15 @@ pub const Index = struct {
     pub fn attrAt(self: *const Index, line: u32, col: u32) ?usize {
         for (self.attrs, 0..) |a, idx| {
             if (spanContains(a.list_span, a.list_end, line, col)) return idx;
+        }
+        return null;
+    }
+
+    /// Find the `use` declaration whose path string (including its
+    /// surrounding quotes) contains the cursor, or null.
+    pub fn useAt(self: *const Index, line: u32, col: u32) ?usize {
+        for (self.uses, 0..) |u, idx| {
+            if (spanContains(u.span, u.end, line, col)) return idx;
         }
         return null;
     }
@@ -207,6 +227,10 @@ const Builder = struct {
     refs: std.ArrayList(RuleRef),
     uses: std.ArrayList(UseDecl),
     attrs: std.ArrayList(Attribute),
+    /// Strings allocated during build that must outlive the builder —
+    /// mangled ABNF rule names, in practice. The final `Index` takes
+    /// ownership via `toOwnedSlice` and frees them in `deinit`.
+    owned_strings: std.ArrayList([]u8),
 
     /// Rule-scope stack. Each entry is an index into `defs`; the top
     /// is the most recently opened rule whose body we are currently
@@ -264,6 +288,7 @@ pub fn buildIndex(alloc: Allocator, source: []const u8) !Index {
         .refs = .empty,
         .uses = .empty,
         .attrs = .empty,
+        .owned_strings = .empty,
         .rule_stack = .empty,
     };
     defer b.rule_stack.deinit(alloc);
@@ -273,6 +298,8 @@ pub fn buildIndex(alloc: Allocator, source: []const u8) !Index {
         b.refs.deinit(alloc);
         b.uses.deinit(alloc);
         b.attrs.deinit(alloc);
+        for (b.owned_strings.items) |s| alloc.free(s);
+        b.owned_strings.deinit(alloc);
     }
 
     var paren_depth: usize = 0;
@@ -369,8 +396,21 @@ pub fn buildIndex(alloc: Allocator, source: []const u8) !Index {
                     .line = @intCast(str_tok.line - 1),
                     .col = @intCast(str_tok.column - 1),
                 };
-                try b.uses.append(b.alloc, .{ .path = inner, .span = span });
+                try b.uses.append(b.alloc, .{
+                    .path = inner,
+                    .span = span,
+                    .end = endOfSpan(b.source, span),
+                });
                 i += 1; // consume the string token
+            },
+            .tagged_string => {
+                // `@abnf"""..."""` blocks introduce rule definitions
+                // (and rule references) into the same registry as the
+                // surrounding pars file. Index them so goto-def, hover,
+                // and find-references work uniformly on rule names
+                // whether they are declared in pars or in an embedded
+                // ABNF block. Unknown tags are silently ignored.
+                try indexTaggedString(&b, t);
             },
             .semicolon => {
                 // A `;` at the outermost paren/bracket level that is
@@ -507,6 +547,129 @@ pub fn buildIndex(alloc: Allocator, source: []const u8) !Index {
         .refs = try b.refs.toOwnedSlice(alloc),
         .uses = try b.uses.toOwnedSlice(alloc),
         .attrs = try b.attrs.toOwnedSlice(alloc),
+        .owned_strings = try b.owned_strings.toOwnedSlice(alloc),
+    };
+}
+
+/// Dispatch for `@<tag>"""..."""` tokens. Only `@abnf` is currently
+/// recognized; other tags are ignored by the index (they still
+/// participate in semantic highlighting).
+fn indexTaggedString(b: *Builder, tok: Token) !void {
+    const lex = tok.lexeme;
+    if (lex.len < 1 + 3 + 3 or lex[0] != '@') return;
+    var i: usize = 1;
+    while (i < lex.len and lex[i] != '"') : (i += 1) {}
+    const tag = lex[1..i];
+    if (i + 3 > lex.len or !std.mem.eql(u8, lex[i .. i + 3], "\"\"\"")) return;
+    const body_offset_in_token: usize = i + 3;
+    const body_end_in_token: usize = lex.len - 3;
+    if (body_end_in_token < body_offset_in_token) return;
+
+    const body = lex[body_offset_in_token..body_end_in_token];
+    const body_host_offset: u32 = @intCast(tok.start + body_offset_in_token);
+
+    if (std.mem.eql(u8, tag, "abnf")) {
+        try indexAbnfBody(b, body, body_host_offset);
+    }
+}
+
+/// Parse the body of an `@abnf"""..."""` block and record its rule
+/// definitions and rule references in the host-file index. Rule names
+/// are stored in their mangled form (`-` → `_`) so that references to
+/// them from surrounding pars code resolve through the usual
+/// `findDef` lookup. Spans are translated back to host-file
+/// coordinates so clients can navigate directly to the ABNF source
+/// bytes inside the tagged-string literal.
+fn indexAbnfBody(b: *Builder, body: []const u8, body_host_offset: u32) !void {
+    var parser = abnf.Parser.init(b.alloc, body);
+    defer parser.deinit();
+
+    const parsed = parser.parse() catch return; // OOM; treat as empty.
+
+    // Even when `parsed.errors` is non-empty, `parsed.rulelist` may
+    // contain partial, well-formed rules that the user is still
+    // editing. Index whatever parsed successfully — LSP features
+    // degrade gracefully while the document is mid-edit.
+    for (parsed.rulelist) |rule| {
+        const name_span = translateAbnfSpan(b.source, body_host_offset, rule.name_span);
+        const name_end = endOfSpan(b.source, name_span);
+        const body_span = translateAbnfSpan(b.source, body_host_offset, rule.body.span);
+        const body_end = endOfSpan(b.source, body_span);
+
+        const name = try mangledName(b, rule.name);
+        try b.defs.append(b.alloc, .{
+            .name = name,
+            .name_span = name_span,
+            .name_end = name_end,
+            .body_start = body_span.start,
+            .body_end = body_span.start + body_span.len,
+            .body_start_line = body_span.line,
+            .body_start_col = body_span.col,
+            .body_end_line = body_end.line,
+            .body_end_col = body_end.col,
+            .kind = .top_level,
+        });
+
+        try collectAbnfRuleRefs(b, body_host_offset, rule.body);
+    }
+}
+
+fn collectAbnfRuleRefs(b: *Builder, body_host_offset: u32, alt: abnf.Alternation) !void {
+    for (alt.arms) |conc| {
+        for (conc.items) |rep| {
+            switch (rep.element) {
+                .rulename => |rn| {
+                    const span = translateAbnfSpan(b.source, body_host_offset, rn.span);
+                    const end = endOfSpan(b.source, span);
+                    const name = try mangledName(b, rn.name);
+                    try b.refs.append(b.alloc, .{
+                        .name = name,
+                        .span = span,
+                        .end = end,
+                        .back_ref = false,
+                        .rule_index = null,
+                    });
+                },
+                .group => |g| try collectAbnfRuleRefs(b, body_host_offset, g.*),
+                .option => |g| try collectAbnfRuleRefs(b, body_host_offset, g.*),
+                .string_val, .num_val, .prose_val => {},
+            }
+        }
+    }
+}
+
+/// Return a slice containing the pars-side spelling of an ABNF rule
+/// name: hyphens rewritten to underscores. Names without hyphens slice
+/// directly into the source buffer; names with hyphens are duplicated
+/// into the builder's owned-string pool.
+fn mangledName(b: *Builder, name: []const u8) ![]const u8 {
+    var has_hyphen = false;
+    for (name) |c| {
+        if (c == '-') {
+            has_hyphen = true;
+            break;
+        }
+    }
+    if (!has_hyphen) return name;
+    const buf = try b.alloc.alloc(u8, name.len);
+    errdefer b.alloc.free(buf);
+    for (name, 0..) |c, j| buf[j] = if (c == '-') '_' else c;
+    try b.owned_strings.append(b.alloc, buf);
+    return buf;
+}
+
+/// Translate an ABNF-local byte span into a host-file `Span`
+/// (start/len plus starting line/column). The ABNF source sits inside
+/// a `@abnf"""..."""` token, so offsets just shift by the token's
+/// body-start within the host file.
+fn translateAbnfSpan(source: []const u8, body_host_offset: u32, s: abnf.Span) Span {
+    const start: usize = body_host_offset + s.start;
+    const pos = endOfOffset(source, start);
+    return .{
+        .start = start,
+        .len = s.len,
+        .line = pos.line,
+        .col = pos.col,
     };
 }
 
@@ -644,6 +807,88 @@ test "buildIndex: #[lr] attribute does not leak into refs or defs" {
     for (idx.refs) |r| {
         try std.testing.expect(!std.mem.eql(u8, r.name, "lr"));
     }
+}
+
+test "buildIndex: @abnf block records rule defs and refs" {
+    const alloc = std.testing.allocator;
+    const src =
+        \\@abnf"""
+        \\greeting = salutation SP subject
+        \\salutation = "hi"
+        \\subject = 1*ALPHA
+        \\"""
+    ;
+    var idx = try buildIndex(alloc, src);
+    defer idx.deinit(alloc);
+
+    // Three defs, one per ABNF rule.
+    try std.testing.expectEqual(@as(usize, 3), idx.defs.len);
+    try std.testing.expectEqualStrings("greeting", idx.defs[0].name);
+    try std.testing.expectEqualStrings("salutation", idx.defs[1].name);
+    try std.testing.expectEqualStrings("subject", idx.defs[2].name);
+
+    // The name_span must round-trip to the host source bytes so the
+    // LSP can report the exact location of the definition.
+    const g = idx.defs[0];
+    try std.testing.expectEqualStrings(
+        "greeting",
+        src[g.name_span.start .. g.name_span.start + g.name_span.len],
+    );
+
+    // Refs: salutation, SP, subject (in greeting), ALPHA (in subject).
+    try std.testing.expectEqual(@as(usize, 4), idx.refs.len);
+    try std.testing.expectEqualStrings("salutation", idx.refs[0].name);
+    try std.testing.expectEqualStrings("SP", idx.refs[1].name);
+    try std.testing.expectEqualStrings("subject", idx.refs[2].name);
+    try std.testing.expectEqualStrings("ALPHA", idx.refs[3].name);
+}
+
+test "buildIndex: @abnf hyphenated names are mangled for pars-side lookup" {
+    const alloc = std.testing.allocator;
+    // `greeting-line` is a valid ABNF rulename but not a valid pars
+    // identifier; on the pars side the rule is known as
+    // `greeting_line`. The index exposes the mangled form so that
+    // pars references resolve through the usual `findDef` path.
+    const src =
+        \\@abnf"""
+        \\greeting-line = "hi"
+        \\"""
+        \\
+        \\entry = greeting_line;
+    ;
+    var idx = try buildIndex(alloc, src);
+    defer idx.deinit(alloc);
+
+    try std.testing.expectEqual(@as(usize, 2), idx.defs.len);
+    try std.testing.expectEqualStrings("greeting_line", idx.defs[0].name);
+    try std.testing.expectEqualStrings("entry", idx.defs[1].name);
+
+    // The ABNF def's name_span still points at the hyphenated bytes
+    // in the host source.
+    const d = idx.defs[0];
+    try std.testing.expectEqualStrings(
+        "greeting-line",
+        src[d.name_span.start .. d.name_span.start + d.name_span.len],
+    );
+
+    // Pars reference resolves to the mangled ABNF def.
+    const hit = idx.findDef("greeting_line", null).?;
+    try std.testing.expectEqual(@as(usize, 0), hit);
+}
+
+test "buildIndex: use declaration records end position" {
+    const alloc = std.testing.allocator;
+    const src = "use \"std/abnf\";";
+    var idx = try buildIndex(alloc, src);
+    defer idx.deinit(alloc);
+
+    try std.testing.expectEqual(@as(usize, 1), idx.uses.len);
+    // Span covers `"std/abnf"` (10 bytes, quotes included).
+    try std.testing.expectEqual(@as(usize, 4), idx.uses[0].span.start);
+    try std.testing.expectEqual(@as(usize, 10), idx.uses[0].span.len);
+    // Span is single-line; end col is start col + len.
+    try std.testing.expectEqual(@as(u32, 0), idx.uses[0].span.line);
+    try std.testing.expectEqual(@as(u32, 14), idx.uses[0].end.col);
 }
 
 test "Index.findDef prefers sub-rule in same scope" {

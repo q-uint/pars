@@ -124,8 +124,50 @@ recognized inside `#[...]`, so rules or bindings named `lr` or
 use "std/abnf";
 ```
 
-Makes the rules from a standard library module (currently `std/abnf`
-and `std/pars`) available in the current grammar.
+Makes the rules from a standard library module (currently `std/abnf`,
+`std/abnf_grammar`, and `std/pars_grammar`) available in the current
+grammar.
+
+### Inline ABNF blocks
+
+RFC 5234 ABNF can be pasted directly into a pars file with an
+`@abnf"""…"""` block. The block contributes rules to the same registry
+as the surrounding pars file, and those rules are callable from the
+rest of the file like any other:
+
+```
+use "std/abnf";
+
+@abnf"""
+  greeting   = salutation SP subject
+  salutation = "hello" / "hi" / "hey"
+  subject    = 1*ALPHA
+"""
+
+entry = greeting;
+```
+
+See [`examples/abnf-block.pars`](examples/abnf-block.pars).
+
+Lowering to pars is mechanical and opinionated:
+
+- ABNF `/` becomes `#[longest](…)` so shorter alternatives cannot
+  starve longer ones (RFC ABNF `/` is unordered; longest-match is the
+  disambiguation protocol grammars assume).
+- Directly left-recursive rules are annotated with `#[lr]` so
+  expressions like `expr = expr "+" term / term` work.
+- Hyphenated rule names (`hier-part`) are mangled to underscores
+  (`hier_part`) for the pars registry; the original spelling is used
+  in diagnostics.
+- Numeric byte values (`%x41`, `%x30-39`, `%x41.42.43`, etc.) validate
+  at compile time; values > 255 are rejected.
+- `=/` incremental alternatives merge within a block.
+- Rule names are case-insensitive per RFC 5234 §2.1: two spellings of
+  the same rule in one block are a compile error.
+- `prose-val` (`<…>`) is rejected as unsupported.
+
+Referenced core rules (`ALPHA`, `DIGIT`, …) are not auto-imported; add
+`use "std/abnf";` in the host file when you need them.
 
 ## Usage
 

@@ -1,0 +1,61 @@
+-- ABNF meta-grammar (RFC 5234 §4 with the RFC 7405 %s / %i extensions).
+-- Recognizes ABNF source text. Dogfooding artifact: the language
+-- describes the grammar it embeds. The `@abnf"..."` block parser lives
+-- in Zig so it can emit a typed AST for the lowering pass; this file is
+-- the spec companion.
+--
+-- Accepts both CRLF and bare LF line endings. RFC 5234 mandates CRLF
+-- but LF-only is universal among modern editors.
+
+use "std/abnf";
+
+eol     = '\r' '\n' / '\n';
+comment = ';' (WSP / ['\x21'-'\x7E'])* eol;
+c_nl    = comment / eol;
+c_wsp   = WSP / (c_nl WSP);
+sp_any  = (c_wsp / c_nl)*;
+
+rulename = ALPHA (ALPHA / DIGIT / '-')*;
+
+-- Quoted strings. Case-insensitive by default (RFC 5234); `%s` forces
+-- case-sensitive, `%i` is explicit case-insensitive (RFC 7405).
+
+dq_body    = (['\x20'-'\x21'] / ['\x23'-'\x7E'])*;
+dq_string  = '"' dq_body '"';
+string_val = ("%s" / "%i")? dq_string;
+
+-- Numeric values. Each form admits a single value, a dot-concatenated
+-- sequence, or a hyphen range.
+
+bin_val = 'b' BIT+    ('-' BIT+    / ('.' BIT+)+)?;
+dec_val = 'd' DIGIT+  ('-' DIGIT+  / ('.' DIGIT+)+)?;
+hex_val = 'x' HEXDIG+ ('-' HEXDIG+ / ('.' HEXDIG+)+)?;
+num_val = '%' (bin_val / dec_val / hex_val);
+
+-- Prose-val. Accepted so the lowering pass can emit a precise
+-- "unsupported construct" diagnostic rather than a generic parse error.
+
+prose_val = '<' (['\x20'-'\x3D'] / ['\x3F'-'\x7E'])* '>';
+
+-- Groupings.
+
+group  = '(' c_wsp* alternation c_wsp* ')';
+option = '[' c_wsp* alternation c_wsp* ']';
+
+element = rulename / group / option / string_val / num_val / prose_val;
+
+-- Repetition prefix. The "*"-form must be tried before the bare count
+-- form: a bare `3` would otherwise shadow the `3` in `3*5` and leave
+-- `*5` unconsumed.
+
+repeat     = DIGIT* '*' DIGIT* / DIGIT+;
+repetition = repeat? element;
+
+concatenation = repetition (c_wsp+ repetition)*;
+alternation   = concatenation (c_wsp* '/' c_wsp* concatenation)*;
+
+elements   = alternation c_wsp*;
+defined_as = c_wsp* ("=/" / '=') c_wsp*;
+
+rule     = rulename defined_as elements;
+rulelist = sp_any (rule sp_any)+ !.;

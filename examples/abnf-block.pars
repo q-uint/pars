@@ -1,0 +1,17 @@
+-- Demonstrates an inline ABNF block. The block introduces rules into
+-- the same registry as the surrounding pars file; the host file then
+-- references them like any other rule.
+--
+-- The RFC 5234 §B.1 core rules (ALPHA, DIGIT, SP, CRLF, ...) are
+-- brought in with an explicit `use "std/abnf"`.
+
+use "std/abnf";
+
+@abnf"""
+  greeting = salutation SP subject
+  salutation = "hello" / "hi" / "hey"
+  subject    = 1*ALPHA
+"""
+
+-- The `greeting` rule matches inputs like "hello world".
+entry = greeting;

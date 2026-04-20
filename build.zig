@@ -8,7 +8,8 @@ pub fn build(b: *std.Build) void {
     // pre-load them without @embedFile crossing the module boundary.
     const stdlib_opts = b.addOptions();
     stdlib_opts.addOption([]const u8, "abnf", @embedFile("lib/abnf.pars"));
-    stdlib_opts.addOption([]const u8, "pars", @embedFile("lib/pars.pars"));
+    stdlib_opts.addOption([]const u8, "abnf_grammar", @embedFile("lib/abnf_grammar.pars"));
+    stdlib_opts.addOption([]const u8, "pars_grammar", @embedFile("lib/pars_grammar.pars"));
 
     // Also install the stdlib sources to share/pars/lib so editor tooling
     // (the LSP) can return file:// locations into them for goto-definition

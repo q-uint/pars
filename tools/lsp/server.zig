@@ -79,6 +79,7 @@ fn mapTokenType(t: TokenType) ?u32 {
         .hash => semantic_decorator,
         .identifier => 0, // type; may be retagged as decorator inside `#[...]`
         .string, .string_i, .char => 1, // string
+        .tagged_string => null, // handled out-of-band by emitTaggedString
         .number => 2, // number
         .kw_let,
         .kw_grammar,
@@ -102,6 +103,258 @@ const SemTok = struct {
 fn lessSemTok(_: void, a: SemTok, b: SemTok) bool {
     if (a.line != b.line) return a.line < b.line;
     return a.col < b.col;
+}
+
+/// Emit semantic tokens for a `@<tag>"""..."""` block. The `@<tag>` and
+/// the two `"""` markers get string-adjacent semantic classes; if the
+/// tag is `abnf`, the body is sub-tokenized as ABNF so the embedded
+/// grammar gets proper highlighting. Unknown tags leave the body
+/// unhighlighted (falling back to the editor's default style).
+fn emitTaggedString(
+    alloc: Allocator,
+    toks: *std.ArrayList(SemTok),
+    source: []const u8,
+    tok: pars.scanner.Token,
+    line: *usize,
+    line_start: *usize,
+) !void {
+    const lex = tok.lexeme;
+    const token_start = tok.start;
+
+    // Parse the `@<tag>"""` prefix out of the lexeme.
+    var i: usize = 1;
+    while (i < lex.len and lex[i] != '"') : (i += 1) {}
+    const tag_len = i - 1;
+    const is_abnf = std.mem.eql(u8, lex[1..i], "abnf");
+    const body_start_abs = token_start + i + 3;
+    const body_end_abs = token_start + lex.len - 3;
+
+    // `@<tag>` as a decorator span.
+    try toks.append(alloc, .{
+        .line = @intCast(line.* - 1),
+        .col = @intCast(token_start - line_start.*),
+        .len = @intCast(1 + tag_len),
+        .ty = semantic_decorator,
+    });
+
+    // Opening `"""` as string.
+    try toks.append(alloc, .{
+        .line = @intCast(line.* - 1),
+        .col = @intCast(token_start + 1 + tag_len - line_start.*),
+        .len = 3,
+        .ty = 1,
+    });
+
+    if (is_abnf) {
+        try tokenizeAbnfBody(alloc, toks, source, body_start_abs, body_end_abs, line, line_start);
+    } else {
+        // Walk the body to keep line tracking correct without emitting
+        // any inner tokens — editor paints the unknown-tag body in its
+        // default color.
+        var j = body_start_abs;
+        while (j < body_end_abs) : (j += 1) {
+            if (source[j] == '\n') {
+                line.* += 1;
+                line_start.* = j + 1;
+            }
+        }
+    }
+
+    // Closing `"""`.
+    try toks.append(alloc, .{
+        .line = @intCast(line.* - 1),
+        .col = @intCast(body_end_abs - line_start.*),
+        .len = 3,
+        .ty = 1,
+    });
+
+    // Advance line tracking past the closing `"""`.
+    var k = body_end_abs;
+    while (k < token_start + lex.len) : (k += 1) {
+        if (source[k] == '\n') {
+            line.* += 1;
+            line_start.* = k + 1;
+        }
+    }
+}
+
+/// Emit ABNF semantic tokens for the body of an `@abnf"""..."""` block.
+/// Scans bytes directly — we don't reuse the AST parser because
+/// highlighting should degrade gracefully on malformed input instead of
+/// giving up. The token set is small enough to hand-classify.
+fn tokenizeAbnfBody(
+    alloc: Allocator,
+    toks: *std.ArrayList(SemTok),
+    source: []const u8,
+    start: usize,
+    end: usize,
+    line: *usize,
+    line_start: *usize,
+) !void {
+    var i = start;
+    while (i < end) {
+        const c = source[i];
+
+        if (c == '\n') {
+            line.* += 1;
+            line_start.* = i + 1;
+            i += 1;
+            continue;
+        }
+        if (c == '\r' or c == ' ' or c == '\t') {
+            i += 1;
+            continue;
+        }
+
+        if (c == ';') {
+            const tstart = i;
+            while (i < end and source[i] != '\n') i += 1;
+            try toks.append(alloc, .{
+                .line = @intCast(line.* - 1),
+                .col = @intCast(tstart - line_start.*),
+                .len = @intCast(i - tstart),
+                .ty = 3, // comment
+            });
+            continue;
+        }
+
+        if (c == '%') {
+            if (i + 1 < end and (source[i + 1] == 's' or source[i + 1] == 'i')) {
+                const prefix_start = i;
+                i += 2;
+                try toks.append(alloc, .{
+                    .line = @intCast(line.* - 1),
+                    .col = @intCast(prefix_start - line_start.*),
+                    .len = 2,
+                    .ty = 5, // keyword (case-sensitivity modifier)
+                });
+                if (i < end and source[i] == '"') {
+                    try emitAbnfString(alloc, toks, source, &i, end, line, line_start);
+                }
+                continue;
+            }
+            // %b / %d / %x num-val (accepts single, range, or concat).
+            const tstart = i;
+            i += 1;
+            if (i < end and (source[i] == 'b' or source[i] == 'd' or source[i] == 'x')) i += 1;
+            while (i < end and (isAbnfHex(source[i]) or source[i] == '.' or source[i] == '-')) i += 1;
+            try toks.append(alloc, .{
+                .line = @intCast(line.* - 1),
+                .col = @intCast(tstart - line_start.*),
+                .len = @intCast(i - tstart),
+                .ty = 2, // number
+            });
+            continue;
+        }
+
+        if (c == '"') {
+            try emitAbnfString(alloc, toks, source, &i, end, line, line_start);
+            continue;
+        }
+
+        if (c == '<') {
+            const tstart = i;
+            i += 1;
+            while (i < end and source[i] != '>') : (i += 1) {
+                if (source[i] == '\n') {
+                    line.* += 1;
+                    line_start.* = i + 1;
+                }
+            }
+            if (i < end) i += 1;
+            try toks.append(alloc, .{
+                .line = @intCast(line.* - 1),
+                .col = @intCast(tstart - line_start.*),
+                .len = @intCast(i - tstart),
+                .ty = 1, // string (prose-val)
+            });
+            continue;
+        }
+
+        if (c == '/' or c == '*' or c == '(' or c == ')' or c == '[' or c == ']') {
+            try toks.append(alloc, .{
+                .line = @intCast(line.* - 1),
+                .col = @intCast(i - line_start.*),
+                .len = 1,
+                .ty = 4, // operator
+            });
+            i += 1;
+            continue;
+        }
+
+        if (c == '=') {
+            const tstart = i;
+            i += 1;
+            if (i < end and source[i] == '/') i += 1;
+            try toks.append(alloc, .{
+                .line = @intCast(line.* - 1),
+                .col = @intCast(tstart - line_start.*),
+                .len = @intCast(i - tstart),
+                .ty = 4, // operator
+            });
+            continue;
+        }
+
+        if (c >= '0' and c <= '9') {
+            const tstart = i;
+            while (i < end and source[i] >= '0' and source[i] <= '9') i += 1;
+            try toks.append(alloc, .{
+                .line = @intCast(line.* - 1),
+                .col = @intCast(tstart - line_start.*),
+                .len = @intCast(i - tstart),
+                .ty = 2, // number
+            });
+            continue;
+        }
+
+        if (isAbnfAlpha(c)) {
+            const tstart = i;
+            while (i < end and (isAbnfAlpha(source[i]) or (source[i] >= '0' and source[i] <= '9') or source[i] == '-')) i += 1;
+            try toks.append(alloc, .{
+                .line = @intCast(line.* - 1),
+                .col = @intCast(tstart - line_start.*),
+                .len = @intCast(i - tstart),
+                .ty = 0, // type
+            });
+            continue;
+        }
+
+        i += 1;
+    }
+}
+
+fn emitAbnfString(
+    alloc: Allocator,
+    toks: *std.ArrayList(SemTok),
+    source: []const u8,
+    i: *usize,
+    end: usize,
+    line: *usize,
+    line_start: *usize,
+) !void {
+    const tstart = i.*;
+    i.* += 1;
+    while (i.* < end and source[i.*] != '"') : (i.* += 1) {
+        if (source[i.*] == '\n') {
+            line.* += 1;
+            line_start.* = i.* + 1;
+        }
+    }
+    if (i.* < end) i.* += 1;
+    try toks.append(alloc, .{
+        .line = @intCast(line.* - 1),
+        .col = @intCast(tstart - line_start.*),
+        .len = @intCast(i.* - tstart),
+        .ty = 1, // string
+    });
+}
+
+fn isAbnfAlpha(c: u8) bool {
+    return (c >= 'A' and c <= 'Z') or (c >= 'a' and c <= 'z') or c == '_';
+}
+
+fn isAbnfHex(c: u8) bool {
+    return (c >= '0' and c <= '9') or (c >= 'A' and c <= 'F') or (c >= 'a' and c <= 'f');
 }
 
 /// Produce an LSP delta-encoded semantic-tokens array for `source`.
@@ -152,6 +405,12 @@ pub fn computeSemanticTokens(alloc: Allocator, source: []const u8) ![]u32 {
         }
 
         if (tok.type == .eof) break;
+
+        if (tok.type == .tagged_string) {
+            try emitTaggedString(alloc, &toks, source, tok, &line, &line_start);
+            prev_end = tok.start + tok.len;
+            continue;
+        }
 
         var final_ty: ?u32 = mapTokenType(tok.type);
 
@@ -690,6 +949,20 @@ pub const Server = struct {
 
         var idx = try symbols.buildIndex(self.alloc, doc.text);
         defer idx.deinit(self.alloc);
+
+        // Cursor on a `use "std/foo"` path string — jump to the
+        // resolved stdlib file. The target location is the top of the
+        // module file (line 0, col 0); clients open the file and the
+        // user can navigate within it from there.
+        if (idx.useAt(pos.line, pos.col)) |ui| {
+            const u = idx.uses[ui];
+            if (try self.loadStdlibModule(u.path)) |entry| {
+                const zero: symbols.Span = .{ .start = 0, .len = 0, .line = 0, .col = 0 };
+                const zero_end: symbols.End = .{ .line = 0, .col = 0 };
+                return self.writeLocation(id, entry.uri, zero, zero_end);
+            }
+            return self.writeResult(id, .null);
+        }
 
         // Prefer a reference at the cursor, fall back to a definition
         // (so a user can ctrl-click the name on the LHS and stay put).
@@ -2053,6 +2326,101 @@ test "semantic tokens: comment in gap" {
     try std.testing.expectEqualSlices(u32, &expected, data);
 }
 
+test "semantic tokens: @abnf block emits decorator plus embedded ABNF" {
+    const alloc = std.testing.allocator;
+    // Lay out the source so the inner string literal does not end
+    // adjacent to the outer `"""` terminator (which would trigger the
+    // scanner's greedy triple-quote match early).
+    //   @abnf"""foo = "bar" """
+    //          ^^^          ^^^
+    //          opener       closer
+    //    col 0: @abnf   (decorator, len 5)
+    //    col 5: """     (string, len 3)
+    //    col 8: foo     (type, len 3)
+    //    col 12: =      (operator, len 1)
+    //    col 14: "bar"  (string, len 5)
+    //    col 20: """    (string, len 3)
+    const src = "@abnf\"\"\"foo = \"bar\" \"\"\"";
+    const data = try computeSemanticTokens(alloc, src);
+    defer alloc.free(data);
+
+    const expected = [_]u32{
+        0, 0,  5, 6, 0, // @abnf (decorator)
+        0, 5,  3, 1, 0, // opening """ (string)
+        0, 3,  3, 0, 0, // foo (type)
+        0, 4,  1, 4, 0, // = (operator)
+        0, 2,  5, 1, 0, // "bar" (string)
+        0, 6,  3, 1, 0, // closing """ (string)
+    };
+    try std.testing.expectEqualSlices(u32, &expected, data);
+}
+
+test "semantic tokens: @abnf block tokenizes num-val and choice" {
+    const alloc = std.testing.allocator;
+    //   @abnf"""x = %x30-39 / ALPHA """
+    //   col 0:  @abnf   (decorator, 5)
+    //   col 5:  """     (string, 3)
+    //   col 8:  x       (type, 1)
+    //   col 10: =       (operator, 1)
+    //   col 12: %x30-39 (number, 7)
+    //   col 20: /       (operator, 1)
+    //   col 22: ALPHA   (type, 5)
+    //   col 28: """     (string, 3)
+    const src = "@abnf\"\"\"x = %x30-39 / ALPHA \"\"\"";
+    const data = try computeSemanticTokens(alloc, src);
+    defer alloc.free(data);
+
+    const expected = [_]u32{
+        0, 0,  5, 6, 0, // @abnf
+        0, 5,  3, 1, 0, // """
+        0, 3,  1, 0, 0, // x
+        0, 2,  1, 4, 0, // =
+        0, 2,  7, 2, 0, // %x30-39
+        0, 8,  1, 4, 0, // /
+        0, 2,  5, 0, 0, // ALPHA
+        0, 6,  3, 1, 0, // """
+    };
+    try std.testing.expectEqualSlices(u32, &expected, data);
+}
+
+test "semantic tokens: unknown tag leaves body unhighlighted" {
+    const alloc = std.testing.allocator;
+    const src = "@regex\"\"\"anything\"\"\"";
+    const data = try computeSemanticTokens(alloc, src);
+    defer alloc.free(data);
+
+    // Only `@regex`, opening `"""`, and closing `"""` — body has no
+    // tokens since `regex` isn't a recognized sub-language.
+    const expected = [_]u32{
+        0, 0,  6, 6, 0, // @regex (decorator)
+        0, 6,  3, 1, 0, // opening """
+        0, 11, 3, 1, 0, // closing """
+    };
+    try std.testing.expectEqualSlices(u32, &expected, data);
+}
+
+test "semantic tokens: multi-line @abnf tracks line positions" {
+    const alloc = std.testing.allocator;
+    // @abnf"""
+    //   foo = "bar"
+    // """
+    // The rule name `foo` should land on line 1 (0-based).
+    const src = "@abnf\"\"\"\n  foo = \"bar\"\n\"\"\"";
+    const data = try computeSemanticTokens(alloc, src);
+    defer alloc.free(data);
+
+    // Walk the delta-encoded stream and spot-check that a `type` token
+    // (for `foo`) appears on line 1.
+    var line: u32 = 0;
+    var saw_foo_on_line_1 = false;
+    var i: usize = 0;
+    while (i + 5 <= data.len) : (i += 5) {
+        line += data[i];
+        if (data[i + 2] == 3 and data[i + 3] == 0 and line == 1) saw_foo_on_line_1 = true;
+    }
+    try std.testing.expect(saw_foo_on_line_1);
+}
+
 test "semantic tokens: string and number" {
     const alloc = std.testing.allocator;
     const data = try computeSemanticTokens(alloc, "\"hi\" 42");
@@ -2300,6 +2668,62 @@ test "server: definition falls back to std/abnf module source" {
     // The response URI must point at a file, not the original document.
     try std.testing.expect(std.mem.indexOf(u8, out, "file:///x.pars") == null);
     try std.testing.expect(std.mem.indexOf(u8, out, "abnf.pars") != null);
+}
+
+test "server: definition on a use-path jumps to the stdlib module file" {
+    const alloc = std.testing.allocator;
+
+    var aw = std.Io.Writer.Allocating.init(alloc);
+    defer aw.deinit();
+
+    var server = Server.initWithIo(alloc, std.testing.io, &aw.writer);
+    defer server.deinit();
+
+    // `use "std/abnf";` — cursor inside the path string. The target
+    // location must be the stdlib file (abnf.pars), not the host file.
+    try server.handleMessage(
+        \\{"jsonrpc":"2.0","method":"textDocument/didOpen","params":{"textDocument":{"uri":"file:///x.pars","languageId":"pars","version":1,"text":"use \"std/abnf\";"}}}
+    );
+    aw.writer.end = 0;
+
+    try server.handleMessage(
+        \\{"jsonrpc":"2.0","id":20,"method":"textDocument/definition","params":{"textDocument":{"uri":"file:///x.pars"},"position":{"line":0,"character":7}}}
+    );
+
+    const out = aw.writer.buffered();
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"id\":20") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "file:///x.pars") == null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "abnf.pars") != null);
+}
+
+test "server: definition jumps from pars ref into an @abnf-defined rule" {
+    const alloc = std.testing.allocator;
+
+    var aw = std.Io.Writer.Allocating.init(alloc);
+    defer aw.deinit();
+
+    var server = Server.init(alloc, &aw.writer);
+    defer server.deinit();
+
+    // @abnf block defines `greeting`; the surrounding pars file
+    // references it. Clicking on the reference must land on the name
+    // span inside the ABNF block.
+    try server.handleMessage(
+        \\{"jsonrpc":"2.0","method":"textDocument/didOpen","params":{"textDocument":{"uri":"file:///x.pars","languageId":"pars","version":1,"text":"@abnf\"\"\"\ngreeting = \"hi\"\n\"\"\"\nentry = greeting;"}}}
+    );
+    aw.writer.end = 0;
+
+    // Cursor on the `greeting` ref in `entry = greeting;` (line 3).
+    try server.handleMessage(
+        \\{"jsonrpc":"2.0","id":21,"method":"textDocument/definition","params":{"textDocument":{"uri":"file:///x.pars"},"position":{"line":3,"character":10}}}
+    );
+
+    const out = aw.writer.buffered();
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"id\":21") != null);
+    // The def is on line 1 (the ABNF `greeting = "hi"` line).
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"line\":1") != null);
+    // And starts at column 0 within the ABNF body.
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"character\":0") != null);
 }
 
 test "server: hover renders body from std/abnf module source" {

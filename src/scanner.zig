@@ -67,6 +67,11 @@ pub const TokenType = enum {
     /// A decimal integer literal. Currently appears only inside bounded
     /// quantifier braces, e.g. the `3` and `5` in `A{3,5}`.
     number,
+    /// A tagged triple-quoted string, e.g. `@abnf"""..."""`. The body is
+    /// captured verbatim with no escape processing. The tag name and body
+    /// are both contained in the lexeme span; downstream code slices the
+    /// lexeme to extract them.
+    tagged_string,
 
     /// 'let' - names the span matched by a sub-pattern within a rule body.
     kw_let,
@@ -179,6 +184,7 @@ pub const Scanner = struct {
             '=' => return self.makeToken(if (self.match('>')) .arrow else .equal),
             '"' => return self.string(),
             '\'' => return self.charLiteral(),
+            '@' => return self.taggedString(),
             else => return self.errorToken("Unexpected character."),
         }
     }
@@ -284,6 +290,39 @@ pub const Scanner = struct {
     fn number(self: *Scanner) Token {
         while (isDigit(self.peek())) _ = self.advance();
         return self.makeToken(.number);
+    }
+
+    fn taggedString(self: *Scanner) Token {
+        if (!isAlpha(self.peek())) return self.errorToken("Expected tag name after '@'.");
+        while (isAlpha(self.peek()) or isDigit(self.peek())) _ = self.advance();
+
+        if (!(self.peek() == '"' and self.peekNext() == '"' and
+            self.current + 2 < self.source.len and
+            self.source[self.current + 2] == '"'))
+        {
+            return self.errorToken("Expected '\"\"\"' after tag name.");
+        }
+        _ = self.advance();
+        _ = self.advance();
+        _ = self.advance();
+
+        while (!self.isAtEnd()) {
+            if (self.peek() == '"' and self.peekNext() == '"' and
+                self.current + 2 < self.source.len and
+                self.source[self.current + 2] == '"')
+            {
+                _ = self.advance();
+                _ = self.advance();
+                _ = self.advance();
+                return self.makeToken(.tagged_string);
+            }
+            if (self.peek() == '\n') {
+                self.line += 1;
+                self.line_start = self.current + 1;
+            }
+            _ = self.advance();
+        }
+        return self.errorToken("Unterminated tagged string.");
     }
 
     fn charLiteral(self: *Scanner) Token {
@@ -562,6 +601,72 @@ test "identifier starting with digit is not valid" {
     try expectTokens("3abc", &.{
         .{ .type = .number, .lexeme = "3" },
         .{ .type = .identifier, .lexeme = "abc" },
+    });
+}
+
+test "tagged string with simple body" {
+    var s = Scanner.init("@abnf\"\"\"hello\"\"\"");
+    const tok = s.scanToken();
+    try std.testing.expectEqual(TokenType.tagged_string, tok.type);
+    try std.testing.expectEqualStrings("@abnf\"\"\"hello\"\"\"", tok.lexeme);
+}
+
+test "tagged string allows embedded newlines and bumps line counter" {
+    var s = Scanner.init("@abnf\"\"\"a\nb\nc\"\"\"");
+    const tok = s.scanToken();
+    try std.testing.expectEqual(TokenType.tagged_string, tok.type);
+    try std.testing.expectEqual(@as(usize, 3), s.line);
+}
+
+test "tagged string preserves CRLF line endings in the body" {
+    var s = Scanner.init("@abnf\"\"\"a\r\nb\"\"\"");
+    const tok = s.scanToken();
+    try std.testing.expectEqual(TokenType.tagged_string, tok.type);
+    try std.testing.expectEqualStrings("@abnf\"\"\"a\r\nb\"\"\"", tok.lexeme);
+}
+
+test "tagged string with empty body" {
+    var s = Scanner.init("@abnf\"\"\"\"\"\"");
+    const tok = s.scanToken();
+    try std.testing.expectEqual(TokenType.tagged_string, tok.type);
+    try std.testing.expectEqualStrings("@abnf\"\"\"\"\"\"", tok.lexeme);
+}
+
+test "unterminated tagged string produces error" {
+    var s = Scanner.init("@abnf\"\"\"oops");
+    const tok = s.scanToken();
+    try std.testing.expectEqual(TokenType.err, tok.type);
+    try std.testing.expectEqualStrings("Unterminated tagged string.", tok.lexeme);
+}
+
+test "tagged string without tag name produces error" {
+    var s = Scanner.init("@\"\"\"oops\"\"\"");
+    const tok = s.scanToken();
+    try std.testing.expectEqual(TokenType.err, tok.type);
+    try std.testing.expectEqualStrings("Expected tag name after '@'.", tok.lexeme);
+}
+
+test "tagged string without opening triple quote produces error" {
+    var s = Scanner.init("@abnf hello");
+    const tok = s.scanToken();
+    try std.testing.expectEqual(TokenType.err, tok.type);
+    try std.testing.expectEqualStrings("Expected '\"\"\"' after tag name.", tok.lexeme);
+}
+
+test "lone @ at eof produces error" {
+    var s = Scanner.init("@");
+    const tok = s.scanToken();
+    try std.testing.expectEqual(TokenType.err, tok.type);
+    try std.testing.expectEqualStrings("Expected tag name after '@'.", tok.lexeme);
+}
+
+test "tagged string followed by pars code" {
+    try expectTokens("@abnf\"\"\"x\"\"\"\nuri = URI;", &.{
+        .{ .type = .tagged_string, .lexeme = "@abnf\"\"\"x\"\"\"" },
+        .{ .type = .identifier, .lexeme = "uri" },
+        .{ .type = .equal, .lexeme = "=" },
+        .{ .type = .identifier, .lexeme = "URI" },
+        .{ .type = .semicolon, .lexeme = ";" },
     });
 }
 

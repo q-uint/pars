@@ -39,6 +39,9 @@ export async function activate(context: vscode.ExtensionContext) {
     vscode.commands.registerCommand("pars.showBytecode", () =>
       BytecodePanel.show(context.extensionPath)
     ),
+    vscode.commands.registerCommand("pars.showRailroad", () =>
+      RailroadPanel.show(context.extensionPath)
+    ),
     vscode.commands.registerCommand(
       "pars.runRule",
       // Optional ruleName preselects the dropdown; called by the
@@ -89,12 +92,42 @@ export async function deactivate(): Promise<void> {
 
 function loadWebviewHtml(extensionPath: string, name: string): string {
   const mediaDir = path.join(extensionPath, "media");
-  const html = fs.readFileSync(path.join(mediaDir, name), "utf8");
+  const outDir = path.join(extensionPath, "out");
+  let html = fs.readFileSync(path.join(mediaDir, name), "utf8");
+
+  // Inline webview.css — matches the pattern the other webviews use so
+  // a strict CSP doesn't need to whitelist a stylesheet URI.
   const css = fs.readFileSync(path.join(mediaDir, "webview.css"), "utf8");
-  return html.replace(
+  html = html.replace(
     '<link rel="stylesheet" href="webview.css">',
     `<style>${css}</style>`
   );
+
+  // Inline any `<script src="…">` or `<link …>` whose target is a
+  // sibling file in `out/`. The railroad webview references both the
+  // vendored railroad-diagrams library (copied in by `copy-deps`) and
+  // its own compiled TS bundle (`railroad.js`); inlining keeps the
+  // webview CSP simple (`script-src 'unsafe-inline'`) and avoids
+  // wiring webview resource URIs for each asset.
+  const inlineScript = (name: string) => {
+    const p = path.join(outDir, name);
+    const tag = `<script src="${name}"></script>`;
+    if (html.includes(tag) && fs.existsSync(p)) {
+      html = html.replace(tag, `<script>${fs.readFileSync(p, "utf8")}</script>`);
+    }
+  };
+  const inlineStylesheet = (name: string) => {
+    const p = path.join(outDir, name);
+    const tag = `<link rel="stylesheet" href="${name}">`;
+    if (html.includes(tag) && fs.existsSync(p)) {
+      html = html.replace(tag, `<style>${fs.readFileSync(p, "utf8")}</style>`);
+    }
+  };
+  inlineScript("railroad-diagrams.js");
+  inlineScript("railroad.js");
+  inlineStylesheet("railroad-diagrams.css");
+
+  return html;
 }
 
 // Resolve the pars-lsp binary in priority order:
@@ -421,3 +454,127 @@ class PlaygroundPanel {
   }
 }
 
+type RailroadNode =
+  | { kind: "terminal"; text: string }
+  | { kind: "non_terminal"; name: string }
+  | { kind: "sequence"; items: RailroadNode[] }
+  | { kind: "choice"; items: RailroadNode[] }
+  | { kind: "optional"; item: RailroadNode }
+  | { kind: "zero_or_more"; item: RailroadNode }
+  | { kind: "one_or_more"; item: RailroadNode }
+  | { kind: "group"; label: string; item: RailroadNode }
+  | { kind: "comment"; text: string };
+
+type RailroadResponse =
+  | {
+      ok: true;
+      uri: string;
+      rules: Record<string, RailroadNode>;
+      // Per-rule where-scope: `where[X][name]` is the body of a
+      // sub-rule defined inside X's where-block. The webview prefers
+      // this over `rules[name]` when resolving a click inside X.
+      where: Record<string, Record<string, RailroadNode>>;
+      entry: string | null;
+    }
+  | { ok: false; uri: string; errors: { line: number; column: number; message: string }[] };
+
+// Singleton webview that renders each rule as an interactive railroad
+// diagram. Clicking a non-terminal expands its rule inline; clicking
+// again collapses. The rule list comes from the LSP's pars/railroad
+// response, refreshed on edits like BytecodePanel does.
+class RailroadPanel {
+  static current: RailroadPanel | undefined;
+
+  private readonly panel: vscode.WebviewPanel;
+  private readonly disposables: vscode.Disposable[] = [];
+  private trackedUri: vscode.Uri | undefined;
+  private refreshTimer: NodeJS.Timeout | undefined;
+
+  static show(extensionPath: string) {
+    const editor = vscode.window.activeTextEditor;
+    if (!editor || editor.document.languageId !== "pars") {
+      void vscode.window.showInformationMessage("pars: open a .pars file first.");
+      return;
+    }
+
+    if (RailroadPanel.current) {
+      RailroadPanel.current.panel.reveal(vscode.ViewColumn.Beside);
+      RailroadPanel.current.track(editor.document.uri);
+      return;
+    }
+
+    const panel = vscode.window.createWebviewPanel(
+      "parsRailroad",
+      "pars: Railroad",
+      vscode.ViewColumn.Beside,
+      { enableScripts: true, retainContextWhenHidden: true }
+    );
+
+    RailroadPanel.current = new RailroadPanel(panel, extensionPath);
+    RailroadPanel.current.track(editor.document.uri);
+  }
+
+  private constructor(panel: vscode.WebviewPanel, extensionPath: string) {
+    this.panel = panel;
+    this.panel.webview.html = loadWebviewHtml(extensionPath, "railroad.html");
+
+    this.disposables.push(
+      this.panel.onDidDispose(() => this.dispose()),
+      vscode.workspace.onDidChangeTextDocument((e) => {
+        if (this.trackedUri && e.document.uri.toString() === this.trackedUri.toString()) {
+          this.scheduleRefresh();
+        }
+      }),
+      vscode.window.onDidChangeActiveTextEditor((editor) => {
+        if (editor && editor.document.languageId === "pars") {
+          this.track(editor.document.uri);
+        }
+      })
+    );
+  }
+
+  private track(uri: vscode.Uri) {
+    this.trackedUri = uri;
+    this.panel.title = `pars: ${path.basename(uri.fsPath)}`;
+    void this.refresh();
+  }
+
+  private scheduleRefresh() {
+    if (this.refreshTimer) clearTimeout(this.refreshTimer);
+    this.refreshTimer = setTimeout(() => void this.refresh(), 150);
+  }
+
+  private async refresh() {
+    if (!this.trackedUri || !client) return;
+    try {
+      const response = (await client.sendRequest("pars/railroad", {
+        textDocument: { uri: this.trackedUri.toString() },
+      })) as RailroadResponse;
+      if (response.ok) {
+        this.panel.webview.postMessage({
+          kind: "update",
+          rules: response.rules,
+          where: response.where,
+          entry: response.entry,
+        });
+      } else {
+        this.panel.webview.postMessage({
+          kind: "compile_errors",
+          errors: response.errors,
+        });
+      }
+    } catch (err) {
+      this.panel.webview.postMessage({
+        kind: "error",
+        message: err instanceof Error ? err.message : String(err),
+      });
+    }
+  }
+
+  private dispose() {
+    RailroadPanel.current = undefined;
+    if (this.refreshTimer) clearTimeout(this.refreshTimer);
+    for (const d of this.disposables) d.dispose();
+    this.panel.dispose();
+  }
+}

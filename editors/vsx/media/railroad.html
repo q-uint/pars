@@ -1,0 +1,164 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+  <meta charset="UTF-8">
+  <meta http-equiv="Content-Security-Policy"
+    content="default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline';">
+  <link rel="stylesheet" href="webview.css">
+  <link rel="stylesheet" href="railroad-diagrams.css">
+  <style>
+    body.railroad {
+      padding: 12px 16px;
+    }
+
+    .footer {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      margin-top: 12px;
+      padding-top: 6px;
+      border-top: 1px solid var(--vscode-panel-border);
+    }
+
+    .footer .credit {
+      flex: 1;
+    }
+
+    .footer button {
+      padding: 2px 8px;
+      background: var(--vscode-button-secondaryBackground);
+      color: var(--vscode-button-secondaryForeground);
+      border: none;
+      cursor: pointer;
+      font-family: inherit;
+      font-size: 0.85em;
+    }
+
+    .footer button:hover {
+      background: var(--vscode-button-secondaryHoverBackground);
+    }
+
+    #diagram {
+      overflow-x: auto;
+      padding: 8px 0;
+    }
+
+    /* Fit mode: the diagram SVG scales down to the panel width,
+       preserving its aspect ratio. Scroll mode is the default and
+       keeps natural sizing so dense diagrams stay legible. */
+    body.railroad.fit #diagram {
+      overflow-x: hidden;
+    }
+
+    body.railroad.fit #diagram svg.railroad-diagram {
+      width: 100%;
+      height: auto;
+      max-width: 100%;
+    }
+
+    #diagram svg.railroad-diagram {
+      background: transparent;
+    }
+
+    #diagram svg.railroad-diagram path {
+      stroke: var(--vscode-editor-foreground);
+    }
+
+    #diagram svg.railroad-diagram rect {
+      stroke: var(--vscode-editor-foreground);
+      fill: var(--vscode-editor-background);
+    }
+
+    #diagram svg.railroad-diagram g.non-terminal,
+    #diagram svg.railroad-diagram g.non-terminal rect,
+    #diagram svg.railroad-diagram g.non-terminal text,
+    #diagram svg.railroad-diagram g.collapse-header,
+    #diagram svg.railroad-diagram g.collapse-header rect,
+    #diagram svg.railroad-diagram g.collapse-header text {
+      cursor: pointer;
+    }
+
+    #diagram svg.railroad-diagram g.non-terminal.expanded rect {
+      fill: var(--vscode-editor-selectionBackground, var(--vscode-list-activeSelectionBackground));
+    }
+
+    /* Expansion headers get a color keyed to their depth so nested
+       expansions visually bracket. The `--depth` CSS variable is set
+       inline per-element during post-render tagging. Colors rotate
+       through the hue circle; lightness/saturation stay modest so
+       the accent still reads on both light and dark themes. */
+    #diagram svg.railroad-diagram g.collapse-header rect {
+      fill: hsl(calc(var(--depth, 1) * 55), 55%, 65%);
+      stroke: hsl(calc(var(--depth, 1) * 55), 45%, 35%);
+    }
+
+    #diagram svg.railroad-diagram g.collapse-header text {
+      fill: var(--vscode-editor-foreground);
+    }
+
+    #diagram svg.railroad-diagram g.non-terminal.cycle rect {
+      stroke-dasharray: 4 2;
+      opacity: 0.65;
+    }
+
+    #diagram svg.railroad-diagram g.non-terminal.cycle text::after {
+      content: " (cycle)";
+    }
+
+    #diagram svg.railroad-diagram text {
+      fill: var(--vscode-editor-foreground);
+      font-family: var(--vscode-editor-font-family);
+    }
+
+    #diagram svg.railroad-diagram g.terminal rect {
+      fill: var(--vscode-textCodeBlock-background, var(--vscode-editor-background));
+    }
+
+    /* Operator labels (!, &, longest, captures, bounded quantifiers)
+       are rendered through the library's Terminal primitive so they
+       get a box (v1.0.0 has no Group). This class, applied after
+       render based on build order, distinguishes them from real
+       match-literal terminals: transparent fill + dashed stroke so
+       the reader sees "annotation" rather than "literal to match". */
+    #diagram svg.railroad-diagram g.operator-label rect {
+      fill: transparent;
+      stroke-dasharray: 3 2;
+      opacity: 0.75;
+    }
+
+    #diagram svg.railroad-diagram g.operator-label text {
+      font-style: italic;
+    }
+
+    .hint {
+      color: var(--vscode-descriptionForeground);
+      font-size: 0.85em;
+      margin-top: 4px;
+    }
+  </style>
+</head>
+
+<body class="railroad">
+  <div class="row">
+    <label for="rule">Rule</label>
+    <select id="rule"></select>
+    <p class="hint">Click a rule reference to expand it inline. Click again to collapse.</p>
+  </div>
+  <div id="diagram">
+    <p class="empty">Loading…</p>
+  </div>
+  <div class="footer">
+    <span class="hint credit">
+      Diagrams rendered with <a href="https://github.com/tabatkins/railroad-diagrams">tabatkins/railroad-diagrams</a>.
+    </span>
+    <button id="fit-toggle" type="button" title="Toggle between horizontal scroll and fit-to-width">
+      Scale: scroll
+    </button>
+  </div>
+
+  <script src="railroad-diagrams.js"></script>
+  <script src="railroad.js"></script>
+</body>
+
+</html>

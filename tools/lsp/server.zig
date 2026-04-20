@@ -10,11 +10,13 @@
 //!   * textDocument/references, prepareRename, rename, codeLens
 //!   * textDocument/completion (rules, captures-in-scope, keywords)
 //!   * pars/disassemble (chunk + constants), pars/runRule (VM probe)
+//!   * pars/railroad (AST-lowered diagram IR for the webview renderer)
 
 const std = @import("std");
 const pars = @import("pars");
 const symbols = @import("symbols.zig");
 const stdlib = @import("stdlib.zig");
+const railroad = @import("railroad.zig");
 
 const Allocator = std.mem.Allocator;
 const Io = std.Io;
@@ -790,6 +792,8 @@ pub const Server = struct {
             try self.handleDisassemble(id.?, params orelse return);
         } else if (std.mem.eql(u8, method, "pars/runRule")) {
             try self.handleRunRule(id.?, params orelse return);
+        } else if (std.mem.eql(u8, method, "pars/railroad")) {
+            try self.handleRailroad(id.?, params orelse return);
         } else if (id) |rid| {
             // Unknown request — reply with MethodNotFound per JSON-RPC.
             try self.writeError(rid, -32601, "method not found");
@@ -1671,6 +1675,118 @@ pub const Server = struct {
             },
             .compile_error => unreachable,
         }
+        try s.endObject();
+        try s.endObject();
+
+        try writeMessage(self.writer, aw.writer.buffered());
+    }
+
+    // Parse the document into an AST, lower each rule body to a
+    // railroad-diagram node tree, and serialize the whole thing to
+    // JSON. The webview renders rules independently and supports
+    // inline expansion by looking up referenced rules in the returned
+    // map, so the response carries every rule, not just the entry.
+    fn handleRailroad(self: *Server, id: std.json.Value, params: std.json.Value) !void {
+        const td = params.object.get("textDocument") orelse return self.writeResult(id, .null);
+        const uri = getString(td, "uri") orelse return self.writeResult(id, .null);
+        const doc = self.documents.get(uri) orelse return self.writeResult(id, .null);
+
+        var parser = pars.ast.Parser.init(self.alloc, doc.text);
+        defer parser.deinit();
+        const parsed = try parser.parse();
+
+        var aw = std.Io.Writer.Allocating.init(self.alloc);
+        defer aw.deinit();
+        var s: std.json.Stringify = .{ .writer = &aw.writer };
+
+        try s.beginObject();
+        try s.objectField("jsonrpc");
+        try s.write("2.0");
+        try s.objectField("id");
+        try s.write(id);
+        try s.objectField("result");
+        try s.beginObject();
+        try s.objectField("uri");
+        try s.write(uri);
+
+        if (!parsed.ok()) {
+            try s.objectField("ok");
+            try s.write(false);
+            try s.objectField("errors");
+            try s.beginArray();
+            for (parsed.errors) |e| {
+                try s.beginObject();
+                try s.objectField("line");
+                try s.write(e.span.line);
+                try s.objectField("column");
+                try s.write(e.span.start);
+                try s.objectField("message");
+                try s.write(e.message);
+                try s.endObject();
+            }
+            try s.endArray();
+            try s.endObject();
+            try s.endObject();
+            try writeMessage(self.writer, aw.writer.buffered());
+            return;
+        }
+
+        // Lower each rule into its own arena-allocated node tree. The
+        // arena's lifetime is this request; JSON serialization happens
+        // before it's freed.
+        var arena = std.heap.ArenaAllocator.init(self.alloc);
+        defer arena.deinit();
+        const aalloc = arena.allocator();
+
+        try s.objectField("ok");
+        try s.write(true);
+        try s.objectField("rules");
+        try s.beginObject();
+        var last_rule_name: ?[]const u8 = null;
+        for (parsed.program.items) |item| {
+            const rule = switch (item) {
+                .rule => |r| r,
+                else => continue,
+            };
+            const node = try railroad.lower(aalloc, rule.body);
+            try s.objectField(rule.name);
+            try railroad.writeJson(&s, node);
+            last_rule_name = rule.name;
+        }
+        try s.endObject();
+
+        // Where-scope: per top-level rule, the bodies of its
+        // where-bindings. The webview prefers this over the global
+        // rules map when resolving non-terminal clicks so
+        // `string where triple = …` expands to the local definition
+        // rather than falling back to a same-named top-level rule
+        // (or missing entirely, as before this field existed).
+        try s.objectField("where");
+        try s.beginObject();
+        for (parsed.program.items) |item| {
+            const rule = switch (item) {
+                .rule => |r| r,
+                else => continue,
+            };
+            if (rule.where_bindings.len == 0) continue;
+            try s.objectField(rule.name);
+            try s.beginObject();
+            for (rule.where_bindings) |b| {
+                const node = try railroad.lower(aalloc, b.body);
+                try s.objectField(b.name);
+                try railroad.writeJson(&s, node);
+            }
+            try s.endObject();
+        }
+        try s.endObject();
+
+        // Default entry: the last rule declared, matching the
+        // compiler's auto-entry behavior when the source has no bare
+        // expression. The webview uses this as the initial rule to
+        // render; the user can pick another from the rule list.
+        try s.objectField("entry");
+        if (last_rule_name) |n| try s.write(n) else try s.write(null);
+
         try s.endObject();
         try s.endObject();
 
@@ -2989,6 +3105,37 @@ test "server: codeLens emits one lens per top-level rule" {
     // bytes here so the literal string check matches the JSON output.
     try std.testing.expect(std.mem.indexOf(u8, out, "\"Match\u{2026}\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "\"pars.runRule\"") != null);
+}
+
+test "server: railroad returns per-rule diagram IR" {
+    const alloc = std.testing.allocator;
+
+    var aw = std.Io.Writer.Allocating.init(alloc);
+    defer aw.deinit();
+
+    var server = Server.init(alloc, &aw.writer);
+    defer server.deinit();
+
+    try server.handleMessage(
+        \\{"jsonrpc":"2.0","method":"textDocument/didOpen","params":{"textDocument":{"uri":"file:///x.pars","languageId":"pars","version":1,"text":"digit = ['0'-'9'];\nnum = digit+;\nkv = k \"=\" v where k = digit; v = digit end"}}}
+    );
+    aw.writer.end = 0;
+
+    try server.handleMessage(
+        \\{"jsonrpc":"2.0","id":77,"method":"pars/railroad","params":{"textDocument":{"uri":"file:///x.pars"}}}
+    );
+
+    const out = aw.writer.buffered();
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"id\":77") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"ok\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"digit\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"num\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"one_or_more\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"non_terminal\"") != null);
+    // Where-bindings show up in a per-rule scope map.
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"where\":{\"kv\":") != null);
+    // Entry points at the last rule declared.
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"entry\":\"kv\"") != null);
 }
 
 test "server: disassemble returns structured bytecode" {

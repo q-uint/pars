@@ -167,8 +167,6 @@ test "empty program matches nothing" {
     try expectMatch("", "", .ok);
 }
 
-// -- Choice tests --
-
 test "choice picks first matching alternative" {
     try expectMatch("\"GET\" / \"POST\"", "GET /", .ok);
 }
@@ -212,8 +210,6 @@ test "choice in rules" {
         .ok,
     );
 }
-
-// -- Quantifier tests --
 
 test "star matches zero occurrences" {
     try expectMatch("'a'*", "", .ok);

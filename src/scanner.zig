@@ -273,6 +273,17 @@ pub const Scanner = struct {
                 self.current + 2 < self.source.len and
                 self.source[self.current + 2] == '"')
             {
+                // A run of four or more `"` means the leading quotes
+                // belong to the body: only the final three close the
+                // string. This lets a body end in trailing quotes
+                // without an escape mechanism, e.g. `"""a":""""""` is
+                // body `a":"` followed by a three-quote close.
+                if (self.current + 3 < self.source.len and
+                    self.source[self.current + 3] == '"')
+                {
+                    _ = self.advance();
+                    continue;
+                }
                 _ = self.advance();
                 _ = self.advance();
                 _ = self.advance();
@@ -311,6 +322,15 @@ pub const Scanner = struct {
                 self.current + 2 < self.source.len and
                 self.source[self.current + 2] == '"')
             {
+                // Same trailing-quote rule as plain triple strings:
+                // only close when the next byte isn't another `"`, so
+                // a body can end in one or more quote characters.
+                if (self.current + 3 < self.source.len and
+                    self.source[self.current + 3] == '"')
+                {
+                    _ = self.advance();
+                    continue;
+                }
                 _ = self.advance();
                 _ = self.advance();
                 _ = self.advance();
@@ -523,6 +543,27 @@ test "unterminated string produces error" {
     const tok = s.scanToken();
     try std.testing.expectEqual(TokenType.err, tok.type);
     try std.testing.expectEqualStrings("Unterminated string.", tok.lexeme);
+}
+
+test "triple-quoted body may end in trailing quotes" {
+    // Body is `a":"` (ending in `"`); close is `"""`; total trailing
+    // quotes = 4. The scanner must let the leading `"` belong to the
+    // body and close only on the final three.
+    var s = Scanner.init("\"\"\"a\":\"\"\"\"\"");
+    const tok = s.scanToken();
+    try std.testing.expectEqual(TokenType.string, tok.type);
+    try std.testing.expectEqualStrings("\"\"\"a\":\"\"\"\"\"", tok.lexeme);
+    const tail = s.scanToken();
+    try std.testing.expectEqual(TokenType.eof, tail.type);
+}
+
+test "tagged string body may end in trailing quotes" {
+    var s = Scanner.init("@abnf\"\"\"x = \"end\"\"\"\"");
+    const tok = s.scanToken();
+    try std.testing.expectEqual(TokenType.tagged_string, tok.type);
+    try std.testing.expectEqualStrings("@abnf\"\"\"x = \"end\"\"\"\"", tok.lexeme);
+    const tail = s.scanToken();
+    try std.testing.expectEqual(TokenType.eof, tail.type);
 }
 
 test "unterminated triple-quoted string" {

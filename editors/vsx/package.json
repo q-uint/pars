@@ -46,6 +46,11 @@
         "icon": "$(file-binary)"
       },
       {
+        "command": "pars.showRailroad",
+        "title": "pars: Show Railroad",
+        "icon": "$(preview)"
+      },
+      {
         "command": "pars.runRule",
         "title": "pars: Run Rule",
         "icon": "$(play)"
@@ -59,6 +64,11 @@
           "group": "navigation"
         },
         {
+          "command": "pars.showRailroad",
+          "when": "resourceLangId == pars",
+          "group": "navigation"
+        },
+        {
           "command": "pars.runRule",
           "when": "resourceLangId == pars",
           "group": "navigation"
@@ -67,6 +77,10 @@
       "commandPalette": [
         {
           "command": "pars.showBytecode",
+          "when": "resourceLangId == pars"
+        },
+        {
+          "command": "pars.showRailroad",
           "when": "resourceLangId == pars"
         },
         {
@@ -93,8 +107,11 @@
     }
   },
   "scripts": {
-    "compile": "bun build src/extension.ts --outfile=out/extension.js --target=node --format=cjs --external=vscode",
-    "watch": "bun build src/extension.ts --outfile=out/extension.js --target=node --format=cjs --external=vscode --watch"
+    "copy-deps": "mkdir -p out && cp node_modules/railroad-diagrams/railroad-diagrams.js node_modules/railroad-diagrams/railroad-diagrams.css out/",
+    "build-extension": "bun build src/extension.ts --outfile=out/extension.js --target=node --format=cjs --external=vscode",
+    "build-webviews": "bun build src/webview/railroad.ts --outfile=out/railroad.js --target=browser --format=iife",
+    "compile": "bun run copy-deps && bun run build-extension && bun run build-webviews",
+    "watch": "bun run copy-deps && bun run build-extension --watch"
   },
   "dependencies": {
     "vscode-languageclient": "^9.0.1"
@@ -102,6 +119,7 @@
   "devDependencies": {
     "@types/node": "^20.0.0",
     "@types/vscode": "^1.85.0",
+    "railroad-diagrams": "1.0.0",
     "typescript": "^5.3.0"
   }
 }

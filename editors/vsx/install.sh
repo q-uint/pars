@@ -51,16 +51,18 @@ mkdir -p "${here}/icons"
 cp "${root}/assets/logo.svg" "${here}/icons/pars.svg"
 
 say "installing extension dependencies"
-(cd "${here}" && bun install --silent)
+# --frozen-lockfile: fail if package.json has drifted from bun.lock
+# instead of silently updating versions. Integrity hashes recorded in
+# the lockfile are enforced on every install this way.
+(cd "${here}" && bun install --silent --frozen-lockfile)
 
 # Bundle extension.ts with its runtime deps into a single CommonJS
-# file. `vscode` is provided by the host and must stay external.
+# file. `vscode` is provided by the host and must stay external. The
+# `copy-deps` step is baked into `bun run compile`; it stages the
+# railroad-diagrams library into out/ so the webview can pick it up
+# at runtime.
 say "bundling extension.js"
-(cd "${here}" && bunx bun build src/extension.ts \
-  --outfile=out/extension.js \
-  --target=node \
-  --format=cjs \
-  --external=vscode)
+(cd "${here}" && bun run compile)
 
 say "packaging .vsix"
 vsix_path="${here}/pars.vsix"

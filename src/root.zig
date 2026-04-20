@@ -2,6 +2,7 @@ const std = @import("std");
 
 pub const abnf = @import("abnf.zig");
 pub const abnf_lower = @import("abnf_lower.zig");
+pub const ast = @import("ast.zig");
 pub const chunk = @import("chunk.zig");
 pub const compiler = @import("compiler.zig");
 pub const debug = @import("debug.zig");

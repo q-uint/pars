@@ -12,6 +12,7 @@ const pratt = @import("pratt.zig");
 const peephole = @import("peephole.zig");
 const abnf = @import("abnf.zig");
 const abnf_lower = @import("abnf_lower.zig");
+const first_analysis = @import("analysis/first.zig");
 const Chunk = chunk_mod.Chunk;
 const OpCode = chunk_mod.OpCode;
 const Value = value_mod.Value;
@@ -238,10 +239,20 @@ pub const Compiler = struct {
     }
 
     pub fn compile(self: *Compiler, source: []const u8, chunk: *Chunk, rule_table: *RuleTable, obj_pool: *object.ObjPool) bool {
-        self.scanner = Scanner.init(source);
+        // Source pre-pass: any `#[longest](...)` whose arms are
+        // provably disjoint on FIRST is rewritten byte-preservingly
+        // into a plain parenthesized group, demoting longest-match
+        // to ordered choice. Failure to rewrite (OOM, syntactic
+        // error in pre-parse) falls through to the original source;
+        // the main compiler will report any real syntax errors.
+        const owned_rewrite = first_analysis.rewriteDemotableLongests(self.alloc, source) catch null;
+        const effective_source = if (owned_rewrite) |buf| buf else source;
+        defer if (owned_rewrite) |buf| self.alloc.free(buf);
+
+        self.scanner = Scanner.init(effective_source);
         self.obj_pool = obj_pool;
         self.compiling_chunk = chunk;
-        self.compiling_source = source;
+        self.compiling_source = effective_source;
         self.compiling_rules = rule_table;
         self.last_rule_name = null;
         self.had_expression = false;

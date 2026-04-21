@@ -31,6 +31,7 @@ const fixtures = [_]Fixture{
     .{ .name = "keyword-exclusion", .grammar = "examples/keyword-exclusion.pars", .input = "hello" },
     .{ .name = "left-recursive-expr", .grammar = "examples/left-recursive-expr.pars", .input = "1+2-3+4" },
     .{ .name = "longest-match", .grammar = "examples/longest-match.pars", .input = "<=" },
+    .{ .name = "abnf-disjoint-alts", .grammar = "examples/abnf-disjoint-alts.pars", .input = "+-*=<>!&|^" },
     .{ .name = "quoted-word", .grammar = "examples/quoted-word.pars", .input = "'hello'" },
     // Heaviest fixture: use the pars-grammar-validator from stdlib
     // to validate a real .pars file. Exercises the whole stdlib

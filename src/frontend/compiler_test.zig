@@ -1,10 +1,10 @@
 const std = @import("std");
-const chunk_mod = @import("chunk.zig");
+const chunk_mod = @import("../runtime/chunk.zig");
 const Chunk = chunk_mod.Chunk;
 const OpCode = chunk_mod.OpCode;
-const object = @import("object.zig");
+const object = @import("../runtime/object.zig");
 const compiler_mod = @import("compiler.zig");
-const peephole = @import("peephole.zig");
+const peephole = @import("../peephole.zig");
 const Compiler = compiler_mod.Compiler;
 const RuleTable = compiler_mod.RuleTable;
 

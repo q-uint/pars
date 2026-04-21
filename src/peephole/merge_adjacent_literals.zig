@@ -1,7 +1,7 @@
 const std = @import("std");
-const chunk_mod = @import("../chunk.zig");
-const object = @import("../object.zig");
-const value_mod = @import("../value.zig");
+const chunk_mod = @import("../runtime/chunk.zig");
+const object = @import("../runtime/object.zig");
+const value_mod = @import("../runtime/value.zig");
 
 const Chunk = chunk_mod.Chunk;
 const OpCode = chunk_mod.OpCode;

@@ -15,7 +15,7 @@
 //! is deliberately conservative: any uncertainty disables demotion.
 
 const std = @import("std");
-const ast = @import("../ast.zig");
+const ast = @import("../frontend/ast.zig");
 
 /// Result of analyzing a single expression. `bits` is a 256-bit
 /// membership set, MSB-within-byte layout matching the runtime
@@ -192,79 +192,50 @@ pub fn canDemoteLongest(arms: []const ast.Expr) bool {
     return true;
 }
 
-/// Source-level pre-pass: rewrite every `#[longest](...)` group whose
-/// arms have pairwise-disjoint, non-nullable FIRST sets into a plain
-/// `(...)` group. The rewrite is byte-preserving — the `#[longest]`
-/// prefix is overwritten with spaces up to and including the closing
-/// `]`, and the opening `(` is left in place. On re-scan the tokens
-/// read as a parenthesized expression, which compiles via the ordered
-/// `/` path instead of the longest-match opcode family.
+/// Source-level rewrite: for every `#[longest](...)` group whose arms
+/// have pairwise-disjoint, non-nullable FIRST sets, overwrite the
+/// `#[longest]` prefix (up to and including the closing `]`) with
+/// spaces. The opening `(` is left in place, so on re-scan the tokens
+/// read as a parenthesized expression and the compiler emits ordered
+/// choice instead of longest-match.
 ///
-/// Preserves byte offsets so source spans, line/column diagnostics,
-/// and ABNF span maps need no remapping.
-///
-/// Returns `null` when no rewrites apply (the caller should reuse the
-/// original source). Returns an owned buffer otherwise.
-pub fn rewriteDemotableLongests(
+/// Rewrites in place. Byte-preserving, so all existing source offsets
+/// — line/column diagnostics, ABNF span maps — remain valid without
+/// remapping. A parse failure leaves the buffer untouched; the main
+/// compiler will report the same errors.
+pub fn demoteLongestInPlace(
     allocator: std.mem.Allocator,
-    source: []const u8,
-) !?[]u8 {
+    source: []u8,
+) !void {
     var parser = ast.Parser.init(allocator, source);
     defer parser.deinit();
-    const result = parser.parse() catch return null;
-    // A syntactically invalid source isn't rewritten — the main
-    // compiler will report the same errors on the original bytes.
-    if (!result.ok()) return null;
-
-    var edits: std.ArrayList(u32) = .empty;
-    defer edits.deinit(allocator);
+    const result = parser.parse() catch return;
+    if (!result.ok()) return;
 
     for (result.program.items) |item| {
         switch (item) {
             .rule => |r| {
-                try collectDemotable(allocator, &r.body, &edits);
-                for (r.where_bindings) |wb| {
-                    try collectDemotable(allocator, &wb.body, &edits);
-                }
+                demoteInExpr(&r.body, source);
+                for (r.where_bindings) |wb| demoteInExpr(&wb.body, source);
             },
-            .bare_expr => |e| try collectDemotable(allocator, &e, &edits),
+            .bare_expr => |e| demoteInExpr(&e, source),
             .use_decl, .tagged_block => {},
         }
     }
-
-    if (edits.items.len == 0) return null;
-
-    const out = try allocator.dupe(u8, source);
-    for (edits.items) |start| {
-        // Scan forward from the `#` for the `]` that closes `[longest]`.
-        // Nothing inside the attribute bracket can be a `]` itself, so
-        // the first one is always the right one.
-        var i: usize = start;
-        while (i < out.len and out[i] != ']') : (i += 1) {}
-        if (i >= out.len) continue;
-        @memset(out[start .. i + 1], ' ');
-    }
-    return out;
 }
 
-fn collectDemotable(
-    allocator: std.mem.Allocator,
-    expr: *const ast.Expr,
-    out: *std.ArrayList(u32),
-) !void {
+fn demoteInExpr(expr: *const ast.Expr, source: []u8) void {
     switch (expr.kind) {
         .longest => |arms| {
-            if (canDemoteLongest(arms)) {
-                try out.append(allocator, expr.span.start);
-            }
-            for (arms) |*a| try collectDemotable(allocator, a, out);
+            if (canDemoteLongest(arms)) blank(source, expr.span.start);
+            for (arms) |*a| demoteInExpr(a, source);
         },
-        .sequence => |parts| for (parts) |*p| try collectDemotable(allocator, p, out),
-        .choice => |arms| for (arms) |*a| try collectDemotable(allocator, a, out),
-        .group => |inner| try collectDemotable(allocator, inner, out),
-        .capture => |cap| try collectDemotable(allocator, cap.body, out),
-        .quantifier => |q| try collectDemotable(allocator, q.operand, out),
-        .lookahead => |la| try collectDemotable(allocator, la.operand, out),
+        .sequence => |parts| for (parts) |*p| demoteInExpr(p, source),
+        .choice => |arms| for (arms) |*a| demoteInExpr(a, source),
+        .group => |inner| demoteInExpr(inner, source),
+        .capture => |cap| demoteInExpr(cap.body, source),
+        .quantifier => |q| demoteInExpr(q.operand, source),
+        .lookahead => |la| demoteInExpr(la.operand, source),
         .rule_ref,
         .string_lit,
         .char_lit,
@@ -274,6 +245,16 @@ fn collectDemotable(
         .cut_labeled,
         => {},
     }
+}
+
+fn blank(source: []u8, longest_start: u32) void {
+    // Blank `#` through the `]` that closes the attribute bracket.
+    // Nothing inside `[longest]` is itself a `]`, so the first one
+    // found is always the right one.
+    var i: usize = longest_start;
+    while (i < source.len and source[i] != ']') : (i += 1) {}
+    if (i >= source.len) return;
+    @memset(source[longest_start .. i + 1], ' ');
 }
 
 // Decode the first logical byte of a string-literal's raw content,
@@ -599,6 +580,56 @@ test "canDemoteLongest: case-insensitive overlap blocks demotion" {
     defer f.deinit();
     const arms = f.ruleBody(0).kind.longest;
     try testing.expect(!canDemoteLongest(arms));
+}
+
+test "demoteLongestInPlace: disjoint literals are demoted" {
+    const src = "a = #[longest](\"GET\" / \"POST\" / \"DELETE\");";
+    const buf = try testing.allocator.dupe(u8, src);
+    defer testing.allocator.free(buf);
+    try demoteLongestInPlace(testing.allocator, buf);
+    // `#[longest]` prefix is blanked; `(` is kept.
+    try testing.expectEqualStrings(
+        "a =           (\"GET\" / \"POST\" / \"DELETE\");",
+        buf,
+    );
+}
+
+test "demoteLongestInPlace: overlapping arms are untouched" {
+    const src = "a = #[longest](\"GET\" / \"GETS\");";
+    const buf = try testing.allocator.dupe(u8, src);
+    defer testing.allocator.free(buf);
+    try demoteLongestInPlace(testing.allocator, buf);
+    try testing.expectEqualStrings(src, buf);
+}
+
+test "demoteLongestInPlace: buffer is byte-preserving" {
+    const src = "a = #[longest](\"x\" / \"y\");\nb = c;\n";
+    const buf = try testing.allocator.dupe(u8, src);
+    defer testing.allocator.free(buf);
+    try demoteLongestInPlace(testing.allocator, buf);
+    try testing.expectEqual(src.len, buf.len);
+    // Only the `#[longest]` prefix was rewritten; newlines unchanged.
+    try testing.expectEqual(@as(usize, std.mem.count(u8, src, "\n")), std.mem.count(u8, buf, "\n"));
+}
+
+test "demoteLongestInPlace: descends into rule bodies and where-blocks" {
+    const src =
+        \\a = b
+        \\  where b = #[longest]("x" / "y") end
+        \\;
+    ;
+    const buf = try testing.allocator.dupe(u8, src);
+    defer testing.allocator.free(buf);
+    try demoteLongestInPlace(testing.allocator, buf);
+    try testing.expect(std.mem.indexOf(u8, buf, "#[longest]") == null);
+}
+
+test "demoteLongestInPlace: parse failures leave buffer intact" {
+    const src = "not a grammar at all { } ???";
+    const buf = try testing.allocator.dupe(u8, src);
+    defer testing.allocator.free(buf);
+    try demoteLongestInPlace(testing.allocator, buf);
+    try testing.expectEqualStrings(src, buf);
 }
 
 test "canDemoteLongest: single arm is not a candidate" {

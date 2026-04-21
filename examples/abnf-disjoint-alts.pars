@@ -1,0 +1,14 @@
+-- Exercises the FIRST-disjointness demotion for ABNF-generated
+-- `#[longest]` groups. Every alternative of `op` starts with a
+-- distinct byte, so ordered choice matches exactly the same strings
+-- as longest-match — the lowering-time wrapper is stripped at compile
+-- time and the per-byte dispatch is a plain `/` chain.
+--
+-- Usage:
+--   echo -n "+-*=<>!&|^" | pars examples/abnf-disjoint-alts.pars
+
+@abnf"""
+op = "+" / "-" / "*" / "=" / "<" / ">" / "!" / "&" / "|" / "^"
+"""
+
+entry = op+;

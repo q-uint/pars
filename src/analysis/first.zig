@@ -55,19 +55,41 @@ pub const FirstInfo = struct {
     }
 };
 
+/// Opaque adapter supplying FIRST/nullable for rule references during
+/// analysis. Passing `null` for the resolver preserves the
+/// purely-local semantics: any `rule_ref` becomes `null` ("unknown,
+/// do not optimize"). A whole-grammar driver (see `grammar.zig`)
+/// supplies a resolver backed by its fixed-point rule table.
+pub const Resolver = struct {
+    ctx: *const anyopaque,
+    lookupFn: *const fn (ctx: *const anyopaque, name: []const u8) ?FirstInfo,
+
+    pub fn lookup(self: Resolver, name: []const u8) ?FirstInfo {
+        return self.lookupFn(self.ctx, name);
+    }
+};
+
 /// Compute FIRST/nullable for `expr`. Returns `null` on any construct
 /// outside the local core (rule references, back-references). Callers
 /// must treat `null` as "unknown — do not optimize".
 pub fn computeLocal(expr: *const ast.Expr) ?FirstInfo {
-    return computeKind(expr.kind);
+    return computeWithResolver(expr, null);
 }
 
-fn computeKind(kind: ast.ExprKind) ?FirstInfo {
+/// Same as `computeLocal`, but consults `resolver` on `rule_ref`
+/// nodes. Passing `null` reproduces the local-only behavior.
+pub fn computeWithResolver(expr: *const ast.Expr, resolver: ?Resolver) ?FirstInfo {
+    return computeKind(expr.kind, resolver);
+}
+
+fn computeKind(kind: ast.ExprKind, resolver: ?Resolver) ?FirstInfo {
     return switch (kind) {
-        // A rule_ref's FIRST is the referenced rule's FIRST, which the
-        // local analysis doesn't have. Phase-2 grammar analysis fills
-        // this in.
-        .rule_ref => null,
+        // A rule_ref's FIRST is the referenced rule's FIRST. Without a
+        // resolver the local analysis can't supply one; with a
+        // resolver we delegate. The resolver also returns null for
+        // unknown or unanalyzable names, so this branch's null
+        // contract is unchanged.
+        .rule_ref => |name| if (resolver) |r| r.lookup(name) else null,
 
         // `.` matches any single byte.
         .any_byte => blk: {
@@ -106,9 +128,9 @@ fn computeKind(kind: ast.ExprKind) ?FirstInfo {
             break :blk info;
         },
 
-        .group => |inner| computeLocal(inner),
+        .group => |inner| computeWithResolver(inner, resolver),
 
-        .capture => |cap| computeLocal(cap.body),
+        .capture => |cap| computeWithResolver(cap.body, resolver),
 
         // Sequence: walk left-to-right, unioning each part's FIRST
         // into the result and stopping as soon as a non-nullable part
@@ -116,7 +138,7 @@ fn computeKind(kind: ast.ExprKind) ?FirstInfo {
         .sequence => |parts| blk: {
             var info = FirstInfo.epsilon();
             for (parts) |*p| {
-                const part = computeLocal(p) orelse break :blk null;
+                const part = computeWithResolver(p, resolver) orelse break :blk null;
                 info.unionInto(part);
                 if (!part.nullable) {
                     info.nullable = false;
@@ -131,7 +153,7 @@ fn computeKind(kind: ast.ExprKind) ?FirstInfo {
         .choice, .longest => |arms| blk: {
             var info = FirstInfo.empty();
             for (arms) |*a| {
-                const arm = computeLocal(a) orelse break :blk null;
+                const arm = computeWithResolver(a, resolver) orelse break :blk null;
                 info.unionInto(arm);
                 if (arm.nullable) info.nullable = true;
             }
@@ -139,7 +161,7 @@ fn computeKind(kind: ast.ExprKind) ?FirstInfo {
         },
 
         .quantifier => |q| blk: {
-            const operand = computeLocal(q.operand) orelse break :blk null;
+            const operand = computeWithResolver(q.operand, resolver) orelse break :blk null;
             break :blk switch (q.kind) {
                 .star, .question => FirstInfo{ .bits = operand.bits, .nullable = true },
                 .plus => operand,

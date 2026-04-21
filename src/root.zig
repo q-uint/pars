@@ -2,10 +2,7 @@ const std = @import("std");
 
 pub const abnf = @import("abnf/abnf.zig");
 pub const abnf_lower = @import("abnf/abnf_lower.zig");
-pub const analysis = struct {
-    pub const first = @import("analysis/first.zig");
-    pub const grammar = @import("analysis/grammar.zig");
-};
+pub const analysis = @import("analysis.zig");
 pub const ast = @import("frontend/ast.zig");
 pub const chunk = @import("runtime/chunk.zig");
 pub const compiler = @import("frontend/compiler.zig");

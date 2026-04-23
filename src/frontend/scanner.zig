@@ -254,6 +254,21 @@ pub const Scanner = struct {
         }
 
         while (self.peek() != '"' and !self.isAtEnd()) {
+            // A backslash consumes the next byte as part of an escape,
+            // which keeps `"\""`, `"\\"`, `"\n"`, etc. inside one
+            // token. Escape validity is enforced later by the
+            // decoder; the scanner's only job is to delimit the
+            // lexeme correctly.
+            if (self.peek() == '\\') {
+                _ = self.advance();
+                if (self.isAtEnd()) break;
+                if (self.peek() == '\n') {
+                    self.line += 1;
+                    self.line_start = self.current + 1;
+                }
+                _ = self.advance();
+                continue;
+            }
             if (self.peek() == '\n') {
                 self.line += 1;
                 self.line_start = self.current + 1;

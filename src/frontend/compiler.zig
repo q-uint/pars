@@ -12,7 +12,7 @@ const pratt = @import("pratt.zig");
 const peephole = @import("../peephole.zig");
 const abnf = @import("../abnf/abnf.zig");
 const abnf_lower = @import("../abnf/abnf_lower.zig");
-const first_analysis = @import("../analysis/first.zig");
+const grammar_analysis = @import("../analysis/grammar.zig");
 const Chunk = chunk_mod.Chunk;
 const OpCode = chunk_mod.OpCode;
 const Value = value_mod.Value;
@@ -554,7 +554,7 @@ pub const Compiler = struct {
         // group to ordered choice when FIRST-disjointness proves the
         // semantics match. The rewrite is in place and byte-preserving,
         // so the ABNF span map below stays valid.
-        first_analysis.demoteLongestInPlace(self.alloc, owned_source) catch {};
+        grammar_analysis.demoteLongestInPlace(self.alloc, owned_source) catch {};
 
         // Sub-compile the generated pars source into the shared rule
         // table. Errors from the sub-compiler use positions in the
@@ -678,7 +678,7 @@ pub const Compiler = struct {
         if (self.parser.had_error) return;
 
         const raw = self.parser.previous.lexeme;
-        const path = literal.stripStringDelimiters(raw, 0);
+        const path = literal.stripStringDelimiters(raw, 0).body;
 
         const src = resolveStdlib(path) orelse {
             self.errorAtPrevious("Unknown module. Relative imports are not yet supported.");
@@ -1087,14 +1087,37 @@ pub const Compiler = struct {
     }
 
     pub fn stringLiteral(self: *Compiler) void {
-        const bytes = literal.stripStringDelimiters(self.parser.previous.lexeme, 0);
-        self.emitMatchString(.op_match_string, .op_match_string_wide, bytes);
+        self.emitStringLiteral(0, .op_match_string, .op_match_string_wide);
     }
 
     pub fn stringLiteralIgnoreCase(self: *Compiler) void {
         // The 'i' prefix counts as one extra leading byte before the quotes.
-        const bytes = literal.stripStringDelimiters(self.parser.previous.lexeme, 1);
-        self.emitMatchString(.op_match_string_i, .op_match_string_i_wide, bytes);
+        self.emitStringLiteral(1, .op_match_string_i, .op_match_string_i_wide);
+    }
+
+    // Resolve a string-literal lexeme to the byte sequence the runtime
+    // should match. Single-quoted strings decode escape sequences
+    // (`\n`, `\xNN`, etc.); triple-quoted strings are emitted verbatim.
+    // Escape errors surface as compile diagnostics; the compiler swallows
+    // the instruction so codegen can continue looking for further errors.
+    fn emitStringLiteral(self: *Compiler, prefix_len: usize, narrow: OpCode, wide: OpCode) void {
+        const stripped = literal.stripStringDelimiters(self.parser.previous.lexeme, prefix_len);
+        if (stripped.triple_quoted) {
+            self.emitMatchString(narrow, wide, stripped.body);
+            return;
+        }
+        const decoded = literal.decodeStringBody(self.alloc, stripped.body) catch |e| switch (e) {
+            error.OutOfMemory => {
+                self.errorAtPrevious("Out of memory.");
+                return;
+            },
+            else => |le| {
+                self.errorAtPrevious(literal.errorMessage(le));
+                return;
+            },
+        };
+        defer self.alloc.free(decoded);
+        self.emitMatchString(narrow, wide, decoded);
     }
 
     /// Compile a charset expression: `[` has already been consumed.
@@ -1495,7 +1518,7 @@ pub const Compiler = struct {
             return;
         }
         self.advance();
-        const bytes = literal.stripStringDelimiters(self.parser.previous.lexeme, 0);
+        const bytes = literal.stripStringDelimiters(self.parser.previous.lexeme, 0).body;
         const lit = self.obj_pool.copyLiteral(bytes) catch {
             self.errorAtPrevious("Out of memory.");
             return;

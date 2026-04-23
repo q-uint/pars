@@ -389,7 +389,7 @@ pub fn buildIndex(alloc: Allocator, source: []const u8) !Index {
                 // Strip the surrounding `"..."`. Triple-quoted strings
                 // are legal syntactically but meaningless here; we
                 // still handle them to avoid slicing into a delimiter.
-                const inner = stripStringDelimiters(str_tok.lexeme, 0);
+                const inner = stripStringDelimiters(str_tok.lexeme, 0).body;
                 const span: Span = .{
                     .start = str_tok.start,
                     .len = str_tok.len,

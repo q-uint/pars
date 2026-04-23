@@ -86,6 +86,29 @@ test "case-insensitive string rejects non-letters that differ" {
     try expectMatch("i\"a-b\"", "a_b", .no_match);
 }
 
+test "string literal decodes named escapes" {
+    try expectMatch("\"\\n\"", "\n", .ok);
+    try expectMatch("\"\\n\"", "\\n", .no_match);
+    try expectMatch("\"a\\tb\"", "a\tb", .ok);
+    try expectMatch("\"a\\\\b\"", "a\\b", .ok);
+    try expectMatch("\"\\\"\"", "\"", .ok);
+}
+
+test "string literal decodes hex escapes" {
+    try expectMatch("\"\\x41BC\"", "ABC", .ok);
+    try expectMatch("\"\\x00\"", &.{0}, .ok);
+}
+
+test "case-insensitive string decodes escapes" {
+    try expectMatch("i\"A\\tB\"", "a\tb", .ok);
+}
+
+test "triple-quoted string is raw (no escape decoding)" {
+    // The body \n is literally backslash + n, not a newline.
+    try expectMatch("\"\"\"\\n\"\"\"", "\\n", .ok);
+    try expectMatch("\"\"\"\\n\"\"\"", "\n", .no_match);
+}
+
 test "grouping compiles to the same code as the inner expression" {
     try expectMatch("(\"GET\")", "GET", .ok);
     try expectMatch("(\"GET\" \" \") \"/\"", "GET /", .ok);

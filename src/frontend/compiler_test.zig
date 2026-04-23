@@ -180,6 +180,38 @@ test "scanner error surfaces through compile with correct location" {
     try std.testing.expectEqual(@as(usize, 1), errs[0].column);
 }
 
+test "unknown escape in string literal is a compile error" {
+    const alloc = std.testing.allocator;
+    var result = try compileForTest(alloc, "a = \"\\q\";");
+    defer result.deinit();
+
+    try std.testing.expect(!result.ok);
+    const errs = result.compiler.getErrors();
+    try std.testing.expectEqual(@as(usize, 1), errs.len);
+    try std.testing.expectEqualStrings("Unknown escape sequence.", errs[0].message);
+}
+
+test "bad hex escape in string literal is a compile error" {
+    const alloc = std.testing.allocator;
+    var result = try compileForTest(alloc, "a = \"\\xZZ\";");
+    defer result.deinit();
+
+    try std.testing.expect(!result.ok);
+    const errs = result.compiler.getErrors();
+    try std.testing.expectEqual(@as(usize, 1), errs.len);
+    try std.testing.expectEqualStrings("Invalid hex digit in escape sequence.", errs[0].message);
+}
+
+test "triple-quoted string does not decode escapes" {
+    // The body \q would be an unknown escape in a single-quoted string,
+    // but triple-quoted strings are raw — this must compile cleanly.
+    const alloc = std.testing.allocator;
+    var result = try compileForTest(alloc, "a = \"\"\"\\q\"\"\";");
+    defer result.deinit();
+
+    try std.testing.expect(result.ok);
+}
+
 test "use std/abnf populates DIGIT in rule table" {
     const alloc = std.testing.allocator;
     var result = try compileForTest(alloc, "use \"std/abnf\";");

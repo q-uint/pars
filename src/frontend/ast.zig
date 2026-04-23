@@ -97,6 +97,18 @@ pub const ExprKind = union(enum) {
     /// Reference to an identifier: either a rule name, a where-binding,
     /// or a capture back-reference. The AST does not resolve which —
     /// that is a name-resolution concern for consumers.
+    ///
+    /// TODO: capture back-refs need separate analysis semantics. When
+    /// a back-ref's name shadows a top-level rule, FIRST analysis
+    /// currently treats the ref as a call to that rule. Safe for
+    /// disjointness (a superset FIRST cannot falsely claim
+    /// disjointness) but unsafe for nullable: a nullable capture body
+    /// whose name shadows a non-nullable rule gets the rule's
+    /// nullable=false, which `canDemoteLongest` relies on. Latent
+    /// today — ABNF-lowered source emits no captures, and
+    /// `demoteLongestInPlace` only runs on that source. Fix is either
+    /// a name-resolution pass before FIRST or an `is_backref` bit
+    /// populated at parse time.
     rule_ref: []const u8,
     string_lit: StringLit,
     char_lit: u8,
@@ -364,7 +376,7 @@ pub const Parser = struct {
         if (!self.consume(.string, "Expect a module-path string after 'use'.")) return null;
         const raw = self.previous;
         _ = self.match(.semicolon);
-        const path = literal.stripStringDelimiters(raw.lexeme, 0);
+        const path = literal.stripStringDelimiters(raw.lexeme, 0).body;
         return .{ .use_decl = .{
             .path = path,
             .path_span = tokSpan(raw),
@@ -680,16 +692,12 @@ pub const Parser = struct {
         const tok = self.current;
         self.advance();
         const prefix_len: usize = if (case_insensitive) 1 else 0;
-        const body = tok.lexeme[prefix_len..];
-        const triple = body.len >= 6 and
-            std.mem.startsWith(u8, body, "\"\"\"") and
-            std.mem.endsWith(u8, body, "\"\"\"");
-        const raw = literal.stripStringDelimiters(tok.lexeme, prefix_len);
+        const stripped = literal.stripStringDelimiters(tok.lexeme, prefix_len);
         return .{
             .kind = .{ .string_lit = .{
-                .raw = raw,
+                .raw = stripped.body,
                 .case_insensitive = case_insensitive,
-                .triple_quoted = triple,
+                .triple_quoted = stripped.triple_quoted,
             } },
             .span = tokSpan(tok),
         };
@@ -818,7 +826,7 @@ pub const Parser = struct {
         }
         const str_tok = self.current;
         self.advance();
-        const label = literal.stripStringDelimiters(str_tok.lexeme, 0);
+        const label = literal.stripStringDelimiters(str_tok.lexeme, 0).body;
         return .{
             .kind = .{ .cut_labeled = label },
             .span = .{

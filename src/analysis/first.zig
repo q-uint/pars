@@ -1,24 +1,43 @@
-//! Local FIRST / nullable analysis for a single `Expr`.
+//! FIRST / nullable analysis for a single `Expr`.
 //!
 //! Computes, for an expression, the set of input bytes that may begin
 //! a successful match (`bits`) and whether the expression may match
-//! the empty string (`nullable`). The analysis is purely local: any
-//! construct whose FIRST depends on another rule — a `rule_ref`, an
-//! as-yet unresolved back-reference — causes `computeLocal` to return
-//! `null`, meaning "unknown, do not optimize". A later whole-grammar
-//! pass can fold in a rule-table fixed point and extend this.
+//! the empty string (`nullable`). `computeLocal` is purely local: any
+//! construct whose FIRST depends on another rule -- a `rule_ref`, an
+//! as-yet unresolved back-reference -- returns `null`, meaning
+//! "unknown, do not optimize". `computeWithResolver` lifts that
+//! restriction by delegating `rule_ref` resolution to a `Resolver`;
+//! the whole-grammar pass in `grammar.zig` supplies one backed by a
+//! fixed-point rule table.
 //!
-//! The primary client is the compiler's `#[longest](...)` lowering.
-//! When every arm has a known, non-nullable FIRST and the arms are
-//! pairwise disjoint, ordered choice matches the same strings as the
-//! longest-match semantics — no backtrack-and-retry needed. The check
-//! is deliberately conservative: any uncertainty disables demotion.
+//! The primary client is the `#[longest](...)` demotion in
+//! `grammar.zig`. When every arm has a known, non-nullable FIRST
+//! and the arms are pairwise disjoint, ordered choice matches the
+//! same strings as the longest-match semantics -- no
+//! backtrack-and-retry needed. The check is deliberately
+//! conservative: any uncertainty disables demotion.
+//!
+//! Contract note. Both `computeLocal` and `computeWithResolver`
+//! poison all-or-nothing: if any subexpression is unresolvable they
+//! return `null`, discarding the FIRST of sibling arms or prior
+//! sequence parts that were computable. This matches the demotion
+//! client's "any uncertainty => don't optimize" requirement. Callers
+//! wanting best-effort FIRST (e.g. a diagnostic listing the known
+//! starting bytes of a partially-unresolved rule) need a different
+//! entry point; don't reuse these functions with a relaxed
+//! interpretation of `null`.
+//!
+//! Lookahead caveat. `&A` is reported as (FIRST=empty, nullable=true).
+//! Safe for sequence prefixes and for consumers that gate on
+//! `nullable` (as `canDemoteLongest` does). A consumer that reads
+//! FIRST without that gate would classify `&A` as disjoint from A,
+//! which is wrong -- true FIRST(&A) is FIRST(A).
 
 const std = @import("std");
 const ast = @import("../frontend/ast.zig");
 
 /// Result of analyzing a single expression. `bits` is a 256-bit
-/// membership set, MSB-within-byte layout matching the runtime
+/// membership set, LSB-within-byte layout matching the runtime
 /// charset encoding so the two representations are interchangeable.
 pub const FirstInfo = struct {
     bits: [32]u8,
@@ -71,7 +90,7 @@ pub const Resolver = struct {
 
 /// Compute FIRST/nullable for `expr`. Returns `null` on any construct
 /// outside the local core (rule references, back-references). Callers
-/// must treat `null` as "unknown — do not optimize".
+/// must treat `null` as "unknown -- do not optimize".
 pub fn computeLocal(expr: *const ast.Expr) ?FirstInfo {
     return computeWithResolver(expr, null);
 }
@@ -114,12 +133,18 @@ fn computeKind(kind: ast.ExprKind, resolver: ?Resolver) ?FirstInfo {
             break :blk info;
         },
 
-        // String literals hold raw undecoded bytes; decode just the
-        // first byte. Case-insensitive literals admit both cases of a
-        // letter as the first byte.
+        // Single-quoted string literals store their escape-bearing source
+        // verbatim, so we decode the first byte the same way the compiler
+        // does at emit time. Triple-quoted strings are raw: the first
+        // byte of `raw` is already the first byte the runtime matches.
+        // Case-insensitive literals admit both cases of a letter as the
+        // first byte.
         .string_lit => |s| blk: {
             if (s.raw.len == 0) break :blk FirstInfo.epsilon();
-            const first = firstByte(s.raw) orelse break :blk null;
+            const first = if (s.triple_quoted)
+                s.raw[0]
+            else
+                firstByte(s.raw) orelse break :blk null;
             var info = FirstInfo.empty();
             info.add(first);
             if (s.case_insensitive and std.ascii.isAlphabetic(first)) {
@@ -174,7 +199,7 @@ fn computeKind(kind: ast.ExprKind, resolver: ?Resolver) ?FirstInfo {
 
         // Lookaheads consume no input but succeed/fail based on `A`.
         // The standard LL-style over-approximation treats them as
-        // (nullable, FIRST=∅): correct for the sequence rule — a
+        // (nullable, FIRST=empty): correct for the sequence rule -- a
         // sequence `&A B` gets FIRST(B), not the tighter intersection,
         // which is safe for disjointness checks (a superset cannot
         // falsely claim disjointness).
@@ -187,7 +212,7 @@ fn computeKind(kind: ast.ExprKind, resolver: ?Resolver) ?FirstInfo {
 }
 
 /// Whether all infos are pairwise disjoint on their FIRST bits.
-/// Runs in O(n·32) by accumulating a union: if arm_i overlaps the
+/// Runs in O(n*32) by accumulating a union: if arm_i overlaps the
 /// union of arms 0..i-1, it overlaps at least one of them.
 pub fn disjoint(infos: []const FirstInfo) bool {
     var combined = FirstInfo.empty();
@@ -201,12 +226,20 @@ pub fn disjoint(infos: []const FirstInfo) bool {
 /// Whether a `#[longest]` over `arms` can be demoted to ordered
 /// choice without changing which strings match. Requires every arm
 /// to be analyzable, non-nullable, and pairwise disjoint from the
-/// others on FIRST.
-pub fn canDemoteLongest(arms: []const ast.Expr) bool {
+/// others on FIRST. Passing `null` for `resolver` keeps the
+/// local-only behavior (rule references block demotion); a
+/// whole-grammar resolver lifts that restriction for arms whose
+/// references resolve through the rule table.
+pub fn canDemoteLongest(arms: []const ast.Expr, resolver: ?Resolver) bool {
     if (arms.len < 2) return false;
     var combined = FirstInfo.empty();
     for (arms) |*arm| {
-        const info = computeLocal(arm) orelse return false;
+        const info = computeWithResolver(arm, resolver) orelse return false;
+        // TODO: this check can be fooled by a capture back-reference
+        // whose name shadows a non-nullable top-level rule. See the
+        // TODO on `ast.ExprKind.rule_ref`. Latent today because
+        // captures don't appear in ABNF-lowered source, the only
+        // input `demoteLongestInPlace` runs on.
         if (info.nullable) return false;
         if (combined.overlaps(info)) return false;
         combined.unionInto(info);
@@ -214,75 +247,11 @@ pub fn canDemoteLongest(arms: []const ast.Expr) bool {
     return true;
 }
 
-/// Source-level rewrite: for every `#[longest](...)` group whose arms
-/// have pairwise-disjoint, non-nullable FIRST sets, overwrite the
-/// `#[longest]` prefix (up to and including the closing `]`) with
-/// spaces. The opening `(` is left in place, so on re-scan the tokens
-/// read as a parenthesized expression and the compiler emits ordered
-/// choice instead of longest-match.
-///
-/// Rewrites in place. Byte-preserving, so all existing source offsets
-/// — line/column diagnostics, ABNF span maps — remain valid without
-/// remapping. A parse failure leaves the buffer untouched; the main
-/// compiler will report the same errors.
-pub fn demoteLongestInPlace(
-    allocator: std.mem.Allocator,
-    source: []u8,
-) !void {
-    var parser = ast.Parser.init(allocator, source);
-    defer parser.deinit();
-    const result = parser.parse() catch return;
-    if (!result.ok()) return;
-
-    for (result.program.items) |item| {
-        switch (item) {
-            .rule => |r| {
-                demoteInExpr(&r.body, source);
-                for (r.where_bindings) |wb| demoteInExpr(&wb.body, source);
-            },
-            .bare_expr => |e| demoteInExpr(&e, source),
-            .use_decl, .tagged_block => {},
-        }
-    }
-}
-
-fn demoteInExpr(expr: *const ast.Expr, source: []u8) void {
-    switch (expr.kind) {
-        .longest => |arms| {
-            if (canDemoteLongest(arms)) blank(source, expr.span.start);
-            for (arms) |*a| demoteInExpr(a, source);
-        },
-        .sequence => |parts| for (parts) |*p| demoteInExpr(p, source),
-        .choice => |arms| for (arms) |*a| demoteInExpr(a, source),
-        .group => |inner| demoteInExpr(inner, source),
-        .capture => |cap| demoteInExpr(cap.body, source),
-        .quantifier => |q| demoteInExpr(q.operand, source),
-        .lookahead => |la| demoteInExpr(la.operand, source),
-        .rule_ref,
-        .string_lit,
-        .char_lit,
-        .charset,
-        .any_byte,
-        .cut,
-        .cut_labeled,
-        => {},
-    }
-}
-
-fn blank(source: []u8, longest_start: u32) void {
-    // Blank `#` through the `]` that closes the attribute bracket.
-    // Nothing inside `[longest]` is itself a `]`, so the first one
-    // found is always the right one.
-    var i: usize = longest_start;
-    while (i < source.len and source[i] != ']') : (i += 1) {}
-    if (i >= source.len) return;
-    @memset(source[longest_start .. i + 1], ' ');
-}
-
-// Decode the first logical byte of a string-literal's raw content,
-// honoring the same escape sequences as `literal.extractCharByte`.
+// Decode the first logical byte of a single-quoted string literal's
+// raw content, matching the escape table in `literal.decodeStringBody`.
 // Returns null when the escape is malformed or unrecognized; the
-// caller's contract is "unknown means do not optimize".
+// caller's contract is "unknown means do not optimize". Triple-quoted
+// strings are raw and must not be passed here.
 fn firstByte(raw: []const u8) ?u8 {
     if (raw.len == 0) return null;
     if (raw[0] != '\\') return raw[0];
@@ -497,7 +466,7 @@ test "lookahead contributes no FIRST but stays nullable" {
         \\b = !'x' 'y';
     );
     defer f.deinit();
-    // `&x y` → FIRST = FIRST(y) = {y}, non-nullable.
+    // `&x y` -> FIRST = FIRST(y) = {y}, non-nullable.
     const a = computeLocal(f.ruleBody(0)).?;
     try testing.expect(a.contains('y'));
     try testing.expect(!a.contains('x'));
@@ -537,130 +506,80 @@ test "sequence with nullable lead and rule reference blocks analysis" {
 }
 
 test "canDemoteLongest: disjoint literal arms" {
-    // G, P, D all distinct as first bytes — demotion safe.
+    // G, P, D all distinct as first bytes -- demotion safe.
     var f = try Fixture.init("a = #[longest](\"GET\" / \"POST\" / \"DELETE\");");
     defer f.deinit();
     const arms = f.ruleBody(0).kind.longest;
-    try testing.expect(canDemoteLongest(arms));
+    try testing.expect(canDemoteLongest(arms, null));
 }
 
 test "canDemoteLongest: shared-first-byte literals block demotion" {
-    // POST and PUT both start with P — even though they're different
+    // POST and PUT both start with P -- even though they're different
     // words, longest semantics diverges from ordered choice here.
     var f = try Fixture.init("a = #[longest](\"GET\" / \"POST\" / \"PUT\");");
     defer f.deinit();
     const arms = f.ruleBody(0).kind.longest;
-    try testing.expect(!canDemoteLongest(arms));
+    try testing.expect(!canDemoteLongest(arms, null));
 }
 
 test "canDemoteLongest: overlapping first bytes blocks demotion" {
     var f = try Fixture.init("a = #[longest](\"GET\" / \"GETS\");");
     defer f.deinit();
     const arms = f.ruleBody(0).kind.longest;
-    try testing.expect(!canDemoteLongest(arms));
+    try testing.expect(!canDemoteLongest(arms, null));
 }
 
 test "canDemoteLongest: rule reference arm blocks demotion" {
     var f = try Fixture.init("a = #[longest]('x' / other);");
     defer f.deinit();
     const arms = f.ruleBody(0).kind.longest;
-    try testing.expect(!canDemoteLongest(arms));
+    try testing.expect(!canDemoteLongest(arms, null));
 }
 
 test "canDemoteLongest: nullable arm blocks demotion" {
     var f = try Fixture.init("a = #[longest]('x' / 'y'?);");
     defer f.deinit();
     const arms = f.ruleBody(0).kind.longest;
-    try testing.expect(!canDemoteLongest(arms));
+    try testing.expect(!canDemoteLongest(arms, null));
 }
 
 test "canDemoteLongest: charset arms with disjoint ranges" {
     var f = try Fixture.init("a = #[longest](['0'-'9'] / ['a'-'z']);");
     defer f.deinit();
     const arms = f.ruleBody(0).kind.longest;
-    try testing.expect(canDemoteLongest(arms));
+    try testing.expect(canDemoteLongest(arms, null));
 }
 
 test "canDemoteLongest: charset arms with overlapping ranges blocked" {
     var f = try Fixture.init("a = #[longest](['a'-'m'] / ['k'-'z']);");
     defer f.deinit();
     const arms = f.ruleBody(0).kind.longest;
-    try testing.expect(!canDemoteLongest(arms));
+    try testing.expect(!canDemoteLongest(arms, null));
 }
 
 test "canDemoteLongest: case-insensitive string arms respect folded FIRST" {
-    // i"Get" has FIRST {G, g}; i"Post" has FIRST {P, p} — disjoint.
+    // i"Get" has FIRST {G, g}; i"Post" has FIRST {P, p} -- disjoint.
     var f = try Fixture.init("a = #[longest](i\"Get\" / i\"Post\");");
     defer f.deinit();
     const arms = f.ruleBody(0).kind.longest;
-    try testing.expect(canDemoteLongest(arms));
+    try testing.expect(canDemoteLongest(arms, null));
 }
 
 test "canDemoteLongest: case-insensitive overlap blocks demotion" {
-    // i"Get" FIRST {G, g}; "g..." FIRST {g} — overlap on 'g'.
+    // i"Get" FIRST {G, g}; "g..." FIRST {g} -- overlap on 'g'.
     var f = try Fixture.init("a = #[longest](i\"Get\" / \"gist\");");
     defer f.deinit();
     const arms = f.ruleBody(0).kind.longest;
-    try testing.expect(!canDemoteLongest(arms));
-}
-
-test "demoteLongestInPlace: disjoint literals are demoted" {
-    const src = "a = #[longest](\"GET\" / \"POST\" / \"DELETE\");";
-    const buf = try testing.allocator.dupe(u8, src);
-    defer testing.allocator.free(buf);
-    try demoteLongestInPlace(testing.allocator, buf);
-    // `#[longest]` prefix is blanked; `(` is kept.
-    try testing.expectEqualStrings(
-        "a =           (\"GET\" / \"POST\" / \"DELETE\");",
-        buf,
-    );
-}
-
-test "demoteLongestInPlace: overlapping arms are untouched" {
-    const src = "a = #[longest](\"GET\" / \"GETS\");";
-    const buf = try testing.allocator.dupe(u8, src);
-    defer testing.allocator.free(buf);
-    try demoteLongestInPlace(testing.allocator, buf);
-    try testing.expectEqualStrings(src, buf);
-}
-
-test "demoteLongestInPlace: buffer is byte-preserving" {
-    const src = "a = #[longest](\"x\" / \"y\");\nb = c;\n";
-    const buf = try testing.allocator.dupe(u8, src);
-    defer testing.allocator.free(buf);
-    try demoteLongestInPlace(testing.allocator, buf);
-    try testing.expectEqual(src.len, buf.len);
-    // Only the `#[longest]` prefix was rewritten; newlines unchanged.
-    try testing.expectEqual(@as(usize, std.mem.count(u8, src, "\n")), std.mem.count(u8, buf, "\n"));
-}
-
-test "demoteLongestInPlace: descends into rule bodies and where-blocks" {
-    const src =
-        \\a = b
-        \\  where b = #[longest]("x" / "y") end
-        \\;
-    ;
-    const buf = try testing.allocator.dupe(u8, src);
-    defer testing.allocator.free(buf);
-    try demoteLongestInPlace(testing.allocator, buf);
-    try testing.expect(std.mem.indexOf(u8, buf, "#[longest]") == null);
-}
-
-test "demoteLongestInPlace: parse failures leave buffer intact" {
-    const src = "not a grammar at all { } ???";
-    const buf = try testing.allocator.dupe(u8, src);
-    defer testing.allocator.free(buf);
-    try demoteLongestInPlace(testing.allocator, buf);
-    try testing.expectEqualStrings(src, buf);
+    try testing.expect(!canDemoteLongest(arms, null));
 }
 
 test "canDemoteLongest: single arm is not a candidate" {
     // Structurally a `longest` node with one arm shouldn't occur in
-    // parsed pars — the parser only emits `longest` when it sees
+    // parsed pars -- the parser only emits `longest` when it sees
     // `#[longest](...)` with at least one arm, and multi-arm is the
     // normal shape. Guard defensively anyway.
     var f = try Fixture.init("a = #[longest]('x');");
     defer f.deinit();
     const arms = f.ruleBody(0).kind.longest;
-    try testing.expect(!canDemoteLongest(arms));
+    try testing.expect(!canDemoteLongest(arms, null));
 }
